@@ -18,22 +18,33 @@ import (
 // DefaultBaseURL is the production Toggl Track API v9 root.
 const DefaultBaseURL = "https://api.track.toggl.com/api/v9"
 
+// DefaultReportsBaseURL is the production Toggl Reports API v3 root. It lives on
+// a different path prefix than the v9 API, so it is tracked separately (see
+// SummaryByTask).
+const DefaultReportsBaseURL = "https://api.track.toggl.com/reports/api/v3"
+
 // ErrUnauthorized is returned when Toggl rejects the credentials (401/403).
 var ErrUnauthorized = errors.New("invalid API token")
 
 // Client talks to the Toggl Track API.
 type Client struct {
-	token      string
-	baseURL    string
-	httpClient *http.Client
+	token          string
+	baseURL        string
+	reportsBaseURL string
+	httpClient     *http.Client
 }
 
 // Option configures a Client.
 type Option func(*Client)
 
-// WithBaseURL overrides the API root (used in tests).
+// WithBaseURL overrides the API v9 root (used in tests).
 func WithBaseURL(u string) Option {
 	return func(c *Client) { c.baseURL = strings.TrimRight(u, "/") }
+}
+
+// WithReportsBaseURL overrides the Reports API v3 root (used in tests).
+func WithReportsBaseURL(u string) Option {
+	return func(c *Client) { c.reportsBaseURL = strings.TrimRight(u, "/") }
 }
 
 // WithHTTPClient injects a custom *http.Client (used in tests).
@@ -44,9 +55,10 @@ func WithHTTPClient(h *http.Client) Option {
 // New returns a Client authenticating with the given API token.
 func New(token string, opts ...Option) *Client {
 	c := &Client{
-		token:      token,
-		baseURL:    DefaultBaseURL,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		token:          token,
+		baseURL:        DefaultBaseURL,
+		reportsBaseURL: DefaultReportsBaseURL,
+		httpClient:     &http.Client{Timeout: 30 * time.Second},
 	}
 	for _, o := range opts {
 		o(c)
@@ -54,11 +66,22 @@ func New(token string, opts ...Option) *Client {
 	return c
 }
 
-// do performs an HTTP request, marshaling body (if non-nil) as JSON and
-// unmarshaling a 2xx response into out (if non-nil). Non-2xx responses become
-// errors: 401/403 -> ErrUnauthorized, otherwise an error carrying the status
-// and (possibly non-JSON) response body.
+// do performs an HTTP request against the v9 API (c.baseURL).
 func (c *Client) do(method, path string, body, out any) error {
+	return c.doURL(method, c.baseURL+path, body, out)
+}
+
+// doReports performs an HTTP request against the Reports API v3
+// (c.reportsBaseURL), which lives on a different path prefix than the v9 API.
+func (c *Client) doReports(method, path string, body, out any) error {
+	return c.doURL(method, c.reportsBaseURL+path, body, out)
+}
+
+// doURL performs an HTTP request to a fully-qualified url, marshaling body (if
+// non-nil) as JSON and unmarshaling a 2xx response into out (if non-nil).
+// Non-2xx responses become errors: 401/403 -> ErrUnauthorized, otherwise an
+// error carrying the status and (possibly non-JSON) response body.
+func (c *Client) doURL(method, url string, body, out any) error {
 	var reqBody io.Reader
 	if body != nil {
 		buf, err := json.Marshal(body)
@@ -68,7 +91,7 @@ func (c *Client) do(method, path string, body, out any) error {
 		reqBody = bytes.NewReader(buf)
 	}
 
-	req, err := http.NewRequest(method, c.baseURL+path, reqBody)
+	req, err := http.NewRequest(method, url, reqBody)
 	if err != nil {
 		return err
 	}

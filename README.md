@@ -63,6 +63,17 @@ Like `start`, `add` accepts `<project> <task>` to scope by project name (or set
 `TOGGL_PROJECT_ID`), stores the entry locally marked dirty, and best-effort
 pushes it to Toggl.
 
+To see how much time you have tracked against particular tasks, use `total`.
+It queries the Toggl Reports API directly (no local cache) for all-time totals
+and lists one line per matched task plus a grand total:
+
+```sh
+tg total login review      # totals for tasks matching "login" and "review"
+```
+
+Each argument is a task-name fragment, matched the same case-insensitive way as
+`tg start`. A task matched by more than one fragment is listed once.
+
 ## Usage
 
 ```
@@ -81,6 +92,7 @@ commands:
   update-projects           sync all workspace projects       [--all] [--json]
   push                      send local changes to Toggl       [--json]
   pull [project]            fetch changes; all projects, or one [--since DATE] [--json]
+  total <task>...           total tracked hours per task (Reports API) [--json]
   completion zsh            print the zsh completion script
 ```
 

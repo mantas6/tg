@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -155,6 +156,97 @@ func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, proj
 	default:
 		return fmt.Errorf("multiple tasks match %q:\n%s", fragment, candidateList(tasks))
 	}
+}
+
+// cmdTotal reports per-task tracked totals straight from the Toggl Reports API
+// (never the local store): it fetches every task's summed seconds for the whole
+// available date range (2006-01-01 through now's calendar day in loc) and then
+// keeps only the tasks whose names match the given fragments. Each fragment is
+// matched against the reported task names with the same case-insensitive
+// substring / exact-title-wins semantics as `tg start` (see matchSummaryTasks);
+// tasks matched by more than one fragment are listed once. Output is one line
+// per matched task with its total, followed by the sum of all listed tasks. No
+// fragments, or no matches at all, is an error.
+func cmdTotal(w io.Writer, c *api.Client, workspaceID int64, fragments []string, now time.Time, loc *time.Location, jsonOut bool) error {
+	var cleaned []string
+	for _, f := range fragments {
+		if f = strings.TrimSpace(f); f != "" {
+			cleaned = append(cleaned, f)
+		}
+	}
+	if len(cleaned) == 0 {
+		return errors.New("usage: tg total <task-fragment> [task-fragment...]")
+	}
+
+	endDate := now.In(loc).Format("2006-01-02")
+	rows, err := c.SummaryByTask(workspaceID, "", endDate)
+	if err != nil {
+		return err
+	}
+
+	// Collect the union of tasks matched by any fragment, deduped by task id so
+	// a task caught by two fragments is only listed (and summed) once.
+	var matched []api.SummaryTask
+	seen := map[int64]bool{}
+	for _, frag := range cleaned {
+		for _, r := range matchSummaryTasks(rows, frag) {
+			if seen[r.TaskID] {
+				continue
+			}
+			seen[r.TaskID] = true
+			matched = append(matched, r)
+		}
+	}
+	if len(matched) == 0 {
+		return fmt.Errorf("no task matches %s", strings.Join(quoteAll(cleaned), ", "))
+	}
+
+	sort.Slice(matched, func(i, j int) bool {
+		if matched[i].Name != matched[j].Name {
+			return matched[i].Name < matched[j].Name
+		}
+		return matched[i].TaskID < matched[j].TaskID
+	})
+
+	if jsonOut {
+		return renderTotalsJSON(w, matched)
+	}
+	renderTotals(w, matched)
+	return nil
+}
+
+// matchSummaryTasks mirrors the store's matchTasks for Reports API rows: a
+// case-insensitive substring match on the task name, with an exact
+// (case-insensitive) full-name match taking precedence over mere substrings.
+func matchSummaryTasks(rows []api.SummaryTask, fragment string) []api.SummaryTask {
+	frag := strings.ToLower(strings.TrimSpace(fragment))
+	if frag == "" {
+		return nil
+	}
+	var subs, exact []api.SummaryTask
+	for _, r := range rows {
+		name := strings.ToLower(r.Name)
+		if !strings.Contains(name, frag) {
+			continue
+		}
+		subs = append(subs, r)
+		if name == frag {
+			exact = append(exact, r)
+		}
+	}
+	if len(exact) > 0 {
+		return exact
+	}
+	return subs
+}
+
+// quoteAll wraps each string in double quotes for a readable error listing.
+func quoteAll(ss []string) []string {
+	out := make([]string, len(ss))
+	for i, s := range ss {
+		out[i] = strconv.Quote(s)
+	}
+	return out
 }
 
 // parseTimesign parses a START-STOP timesign into two wall-clock times on now's

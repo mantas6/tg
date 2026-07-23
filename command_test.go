@@ -927,6 +927,147 @@ func TestPullIgnoresProjectEnv(t *testing.T) {
 	}
 }
 
+// totalReportsServer returns a client whose Reports API points at a test server
+// serving a fixed summary payload (two projects; tasks Fix login bug 4500s,
+// Code review 2700s, Write tests 3600s, Write docs 900s), and records the
+// request body seen.
+func totalReportsServer(t *testing.T) (*api.Client, *map[string]any) {
+	t.Helper()
+	body := map[string]any{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/workspace/1/summary/time_entries" {
+			t.Errorf("path = %q, want /workspace/1/summary/time_entries", r.URL.Path)
+		}
+		raw, _ := io.ReadAll(r.Body)
+		json.Unmarshal(raw, &body)
+		w.Write([]byte(`{"groups":[
+		  {"id":1,"sub_groups":[
+		    {"id":10,"title":"Fix login bug","seconds":4500},
+		    {"id":12,"title":"Code review","seconds":2700},
+		    {"id":13,"title":"Write tests","seconds":3600},
+		    {"id":14,"title":"Write docs","seconds":900}]}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	c := api.New("tok", api.WithReportsBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+	return c, &body
+}
+
+var totalNow = time.Date(2026, 1, 2, 15, 0, 0, 0, time.UTC)
+
+// TestTotalMultipleFragments verifies each positional fragment selects its
+// matching task, the totals come from the Reports API, and the bottom line sums
+// all listed tasks. It also checks the default all-time date range is sent.
+func TestTotalMultipleFragments(t *testing.T) {
+	c, body := totalReportsServer(t)
+
+	var buf bytes.Buffer
+	if err := cmdTotal(&buf, c, 1, []string{"login", "review"}, totalNow, time.UTC, false); err != nil {
+		t.Fatalf("total: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"Fix login bug", "1h15m", "Code review", "0h45m", "Total: 2h00m"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	// Fragments that were not asked for must not appear.
+	if strings.Contains(out, "Write tests") || strings.Contains(out, "Write docs") {
+		t.Errorf("output should only list matched tasks:\n%s", out)
+	}
+	// The default (all-time) start date and today's end date are sent.
+	if (*body)["start_date"] != "2006-01-01" {
+		t.Errorf("start_date = %v, want 2006-01-01", (*body)["start_date"])
+	}
+	if (*body)["end_date"] != "2026-01-02" {
+		t.Errorf("end_date = %v, want 2026-01-02", (*body)["end_date"])
+	}
+}
+
+// TestTotalFragmentMatchingMany verifies one fragment can match several tasks
+// (substring semantics), all of which are listed and summed.
+func TestTotalFragmentMatchingMany(t *testing.T) {
+	c, _ := totalReportsServer(t)
+
+	var buf bytes.Buffer
+	if err := cmdTotal(&buf, c, 1, []string{"write"}, totalNow, time.UTC, false); err != nil {
+		t.Fatalf("total: %v", err)
+	}
+	out := buf.String()
+	// "write" matches both Write tests (1h00m) and Write docs (0h15m).
+	for _, want := range []string{"Write tests", "1h00m", "Write docs", "0h15m", "Total: 1h15m"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestTotalDedupesAcrossFragments verifies a task caught by two overlapping
+// fragments is listed and summed only once.
+func TestTotalDedupesAcrossFragments(t *testing.T) {
+	c, _ := totalReportsServer(t)
+
+	var buf bytes.Buffer
+	if err := cmdTotal(&buf, c, 1, []string{"write", "docs"}, totalNow, time.UTC, false); err != nil {
+		t.Fatalf("total: %v", err)
+	}
+	out := buf.String()
+	if n := strings.Count(out, "Write docs"); n != 1 {
+		t.Errorf("Write docs listed %d times, want 1:\n%s", n, out)
+	}
+	// Write tests (1h00m) + Write docs (0h15m), counted once each.
+	if !strings.Contains(out, "Total: 1h15m") {
+		t.Errorf("total should count each task once:\n%s", out)
+	}
+}
+
+func TestTotalNoMatches(t *testing.T) {
+	c, _ := totalReportsServer(t)
+
+	var buf bytes.Buffer
+	err := cmdTotal(&buf, c, 1, []string{"nonexistent"}, totalNow, time.UTC, false)
+	if err == nil || !strings.Contains(err.Error(), "no task matches") {
+		t.Errorf("err = %v, want a no-match error", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("nothing should be written on no match, got %q", buf.String())
+	}
+}
+
+func TestTotalRequiresFragment(t *testing.T) {
+	c, _ := totalReportsServer(t)
+
+	var buf bytes.Buffer
+	err := cmdTotal(&buf, c, 1, []string{"  "}, totalNow, time.UTC, false)
+	if err == nil || !strings.Contains(err.Error(), "usage") {
+		t.Errorf("err = %v, want a usage error for a blank fragment", err)
+	}
+}
+
+func TestTotalJSON(t *testing.T) {
+	c, _ := totalReportsServer(t)
+
+	var buf bytes.Buffer
+	if err := cmdTotal(&buf, c, 1, []string{"login", "review"}, totalNow, time.UTC, true); err != nil {
+		t.Fatalf("total --json: %v", err)
+	}
+	var got struct {
+		Tasks []struct {
+			Task            string `json:"task"`
+			DurationSeconds int64  `json:"duration_seconds"`
+		} `json:"tasks"`
+		TotalSeconds int64 `json:"total_seconds"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("json: %v (%s)", err, buf.String())
+	}
+	if len(got.Tasks) != 2 {
+		t.Fatalf("tasks = %d, want 2", len(got.Tasks))
+	}
+	if got.TotalSeconds != 7200 {
+		t.Errorf("total_seconds = %d, want 7200", got.TotalSeconds)
+	}
+}
+
 func TestResolveStartProjectUnique(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)

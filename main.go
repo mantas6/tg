@@ -56,6 +56,8 @@ func run(cmd string, args []string) error {
 		return runPush(args)
 	case "pull":
 		return runPull(args)
+	case "total":
+		return runTotal(args)
 	case "completion":
 		return runCompletion(args)
 	case "help", "-h", "--help":
@@ -298,6 +300,21 @@ func runPull(args []string) error {
 	return cmdPull(os.Stdout, st, api.New(cfg.APIToken), fragment, since, now, *jsonOut)
 }
 
+func runTotal(args []string) error {
+	fs := newFlagSet("total")
+	jsonOut := fs.Bool("json", false, "emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	// total queries the Reports API directly and never touches the local store,
+	// so no store is opened here (unlike the catalog-backed commands).
+	return cmdTotal(os.Stdout, api.New(cfg.APIToken), cfg.WorkspaceID, fs.Args(), time.Now(), time.Local, *jsonOut)
+}
+
 func runAuth(args []string) error {
 	fs := newFlagSet("auth")
 	if err := fs.Parse(args); err != nil {
@@ -401,6 +418,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  update-projects           sync all workspace projects       [--all] [--json]")
 	fmt.Fprintln(w, "  push                      send local changes to Toggl       [--json]")
 	fmt.Fprintln(w, "  pull [project]            fetch changes; all projects, or one [--since DATE] [--json]")
+	fmt.Fprintln(w, "  total <task>...           total tracked hours per task (Reports API) [--json]")
 	fmt.Fprintln(w, "  completion zsh            print the zsh completion script")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "sync: run `tg pull` then `tg push` for correct last-writer-wins.")

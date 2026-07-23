@@ -22,6 +22,15 @@ func newTestClient(t *testing.T, handler http.HandlerFunc) *Client {
 	return New("mytoken", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
 }
 
+// newTestClientReports spins up an httptest.Server and returns a Client whose
+// Reports API base URL points at it (used for the reports endpoints).
+func newTestClientReports(t *testing.T, handler http.HandlerFunc) *Client {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return New("mytoken", WithReportsBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+}
+
 func ptrInt(v int64) *int64 { return &v }
 
 func TestBasicAuthHeader(t *testing.T) {
@@ -333,6 +342,62 @@ func projectTasksBare() string {
 		items = append(items, fmt.Sprintf(`{"id":%d,"project_id":42,"name":"T%d","active":true}`, i+1, i+1))
 	}
 	return "[" + strings.Join(items, ",") + "]"
+}
+
+func TestSummaryByTask(t *testing.T) {
+	var gotMethod, gotPath string
+	var body map[string]any
+	c := newTestClientReports(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		raw, _ := io.ReadAll(r.Body)
+		json.Unmarshal(raw, &body)
+		// Two projects; the second repeats task 10, whose seconds must be summed
+		// across groups. A sub-group without a task id/title is dropped.
+		w.Write([]byte(`{"groups":[
+		  {"id":1,"sub_groups":[
+		    {"id":10,"title":"Fix login bug","seconds":4500},
+		    {"id":12,"title":"Code review","seconds":2700},
+		    {"id":null,"title":"","seconds":600}]},
+		  {"id":2,"sub_groups":[
+		    {"id":10,"title":"Fix login bug","seconds":1800}]}]}`))
+	})
+
+	tasks, err := c.SummaryByTask(1, "", "2026-01-02")
+	if err != nil {
+		t.Fatalf("SummaryByTask: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %s, want POST", gotMethod)
+	}
+	if gotPath != "/workspace/1/summary/time_entries" {
+		t.Errorf("path = %q, want /workspace/1/summary/time_entries", gotPath)
+	}
+	// An empty start date defaults to the Reports API's earliest allowed date.
+	if body["start_date"] != reportAllTimeStart {
+		t.Errorf("start_date = %v, want %q", body["start_date"], reportAllTimeStart)
+	}
+	if body["end_date"] != "2026-01-02" {
+		t.Errorf("end_date = %v, want 2026-01-02", body["end_date"])
+	}
+	if body["grouping"] != "projects" || body["sub_grouping"] != "tasks" {
+		t.Errorf("grouping/sub_grouping = %v/%v, want projects/tasks", body["grouping"], body["sub_grouping"])
+	}
+
+	// Task 10 (summed across the two groups), task 12; the task-less sub-group
+	// is dropped.
+	if len(tasks) != 2 {
+		t.Fatalf("tasks = %d (%+v), want 2", len(tasks), tasks)
+	}
+	byID := map[int64]SummaryTask{}
+	for _, tk := range tasks {
+		byID[tk.TaskID] = tk
+	}
+	if got := byID[10]; got.Seconds != 6300 || got.Name != "Fix login bug" {
+		t.Errorf("task 10 = %+v, want Fix login bug / 6300s", got)
+	}
+	if got := byID[12]; got.Seconds != 2700 || got.Name != "Code review" {
+		t.Errorf("task 12 = %+v, want Code review / 2700s", got)
+	}
 }
 
 func TestErrorMapping(t *testing.T) {

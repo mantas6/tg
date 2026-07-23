@@ -68,6 +68,7 @@ _tg() {
         'update-projects:sync all workspace projects'
         'push:send local changes to Toggl'
         "pull:fetch remote changes (all projects, or one)"
+        'total:total tracked hours per task (Reports API)'
         'completion:print a shell completion script'
         'help:show usage'
       )
@@ -104,6 +105,9 @@ _tg() {
           ;;
         pull)
           _arguments '--since[pull entries modified since DATE]:date (YYYY-MM-DD):' '--json[emit JSON]' '*:project fragment:'
+          ;;
+        total)
+          _arguments '--json[emit JSON]' '*:task fragment:__tg_tasks'
           ;;
         completion)
           local -a shells
