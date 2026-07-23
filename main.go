@@ -36,6 +36,8 @@ func run(cmd string, args []string) error {
 		return runAuth(args)
 	case "start":
 		return runStart(args)
+	case "add":
+		return runAdd(args)
 	case "stop":
 		return runStop(args)
 	case "current", "status":
@@ -97,6 +99,44 @@ func runStart(args []string) error {
 		fragment = rest[1]
 	}
 	return cmdStart(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectID, fragment, time.Now())
+}
+
+func runAdd(args []string) error {
+	fs := newFlagSet("add")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	// First positional arg is the timesign. After it, two fragments mean
+	// `<project> <task>` (the first scopes to a project, overriding
+	// TOGGL_PROJECT_ID); one means `<task>` scoped by env. This mirrors
+	// runStart's project/task resolution.
+	rest := fs.Args()
+	if len(rest) < 2 {
+		return errors.New("usage: tg add <timesign> [project] <task-fragment>")
+	}
+	timesign := rest[0]
+	rest = rest[1:]
+	projectID := projectIDFromEnv()
+	fragment := strings.Join(rest, " ")
+	if len(rest) == 2 {
+		pid, err := resolveStartProject(st, rest[0])
+		if err != nil {
+			return err
+		}
+		projectID = pid
+		fragment = rest[1]
+	}
+	return cmdAdd(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectID, timesign, fragment, time.Now(), time.Local)
 }
 
 func runStop(args []string) error {
@@ -351,6 +391,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "commands:")
 	fmt.Fprintln(w, "  auth [token]              verify a Toggl API token and store config")
 	fmt.Fprintln(w, "  start [project] <task>    start tracking the task matching <task>")
+	fmt.Fprintln(w, "  add <range> [project] <task>  add a finished entry (e.g. 9-:30, 10:30-11)")
 	fmt.Fprintln(w, "  stop                      stop the running entry (snaps to 5m)")
 	fmt.Fprintln(w, "  current | status          show the running entry            [--json]")
 	fmt.Fprintln(w, "  today   | list | ls       show today's entries     [--days N] [--json]")

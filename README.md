@@ -48,6 +48,21 @@ tg start <task>             # start tracking the matching task
 tg stop                     # stop the running entry
 ```
 
+To record a finished block of time without using the timer, use `add` with a
+`START-STOP` range on today's clock:
+
+```sh
+tg add 9-:30 <task>         # 09:00-09:30
+tg add 10-11 <task>         # 10:00-11:00
+tg add 10:30-11 <task>      # 10:30-11:00
+```
+
+Each side is `H` or `H:MM`; the stop side may also be `:MM`, inheriting the
+start hour. Hours are 0-23, minutes 0-59, and the stop must be after the start.
+Like `start`, `add` accepts `<project> <task>` to scope by project name (or set
+`TOGGL_PROJECT_ID`), stores the entry locally marked dirty, and best-effort
+pushes it to Toggl.
+
 ## Usage
 
 ```
@@ -56,6 +71,7 @@ usage: tg <command> [flags]
 commands:
   auth [token]              verify a Toggl API token and store config
   start [project] <task>    start tracking the task matching <task>
+  add <range> [project] <task>  add a finished entry (e.g. 9-:30, 10:30-11)
   stop                      stop the running entry (snaps to 5m)
   current | status          show the running entry            [--json]
   today   | list | ls       show today's entries     [--days N] [--json]

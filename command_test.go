@@ -307,6 +307,275 @@ func TestProjectIDFromEnv(t *testing.T) {
 	}
 }
 
+// addDay is the calendar day timesigns resolve onto in the tests below.
+var addNow = time.Date(2026, 1, 2, 15, 0, 0, 0, time.UTC)
+
+func TestParseTimesignValid(t *testing.T) {
+	hm := func(h, m int) time.Time {
+		return time.Date(2026, 1, 2, h, m, 0, 0, time.UTC)
+	}
+	cases := []struct {
+		in                     string
+		wantStartH, wantStartM int
+		wantStopH, wantStopM   int
+	}{
+		{"9-:30", 9, 0, 9, 30},      // minutes-only stop inherits start hour
+		{"10-11", 10, 0, 11, 0},     // bare hours default minutes to 0
+		{"10:30-11", 10, 30, 11, 0}, // H:MM start, bare-hour stop
+		{"9:15-9:45", 9, 15, 9, 45}, // both sides H:MM
+		{"0-:01", 0, 0, 0, 1},       // midnight hour, one-minute span
+		{"23-23:59", 23, 0, 23, 59}, // last hour of the day
+		{" 9 - :30 ", 9, 0, 9, 30},  // surrounding/inner whitespace tolerated
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			start, stop, err := parseTimesign(tc.in, addNow, time.UTC)
+			if err != nil {
+				t.Fatalf("parseTimesign(%q): %v", tc.in, err)
+			}
+			if !start.Equal(hm(tc.wantStartH, tc.wantStartM)) {
+				t.Errorf("start = %v, want %02d:%02d", start, tc.wantStartH, tc.wantStartM)
+			}
+			if !stop.Equal(hm(tc.wantStopH, tc.wantStopM)) {
+				t.Errorf("stop = %v, want %02d:%02d", stop, tc.wantStopH, tc.wantStopM)
+			}
+		})
+	}
+}
+
+func TestParseTimesignErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"missing dash", "9"},
+		{"empty", ""},
+		{"empty start", "-11"},
+		{"empty stop", "9-"},
+		{"empty both", "-"},
+		{"bad start hour", "24-25"},
+		{"bad stop hour", "9-24"},
+		{"bad start minutes", "9:60-10"},
+		{"bad stop minutes", "9-9:60"},
+		{"minutes-only start", ":30-10"},
+		{"stop equals start", "9-9"},
+		{"stop before start", "10-9"},
+		{"minutes-only stop not after start", "9-:00"},
+		{"non-numeric hour", "ab-cd"},
+		{"non-numeric minutes", "9:aa-10"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := parseTimesign(tc.in, addNow, time.UTC); err == nil {
+				t.Errorf("parseTimesign(%q) = nil error, want an error", tc.in)
+			}
+		})
+	}
+}
+
+func TestAddCreatesFinishedEntry(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdAdd(&buf, s, nil, 1, nil, "9-:30", "login", addNow, time.UTC); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"Added: Fix login bug", "09:00-09:30", "0h30m"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output = %q, want %q", out, want)
+		}
+	}
+
+	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	if e.TaskID == nil || *e.TaskID != 10 {
+		t.Errorf("task_id = %v, want 10", e.TaskID)
+	}
+	if e.ProjectID == nil || *e.ProjectID != 1 {
+		t.Errorf("project_id = %v, want 1", e.ProjectID)
+	}
+	if e.Stop == nil {
+		t.Fatal("entry should be already stopped")
+	}
+	wantStart := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
+	wantStop := time.Date(2026, 1, 2, 9, 30, 0, 0, time.UTC)
+	if !e.Start.Equal(wantStart) {
+		t.Errorf("start = %v, want %v", e.Start, wantStart)
+	}
+	if !e.Stop.Equal(wantStop) {
+		t.Errorf("stop = %v, want %v", *e.Stop, wantStop)
+	}
+	if e.Duration != 1800 {
+		t.Errorf("duration = %d, want 1800", e.Duration)
+	}
+	if !e.Dirty {
+		t.Error("added entry should be dirty for a later push")
+	}
+	if r, _ := s.Running(); r != nil {
+		t.Errorf("add must not create a running entry, got %+v", r)
+	}
+}
+
+func TestAddDoesNotStopRunning(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	// A running entry created by start must survive an `add`.
+	var buf bytes.Buffer
+	if err := cmdStart(&buf, s, nil, 1, nil, "review", testStart); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := cmdAdd(&buf, s, nil, 1, nil, "10-11", "login", addNow, time.UTC); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	r, _ := s.Running()
+	if r == nil || r.TaskID == nil || *r.TaskID != 12 {
+		t.Fatalf("running entry = %+v, want Code review still running", r)
+	}
+}
+
+func TestAddProjectScopeViaEnvID(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	// "fix" matches several tasks, but scoping to project 2 leaves only one.
+	pid := int64(2)
+	var buf bytes.Buffer
+	if err := cmdAdd(&buf, s, nil, 1, &pid, "10-11", "fix", addNow, time.UTC); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	if e.TaskID == nil || *e.TaskID != 20 {
+		t.Errorf("task_id = %v, want 20 (Payment fix)", e.TaskID)
+	}
+	if e.ProjectID == nil || *e.ProjectID != 2 {
+		t.Errorf("project_id = %v, want 2", e.ProjectID)
+	}
+	// The billable project carries its flag onto the entry.
+	if !e.Billable {
+		t.Error("entry in a billable project should be billable")
+	}
+}
+
+func TestAddAmbiguous(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	err := cmdAdd(&buf, s, nil, 1, nil, "10-11", "write", addNow, time.UTC)
+	if err == nil {
+		t.Fatal("expected ambiguity error")
+	}
+	if !strings.Contains(err.Error(), "Write tests") || !strings.Contains(err.Error(), "Write docs") {
+		t.Errorf("error should list candidates: %v", err)
+	}
+	if entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 0 {
+		t.Errorf("no entry should be created on ambiguity, got %d", len(entries))
+	}
+}
+
+func TestAddNoneSuggestsUpdate(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	err := cmdAdd(&buf, s, nil, 1, nil, "10-11", "nonexistent", addNow, time.UTC)
+	if err == nil || !strings.Contains(err.Error(), "tg update") {
+		t.Errorf("err = %v, want suggestion to run `tg update`", err)
+	}
+}
+
+func TestAddInvalidTimesign(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	err := cmdAdd(&buf, s, nil, 1, nil, "nope", "login", addNow, time.UTC)
+	if err == nil || !strings.Contains(err.Error(), "timesign") {
+		t.Errorf("err = %v, want a timesign parse error", err)
+	}
+	// A bad timesign must be rejected before any task lookup or write.
+	if entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 0 {
+		t.Errorf("no entry should be created for a bad timesign, got %d", len(entries))
+	}
+}
+
+func TestAddBestEffortPush(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var body map[string]any
+	var gotMethod string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		raw, _ := io.ReadAll(r.Body)
+		json.Unmarshal(raw, &body)
+		w.Write([]byte(`{"id":9100,"at":"2026-01-02T09:00:00Z"}`))
+	}))
+	defer srv.Close()
+	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+
+	var buf bytes.Buffer
+	if err := cmdAdd(&buf, s, c, 1, nil, "9-:30", "login", addNow, time.UTC); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %s, want POST", gotMethod)
+	}
+	if v, ok := body["task_id"].(float64); !ok || int64(v) != 10 {
+		t.Errorf("task_id = %v, want 10", body["task_id"])
+	}
+	if v, ok := body["duration"].(float64); !ok || int64(v) != 1800 {
+		t.Errorf("duration = %v, want 1800", body["duration"])
+	}
+	// A successful push marks the entry synced (remote id set, clean).
+	r, _ := s.EntryByRemoteID(9100)
+	if r == nil {
+		t.Fatal("expected the added entry to be synced with its remote id")
+	}
+	if r.Dirty {
+		t.Error("added entry should be clean after a successful push")
+	}
+}
+
+func TestAddSyncFailureIsNonFatal(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+
+	var buf bytes.Buffer
+	if err := cmdAdd(&buf, s, c, 1, nil, "9-:30", "login", addNow, time.UTC); err != nil {
+		t.Fatalf("add should not fail on a sync error: %v", err)
+	}
+	if !strings.Contains(buf.String(), "warning") {
+		t.Errorf("output = %q, want a sync warning", buf.String())
+	}
+	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	if !entries[0].Dirty {
+		t.Error("added entry should stay dirty for a later push")
+	}
+	if entries[0].RemoteID != nil {
+		t.Errorf("remote_id = %v, want nil (never synced)", entries[0].RemoteID)
+	}
+}
+
 func TestStopSnaps(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)

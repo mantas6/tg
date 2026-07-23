@@ -55,6 +55,7 @@ _tg() {
       commands=(
         'auth:verify a Toggl API token and store config'
         'start:start tracking the task matching a fragment'
+        'add:add a finished entry from a START-STOP range'
         'stop:stop the running entry (snaps to 5m)'
         'current:show the running entry'
         'status:show the running entry'
@@ -76,6 +77,12 @@ _tg() {
       case $words[1] in
         start)
           __tg_tasks
+          ;;
+        add)
+          # First arg is the START-STOP range; later args are task names.
+          if (( CURRENT > 2 )); then
+            __tg_tasks
+          fi
           ;;
         current|status|push)
           _arguments '--json[emit JSON]'
