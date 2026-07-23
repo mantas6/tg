@@ -173,8 +173,9 @@ func renderToday(w io.Writer, entries []store.Entry, now time.Time, loc *time.Lo
 				lead = block + " "
 			}
 		}
-		fmt.Fprintf(w, "%s%-12s%-7s%-17s%s\n",
+		line := fmt.Sprintf("%s%-12s%-7s%-17s %s",
 			lead, startClk+"-"+stopClk, formatHM(dur), label, project)
+		fmt.Fprintln(w, strings.TrimRight(line, " "))
 	}
 
 	fmt.Fprintln(w, todayDivider)

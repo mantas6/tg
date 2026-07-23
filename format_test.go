@@ -208,6 +208,24 @@ func TestRenderTodayGaps(t *testing.T) {
 	}
 }
 
+// TestRenderTodayLongNameSpacing guards the separator between the task name
+// and the project bracket: names at or beyond the padding width must not run
+// into "[project]".
+func TestRenderTodayLongNameSpacing(t *testing.T) {
+	start := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
+	stop := time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 1, 2, 11, 0, 0, 0, time.UTC)
+	entries := []store.Entry{
+		{ID: 1, TaskName: "A task name definitely longer than the pad", ProjectName: "Backend", Start: start, Stop: &stop, Duration: 3600},
+	}
+	var buf bytes.Buffer
+	renderToday(&buf, entries, now, time.UTC, false)
+	got := buf.String()
+	if !strings.Contains(got, "A task name definitely longer than the pad [Backend]") {
+		t.Errorf("missing space between task name and project:\n%s", got)
+	}
+}
+
 func TestParseHexColor(t *testing.T) {
 	cases := []struct {
 		in      string
