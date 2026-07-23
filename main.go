@@ -105,6 +105,11 @@ func runStart(args []string) error {
 
 func runAdd(args []string) error {
 	fs := newFlagSet("add")
+	// --desc and --description are aliases bound to the same variable, so
+	// either spelling sets the entry's description (empty leaves it blank).
+	var desc string
+	fs.StringVar(&desc, "desc", "", "entry description")
+	fs.StringVar(&desc, "description", "", "entry description (alias of --desc)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -138,7 +143,7 @@ func runAdd(args []string) error {
 		projectID = pid
 		fragment = rest[1]
 	}
-	return cmdAdd(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectID, timesign, fragment, time.Now(), time.Local)
+	return cmdAdd(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectID, timesign, fragment, desc, time.Now(), time.Local)
 }
 
 func runStop(args []string) error {
@@ -428,7 +433,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "commands:")
 	fmt.Fprintln(w, "  auth [token]              verify a Toggl API token and store config")
 	fmt.Fprintln(w, "  start [project] <task>    start tracking the task matching <task>")
-	fmt.Fprintln(w, "  add <range> [project] <task>  add a finished entry (e.g. 9-:30, 10:30-11)")
+	fmt.Fprintln(w, "  add <range> [project] <task>  add a finished entry (e.g. 9-:30, 10:30-11) [--desc TEXT]")
 	fmt.Fprintln(w, "  stop                      stop the running entry (snaps to 5m)")
 	fmt.Fprintln(w, "  current | status          show the running entry            [--json]")
 	fmt.Fprintln(w, "  today   | list | ls       show today's entries     [--days N] [--json]")

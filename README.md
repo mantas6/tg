@@ -63,6 +63,13 @@ Like `start`, `add` accepts `<project> <task>` to scope by project name (or set
 `TOGGL_PROJECT_ID`), stores the entry locally marked dirty, and best-effort
 pushes it to Toggl.
 
+Pass `--desc` (alias `--description`) to set the entry's description, which is
+carried through to Toggl on push:
+
+```sh
+tg add 9-:30 --desc "reset password flow" <task>
+```
+
 To see how much time you have tracked against particular tasks, use `total`.
 It queries the Toggl Reports API directly (no local cache) and lists one line
 per matched task plus a grand total. By default it covers the last 3 months
@@ -85,7 +92,7 @@ usage: tg <command> [flags]
 commands:
   auth [token]              verify a Toggl API token and store config
   start [project] <task>    start tracking the task matching <task>
-  add <range> [project] <task>  add a finished entry (e.g. 9-:30, 10:30-11)
+  add <range> [project] <task>  add a finished entry (e.g. 9-:30, 10:30-11) [--desc TEXT]
   stop                      stop the running entry (snaps to 5m)
   current | status          show the running entry            [--json]
   today   | list | ls       show today's entries     [--days N] [--json]

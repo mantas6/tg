@@ -378,7 +378,7 @@ func TestAddCreatesFinishedEntry(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, "9-:30", "login", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, nil, 1, nil, "9-:30", "login", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	out := buf.String()
@@ -413,11 +413,58 @@ func TestAddCreatesFinishedEntry(t *testing.T) {
 	if e.Duration != 1800 {
 		t.Errorf("duration = %d, want 1800", e.Duration)
 	}
+	// Without --desc the description stays empty (prior behavior unchanged).
+	if e.Description != "" {
+		t.Errorf("description = %q, want empty", e.Description)
+	}
 	if !e.Dirty {
 		t.Error("added entry should be dirty for a later push")
 	}
 	if r, _ := s.Running(); r != nil {
 		t.Errorf("add must not create a running entry, got %+v", r)
+	}
+}
+
+// TestAddWithDescription verifies --desc/--description sets the entry's
+// description on the stored entry.
+func TestAddWithDescription(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdAdd(&buf, s, nil, 1, nil, "9-:30", "login", "reset password flow", addNow, time.UTC); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	if got := entries[0].Description; got != "reset password flow" {
+		t.Errorf("description = %q, want %q", got, "reset password flow")
+	}
+}
+
+// TestAddDescriptionInPushPayload verifies a description set via --desc reaches
+// Toggl in the create payload on the best-effort push.
+func TestAddDescriptionInPushPayload(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		json.Unmarshal(raw, &body)
+		w.Write([]byte(`{"id":9200,"at":"2026-01-02T09:00:00Z"}`))
+	}))
+	defer srv.Close()
+	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+
+	var buf bytes.Buffer
+	if err := cmdAdd(&buf, s, c, 1, nil, "9-:30", "login", "reset password flow", addNow, time.UTC); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if got, _ := body["description"].(string); got != "reset password flow" {
+		t.Errorf("description = %v, want %q", body["description"], "reset password flow")
 	}
 }
 
@@ -430,7 +477,7 @@ func TestAddDoesNotStopRunning(t *testing.T) {
 	if err := cmdStart(&buf, s, nil, 1, nil, "review", testStart); err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	if err := cmdAdd(&buf, s, nil, 1, nil, "10-11", "login", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, nil, 1, nil, "10-11", "login", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	r, _ := s.Running()
@@ -446,7 +493,7 @@ func TestAddProjectScopeViaEnvID(t *testing.T) {
 	// "fix" matches several tasks, but scoping to project 2 leaves only one.
 	pid := int64(2)
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, &pid, "10-11", "fix", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, nil, 1, &pid, "10-11", "fix", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
@@ -471,7 +518,7 @@ func TestAddAmbiguous(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	err := cmdAdd(&buf, s, nil, 1, nil, "10-11", "write", addNow, time.UTC)
+	err := cmdAdd(&buf, s, nil, 1, nil, "10-11", "write", "", addNow, time.UTC)
 	if err == nil {
 		t.Fatal("expected ambiguity error")
 	}
@@ -488,7 +535,7 @@ func TestAddNoneSuggestsUpdate(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	err := cmdAdd(&buf, s, nil, 1, nil, "10-11", "nonexistent", addNow, time.UTC)
+	err := cmdAdd(&buf, s, nil, 1, nil, "10-11", "nonexistent", "", addNow, time.UTC)
 	if err == nil || !strings.Contains(err.Error(), "tg update") {
 		t.Errorf("err = %v, want suggestion to run `tg update`", err)
 	}
@@ -499,7 +546,7 @@ func TestAddInvalidTimesign(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	err := cmdAdd(&buf, s, nil, 1, nil, "nope", "login", addNow, time.UTC)
+	err := cmdAdd(&buf, s, nil, 1, nil, "nope", "login", "", addNow, time.UTC)
 	if err == nil || !strings.Contains(err.Error(), "timesign") {
 		t.Errorf("err = %v, want a timesign parse error", err)
 	}
@@ -525,7 +572,7 @@ func TestAddBestEffortPush(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, c, 1, nil, "9-:30", "login", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, c, 1, nil, "9-:30", "login", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	if gotMethod != http.MethodPost {
@@ -558,7 +605,7 @@ func TestAddSyncFailureIsNonFatal(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, c, 1, nil, "9-:30", "login", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, c, 1, nil, "9-:30", "login", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add should not fail on a sync error: %v", err)
 	}
 	if !strings.Contains(buf.String(), "warning") {

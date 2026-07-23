@@ -95,7 +95,10 @@ func cmdStart(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, pr
 // When c is non-nil the new entry is pushed to Toggl immediately, mirroring
 // cmdStart; the push is best-effort so a sync failure just leaves the entry
 // dirty (a warning is printed) for a later `tg push`.
-func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, projectID *int64, timesign, fragment string, now time.Time, loc *time.Location) error {
+//
+// desc is the entry's free-form description (from `--desc`/`--description`); an
+// empty desc leaves the description blank, matching the prior behavior.
+func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, projectID *int64, timesign, fragment, desc string, now time.Time, loc *time.Location) error {
 	start, stop, err := parseTimesign(timesign, now, loc)
 	if err != nil {
 		return err
@@ -129,7 +132,7 @@ func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, proj
 			WorkspaceID: workspaceID,
 			ProjectID:   &projID,
 			TaskID:      &taskID,
-			Description: "",
+			Description: desc,
 			Start:       start,
 			Stop:        &stop,
 			Duration:    int64(dur / time.Second),

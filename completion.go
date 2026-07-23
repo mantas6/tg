@@ -80,10 +80,13 @@ _tg() {
           __tg_tasks
           ;;
         add)
-          # First arg is the START-STOP range; later args are task names.
-          if (( CURRENT > 2 )); then
-            __tg_tasks
-          fi
+          # First positional is the START-STOP range; later args are task
+          # names. --desc/--description set the entry description.
+          _arguments \
+            '--desc[entry description]:description:' \
+            '--description[entry description (alias of --desc)]:description:' \
+            '1:time range:' \
+            '*:task fragment:__tg_tasks'
           ;;
         current|status|push)
           _arguments '--json[emit JSON]'
