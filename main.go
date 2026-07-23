@@ -303,6 +303,7 @@ func runPull(args []string) error {
 func runTotal(args []string) error {
 	fs := newFlagSet("total")
 	jsonOut := fs.Bool("json", false, "emit JSON")
+	sinceFlag := fs.String("since", "", "total entries since DATE (YYYY-MM-DD); default 3 months ago")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -310,9 +311,14 @@ func runTotal(args []string) error {
 	if err != nil {
 		return err
 	}
+	now := time.Now()
+	since, err := resolveTotalSince(*sinceFlag, now, time.Local)
+	if err != nil {
+		return err
+	}
 	// total queries the Reports API directly and never touches the local store,
 	// so no store is opened here (unlike the catalog-backed commands).
-	return cmdTotal(os.Stdout, api.New(cfg.APIToken), cfg.WorkspaceID, fs.Args(), time.Now(), time.Local, *jsonOut)
+	return cmdTotal(os.Stdout, api.New(cfg.APIToken), cfg.WorkspaceID, fs.Args(), since, now, time.Local, *jsonOut)
 }
 
 func runAuth(args []string) error {
@@ -377,6 +383,20 @@ func resolveSince(st *store.Store, sinceFlag string, now time.Time, loc *time.Lo
 	return now.AddDate(0, 0, -90), nil
 }
 
+// resolveTotalSince determines the `tg total` window start: an explicit --since
+// date (parsed in loc, mirroring resolveSince's format and error style), else
+// the default three calendar months before now.
+func resolveTotalSince(sinceFlag string, now time.Time, loc *time.Location) (time.Time, error) {
+	if sinceFlag != "" {
+		t, err := time.ParseInLocation("2006-01-02", sinceFlag, loc)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("invalid --since %q (want YYYY-MM-DD)", sinceFlag)
+		}
+		return t, nil
+	}
+	return now.AddDate(0, -3, 0), nil
+}
+
 // tokenSource returns a function that yields the API token: an explicit arg, a
 // piped (non-TTY) stdin line, or an interactive masked prompt.
 func tokenSource(args []string) func() (string, error) {
@@ -418,7 +438,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  update-projects           sync all workspace projects       [--all] [--json]")
 	fmt.Fprintln(w, "  push                      send local changes to Toggl       [--json]")
 	fmt.Fprintln(w, "  pull [project]            fetch changes; all projects, or one [--since DATE] [--json]")
-	fmt.Fprintln(w, "  total <task>...           total tracked hours per task (Reports API) [--json]")
+	fmt.Fprintln(w, "  total <task>...           total tracked hours per task; last 3 months [--since DATE] [--json]")
 	fmt.Fprintln(w, "  completion zsh            print the zsh completion script")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "sync: run `tg pull` then `tg push` for correct last-writer-wins.")

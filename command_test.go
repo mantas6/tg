@@ -954,14 +954,18 @@ func totalReportsServer(t *testing.T) (*api.Client, *map[string]any) {
 
 var totalNow = time.Date(2026, 1, 2, 15, 0, 0, 0, time.UTC)
 
+// totalSince is the default `tg total` window start: three calendar months
+// before totalNow (see resolveTotalSince), i.e. 2025-10-02.
+var totalSince = totalNow.AddDate(0, -3, 0)
+
 // TestTotalMultipleFragments verifies each positional fragment selects its
 // matching task, the totals come from the Reports API, and the bottom line sums
-// all listed tasks. It also checks the default all-time date range is sent.
+// all listed tasks. It also checks the default 3-month date range is sent.
 func TestTotalMultipleFragments(t *testing.T) {
 	c, body := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, c, 1, []string{"login", "review"}, totalNow, time.UTC, false); err != nil {
+	if err := cmdTotal(&buf, c, 1, []string{"login", "review"}, totalSince, totalNow, time.UTC, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	out := buf.String()
@@ -974,9 +978,28 @@ func TestTotalMultipleFragments(t *testing.T) {
 	if strings.Contains(out, "Write tests") || strings.Contains(out, "Write docs") {
 		t.Errorf("output should only list matched tasks:\n%s", out)
 	}
-	// The default (all-time) start date and today's end date are sent.
-	if (*body)["start_date"] != "2006-01-01" {
-		t.Errorf("start_date = %v, want 2006-01-01", (*body)["start_date"])
+	// The default 3-month start date and today's end date are sent.
+	if (*body)["start_date"] != "2025-10-02" {
+		t.Errorf("start_date = %v, want 2025-10-02", (*body)["start_date"])
+	}
+	if (*body)["end_date"] != "2026-01-02" {
+		t.Errorf("end_date = %v, want 2026-01-02", (*body)["end_date"])
+	}
+}
+
+// TestTotalSinceOverridesStart verifies an explicit since date sets the Reports
+// API start_date instead of the default 3-month window, while end_date stays
+// today.
+func TestTotalSinceOverridesStart(t *testing.T) {
+	c, body := totalReportsServer(t)
+
+	since := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	var buf bytes.Buffer
+	if err := cmdTotal(&buf, c, 1, []string{"login"}, since, totalNow, time.UTC, false); err != nil {
+		t.Fatalf("total: %v", err)
+	}
+	if (*body)["start_date"] != "2025-01-01" {
+		t.Errorf("start_date = %v, want 2025-01-01", (*body)["start_date"])
 	}
 	if (*body)["end_date"] != "2026-01-02" {
 		t.Errorf("end_date = %v, want 2026-01-02", (*body)["end_date"])
@@ -989,7 +1012,7 @@ func TestTotalFragmentMatchingMany(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, c, 1, []string{"write"}, totalNow, time.UTC, false); err != nil {
+	if err := cmdTotal(&buf, c, 1, []string{"write"}, totalSince, totalNow, time.UTC, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	out := buf.String()
@@ -1007,7 +1030,7 @@ func TestTotalDedupesAcrossFragments(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, c, 1, []string{"write", "docs"}, totalNow, time.UTC, false); err != nil {
+	if err := cmdTotal(&buf, c, 1, []string{"write", "docs"}, totalSince, totalNow, time.UTC, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	out := buf.String()
@@ -1024,7 +1047,7 @@ func TestTotalNoMatches(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	err := cmdTotal(&buf, c, 1, []string{"nonexistent"}, totalNow, time.UTC, false)
+	err := cmdTotal(&buf, c, 1, []string{"nonexistent"}, totalSince, totalNow, time.UTC, false)
 	if err == nil || !strings.Contains(err.Error(), "no task matches") {
 		t.Errorf("err = %v, want a no-match error", err)
 	}
@@ -1037,7 +1060,7 @@ func TestTotalRequiresFragment(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	err := cmdTotal(&buf, c, 1, []string{"  "}, totalNow, time.UTC, false)
+	err := cmdTotal(&buf, c, 1, []string{"  "}, totalSince, totalNow, time.UTC, false)
 	if err == nil || !strings.Contains(err.Error(), "usage") {
 		t.Errorf("err = %v, want a usage error for a blank fragment", err)
 	}
@@ -1047,7 +1070,7 @@ func TestTotalJSON(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, c, 1, []string{"login", "review"}, totalNow, time.UTC, true); err != nil {
+	if err := cmdTotal(&buf, c, 1, []string{"login", "review"}, totalSince, totalNow, time.UTC, true); err != nil {
 		t.Fatalf("total --json: %v", err)
 	}
 	var got struct {
@@ -1065,6 +1088,41 @@ func TestTotalJSON(t *testing.T) {
 	}
 	if got.TotalSeconds != 7200 {
 		t.Errorf("total_seconds = %d, want 7200", got.TotalSeconds)
+	}
+}
+
+// TestResolveTotalSinceDefault verifies the default window starts three
+// calendar months before now when no --since is given.
+func TestResolveTotalSinceDefault(t *testing.T) {
+	got, err := resolveTotalSince("", totalNow, time.UTC)
+	if err != nil {
+		t.Fatalf("resolveTotalSince: %v", err)
+	}
+	want := totalNow.AddDate(0, -3, 0)
+	if !got.Equal(want) {
+		t.Errorf("since = %v, want %v (3 months before now)", got, want)
+	}
+}
+
+// TestResolveTotalSinceOverride verifies an explicit --since date is parsed in
+// the given location.
+func TestResolveTotalSinceOverride(t *testing.T) {
+	got, err := resolveTotalSince("2025-01-01", totalNow, time.UTC)
+	if err != nil {
+		t.Fatalf("resolveTotalSince: %v", err)
+	}
+	want := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("since = %v, want %v", got, want)
+	}
+}
+
+// TestResolveTotalSinceInvalid verifies a malformed --since date is rejected
+// with the shared "invalid --since" error style.
+func TestResolveTotalSinceInvalid(t *testing.T) {
+	_, err := resolveTotalSince("not-a-date", totalNow, time.UTC)
+	if err == nil || !strings.Contains(err.Error(), "invalid --since") {
+		t.Errorf("err = %v, want an invalid --since error", err)
 	}
 }
 

@@ -64,11 +64,14 @@ Like `start`, `add` accepts `<project> <task>` to scope by project name (or set
 pushes it to Toggl.
 
 To see how much time you have tracked against particular tasks, use `total`.
-It queries the Toggl Reports API directly (no local cache) for all-time totals
-and lists one line per matched task plus a grand total:
+It queries the Toggl Reports API directly (no local cache) and lists one line
+per matched task plus a grand total. By default it covers the last 3 months
+(from today minus three months through today); pass `--since DATE` (YYYY-MM-DD)
+to override the start of the range:
 
 ```sh
-tg total login review      # totals for tasks matching "login" and "review"
+tg total login review                 # last 3 months for "login" and "review"
+tg total --since 2025-01-01 login     # from 2025-01-01 through today
 ```
 
 Each argument is a task-name fragment, matched the same case-insensitive way as
@@ -92,7 +95,7 @@ commands:
   update-projects           sync all workspace projects       [--all] [--json]
   push                      send local changes to Toggl       [--json]
   pull [project]            fetch changes; all projects, or one [--since DATE] [--json]
-  total <task>...           total tracked hours per task (Reports API) [--json]
+  total <task>...           total tracked hours per task; last 3 months [--since DATE] [--json]
   completion zsh            print the zsh completion script
 ```
 

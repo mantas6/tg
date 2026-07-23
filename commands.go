@@ -159,15 +159,16 @@ func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, proj
 }
 
 // cmdTotal reports per-task tracked totals straight from the Toggl Reports API
-// (never the local store): it fetches every task's summed seconds for the whole
-// available date range (2006-01-01 through now's calendar day in loc) and then
-// keeps only the tasks whose names match the given fragments. Each fragment is
-// matched against the reported task names with the same case-insensitive
-// substring / exact-title-wins semantics as `tg start` (see matchSummaryTasks);
-// tasks matched by more than one fragment are listed once. Output is one line
-// per matched task with its total, followed by the sum of all listed tasks. No
-// fragments, or no matches at all, is an error.
-func cmdTotal(w io.Writer, c *api.Client, workspaceID int64, fragments []string, now time.Time, loc *time.Location, jsonOut bool) error {
+// (never the local store): it fetches every task's summed seconds over the date
+// range [since, now] (both taken as calendar days in loc) and then keeps only
+// the tasks whose names match the given fragments. The window defaults to the
+// last three months (see runTotal/resolveTotalSince) and can be overridden with
+// `--since`. Each fragment is matched against the reported task names with the
+// same case-insensitive substring / exact-title-wins semantics as `tg start`
+// (see matchSummaryTasks); tasks matched by more than one fragment are listed
+// once. Output is one line per matched task with its total, followed by the sum
+// of all listed tasks. No fragments, or no matches at all, is an error.
+func cmdTotal(w io.Writer, c *api.Client, workspaceID int64, fragments []string, since, now time.Time, loc *time.Location, jsonOut bool) error {
 	var cleaned []string
 	for _, f := range fragments {
 		if f = strings.TrimSpace(f); f != "" {
@@ -178,8 +179,9 @@ func cmdTotal(w io.Writer, c *api.Client, workspaceID int64, fragments []string,
 		return errors.New("usage: tg total <task-fragment> [task-fragment...]")
 	}
 
+	startDate := since.In(loc).Format("2006-01-02")
 	endDate := now.In(loc).Format("2006-01-02")
-	rows, err := c.SummaryByTask(workspaceID, "", endDate)
+	rows, err := c.SummaryByTask(workspaceID, startDate, endDate)
 	if err != nil {
 		return err
 	}

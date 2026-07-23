@@ -107,7 +107,7 @@ _tg() {
           _arguments '--since[pull entries modified since DATE]:date (YYYY-MM-DD):' '--json[emit JSON]' '*:project fragment:'
           ;;
         total)
-          _arguments '--json[emit JSON]' '*:task fragment:__tg_tasks'
+          _arguments '--since[total entries since DATE (default 3 months ago)]:date (YYYY-MM-DD):' '--json[emit JSON]' '*:task fragment:__tg_tasks'
           ;;
         completion)
           local -a shells
