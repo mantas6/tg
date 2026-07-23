@@ -133,6 +133,8 @@ go test ./...
 go build ./...
 ```
 
+These same checks run automatically via GitHub Actions on every push to `main` and pull request.
+
 ## License
 
 [MIT](LICENSE)
