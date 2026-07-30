@@ -70,6 +70,12 @@ Like `start`, `add` accepts `<project> <task>` to scope by project name (or set
 `TOGGL_PROJECT_ID`), stores the entry locally marked dirty, and best-effort
 pushes it to Toggl.
 
+Time is exclusive: `add` refuses a span that overlaps an entry you already
+tracked and reports the conflict instead of recording it. Back-to-back entries
+are fine (one may start exactly when another ends); a running entry counts as
+occupying everything from its start onwards, so only spans ending at or before
+it are accepted while the timer runs.
+
 Pass `--desc` (alias `--description`) to set the entry's description, which is
 carried through to Toggl on push:
 

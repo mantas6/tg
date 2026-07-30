@@ -461,17 +461,88 @@ func TestAddDoesNotStopRunning(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	// A running entry created by start must survive an `add`.
+	// A running entry created by start must survive an `add`. The added span
+	// sits before the running entry began (09:00) so the overlap guard is
+	// happy: a running entry occupies everything from its start onwards.
 	var buf bytes.Buffer
 	if err := cmdStart(&buf, s, nil, 1, nil, "review", testStart); err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	if err := cmdAdd(&buf, s, nil, 1, nil, "10-11", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, nil, 1, nil, "7-8", "login", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	r, _ := s.Running()
 	if r == nil || r.TaskID == nil || *r.TaskID != 12 {
 		t.Fatalf("running entry = %+v, want Code review still running", r)
+	}
+}
+
+// TestAddRejectsOverlap covers the overlap guard: a span colliding with an
+// already tracked entry is refused, the error names the existing entry, and
+// nothing is written. Touching the neighbour's endpoints stays allowed.
+func TestAddRejectsOverlap(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdAdd(&buf, s, nil, 1, nil, "9-10", "login", "", addNow, time.UTC); err != nil {
+		t.Fatalf("add first: %v", err)
+	}
+
+	// 09:30-10:30 straddles the 09:00-10:00 entry.
+	buf.Reset()
+	err := cmdAdd(&buf, s, nil, 1, nil, "9:30-10:30", "review", "", addNow, time.UTC)
+	if err == nil {
+		t.Fatal("overlapping add = nil error, want an error")
+	}
+	for _, want := range []string{"overlaps existing entry", "09:00-10:00", "Fix login bug"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to mention %q", err, want)
+		}
+	}
+	if buf.Len() != 0 {
+		t.Errorf("output = %q, want nothing written", buf.String())
+	}
+
+	// Only the first entry exists; the rejected one was never created.
+	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+
+	// A back-to-back entry starting exactly when the first ends is fine.
+	buf.Reset()
+	if err := cmdAdd(&buf, s, nil, 1, nil, "10-11", "review", "", addNow, time.UTC); err != nil {
+		t.Fatalf("touching add: %v", err)
+	}
+	if entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(entries))
+	}
+}
+
+// TestAddRejectsOverlapWithRunningEntry checks a running entry blocks any span
+// reaching past its start, since it is still accruing time.
+func TestAddRejectsOverlapWithRunningEntry(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdStart(&buf, s, nil, 1, nil, "review", testStart); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	buf.Reset()
+	err := cmdAdd(&buf, s, nil, 1, nil, "8:30-9:30", "login", "", addNow, time.UTC)
+	if err == nil {
+		t.Fatal("add over a running entry = nil error, want an error")
+	}
+	for _, want := range []string{"overlaps existing entry", "09:00-running", "Code review"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to mention %q", err, want)
+		}
+	}
+	if entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1 (the running entry only)", len(entries))
 	}
 }
 

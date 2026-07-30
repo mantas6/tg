@@ -49,6 +49,22 @@ func entryLabel(e store.Entry) string {
 	return e.Description
 }
 
+// overlapLabel identifies a conflicting entry in an error message: its
+// wall-clock range in loc followed by its task name (or description). A running
+// entry has no stop, so its range reads "HH:MM-running".
+func overlapLabel(e store.Entry, loc *time.Location) string {
+	rng := formatClock(e.Start, loc) + "-"
+	if e.Running() {
+		rng += "running"
+	} else {
+		rng += formatClock(*e.Stop, loc)
+	}
+	if label := entryLabel(e); label != "" {
+		return rng + " " + label
+	}
+	return rng
+}
+
 // statusNameMax caps the task name shown by `status`/`current` so the terse
 // status line stays short enough for a status bar.
 const statusNameMax = 30

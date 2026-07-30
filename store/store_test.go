@@ -228,6 +228,106 @@ func TestEntriesBetweenOrdering(t *testing.T) {
 	}
 }
 
+// TestFindOverlapping tables the interval arithmetic of the overlap guard
+// against a single stored 10:00-11:00 entry: intersecting ranges match, and
+// ranges that only touch an endpoint do not.
+func TestFindOverlapping(t *testing.T) {
+	s := openTest(t)
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	at := func(h, m int) time.Time { return day.Add(time.Duration(h)*time.Hour + time.Duration(m)*time.Minute) }
+	existing := mustCreate(t, s, Entry{
+		WorkspaceID: 1, Start: at(10, 0), Stop: ptrTime(at(11, 0)),
+		Duration: 3600, UpdatedAt: at(10, 0),
+	})
+
+	cases := []struct {
+		name        string
+		start, stop time.Time
+		want        bool
+	}{
+		{"straddles start", at(9, 30), at(10, 30), true},
+		{"straddles stop", at(10, 30), at(11, 30), true},
+		{"contained", at(10, 15), at(10, 45), true},
+		{"contains", at(9, 0), at(12, 0), true},
+		{"identical", at(10, 0), at(11, 0), true},
+		{"touching before", at(9, 0), at(10, 0), false},
+		{"touching after", at(11, 0), at(12, 0), false},
+		{"well before", at(8, 0), at(9, 0), false},
+		{"well after", at(12, 0), at(13, 0), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := s.FindOverlapping(tc.start, tc.stop)
+			if err != nil {
+				t.Fatalf("FindOverlapping: %v", err)
+			}
+			if (len(got) > 0) != tc.want {
+				t.Fatalf("FindOverlapping(%s, %s) = %d entries, want overlap=%v",
+					tc.start.Format("15:04"), tc.stop.Format("15:04"), len(got), tc.want)
+			}
+			if tc.want && got[0].ID != existing {
+				t.Errorf("overlapping id = %d, want %d", got[0].ID, existing)
+			}
+		})
+	}
+}
+
+// TestFindOverlappingIgnoresDeleted keeps soft-deleted entries from blocking a
+// range they no longer occupy.
+func TestFindOverlappingIgnoresDeleted(t *testing.T) {
+	s := openTest(t)
+	start := time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)
+	mustCreate(t, s, Entry{
+		WorkspaceID: 1, Start: start, Stop: ptrTime(start.Add(time.Hour)),
+		Duration: 3600, UpdatedAt: start, Deleted: true,
+	})
+
+	got, err := s.FindOverlapping(start, start.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("FindOverlapping: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("FindOverlapping = %d entries, want 0 (deleted ignored)", len(got))
+	}
+}
+
+// TestFindOverlappingRunningEntry pins the open-ended treatment of a running
+// entry: it blocks anything reaching past its start, but not a range that ends
+// at or before it.
+func TestFindOverlappingRunningEntry(t *testing.T) {
+	s := openTest(t)
+	start := time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)
+	id := mustCreate(t, s, Entry{
+		WorkspaceID: 1, Start: start, Duration: -1, UpdatedAt: start, Dirty: true,
+	})
+
+	// A range extending past the running start overlaps, even far in the future.
+	for _, tc := range []struct {
+		name        string
+		start, stop time.Time
+	}{
+		{"overlaps head", start.Add(-30 * time.Minute), start.Add(30 * time.Minute)},
+		{"after start", start.Add(2 * time.Hour), start.Add(3 * time.Hour)},
+	} {
+		got, err := s.FindOverlapping(tc.start, tc.stop)
+		if err != nil {
+			t.Fatalf("FindOverlapping %s: %v", tc.name, err)
+		}
+		if len(got) != 1 || got[0].ID != id {
+			t.Errorf("FindOverlapping %s = %v, want the running entry %d", tc.name, got, id)
+		}
+	}
+
+	// Ending exactly at the running start only touches it.
+	got, err := s.FindOverlapping(start.Add(-time.Hour), start)
+	if err != nil {
+		t.Fatalf("FindOverlapping before: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("FindOverlapping before = %d entries, want 0", len(got))
+	}
+}
+
 func TestEntryJoinsProjectColor(t *testing.T) {
 	s := openTest(t)
 	if err := s.ReplaceProjects([]Project{

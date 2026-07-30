@@ -213,6 +213,28 @@ func (s *Store) EntriesBetween(from, to time.Time) ([]Entry, error) {
 	return collectEntries(rows)
 }
 
+// FindOverlapping returns the non-deleted entries whose tracked interval
+// intersects the half-open range [start, stop), ordered by start ascending. It
+// backs the overlap guard in `tg add`: an empty result means the range is free.
+//
+// Intervals are half-open, so entries that merely touch the range do not
+// overlap it (an entry ending exactly at start, or starting exactly at stop, is
+// fine). A running entry (stop NULL or duration -1) has no end yet, so it is
+// treated as open-ended and overlaps whenever it began before stop.
+func (s *Store) FindOverlapping(start, stop time.Time) ([]Entry, error) {
+	rows, err := s.db.Query(entrySelect+`
+WHERE e.deleted = 0
+  AND e.start < ?
+  AND (e.stop IS NULL OR e.duration < 0 OR e.stop > ?)
+ORDER BY e.start ASC`,
+		fmtTime(stop), fmtTime(start))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return collectEntries(rows)
+}
+
 // DirtyEntries returns every entry with unsynced local changes, oldest first.
 func (s *Store) DirtyEntries() ([]Entry, error) {
 	rows, err := s.db.Query(entrySelect + " WHERE e.dirty = 1 ORDER BY e.start ASC")

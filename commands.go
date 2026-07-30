@@ -111,6 +111,19 @@ func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, proj
 		return errors.New("usage: tg add <timesign> [project] <task-fragment>")
 	}
 
+	// Time is exclusive: refuse to record a span that collides with something
+	// already tracked (a running entry counts as occupying everything from its
+	// start onwards). Reported before the catalog lookup so the conflict is the
+	// error the user sees.
+	clashes, err := st.FindOverlapping(start, stop)
+	if err != nil {
+		return err
+	}
+	if len(clashes) > 0 {
+		return fmt.Errorf("%s-%s overlaps existing entry %s",
+			formatClock(start, loc), formatClock(stop, loc), overlapLabel(clashes[0], loc))
+	}
+
 	tasks, err := st.FindTasksByFragment(fragment, projectID)
 	if err != nil {
 		return err
