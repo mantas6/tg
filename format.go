@@ -309,25 +309,24 @@ func renderCurrent(w io.Writer, last *store.Entry, dayTotal time.Duration, now t
 	}
 
 	if last == nil {
-		fmt.Fprintln(w, "No entries.")
-		fmt.Fprintln(w, "Today: "+formatHM(dayTotal))
+		fmt.Fprintln(w, "No entries. Today: "+formatHM(dayTotal))
 		return nil
 	}
 	label := truncName(entryLabel(*last), statusNameMax)
 	if last.ProjectName != "" {
 		label += " [" + last.ProjectName + "]"
 	}
+	var line string
 	if last.Stop == nil {
-		fmt.Fprintf(w, "run %s (%s)\n", label, formatHM(now.Sub(last.Start)))
+		line = fmt.Sprintf("run %s (%s)", label, formatHM(now.Sub(last.Start)))
 	} else {
-		line := fmt.Sprintf("last %s %s-%s", label,
+		line = fmt.Sprintf("%s %s-%s", label,
 			formatClock(last.Start, loc), formatClock(*last.Stop, loc))
 		if gap > 0 {
 			line += " (gap " + formatHM(gap) + ")"
 		}
-		fmt.Fprintln(w, line)
 	}
-	fmt.Fprintln(w, "Today: "+formatHM(dayTotal))
+	fmt.Fprintln(w, line+" Today: "+formatHM(dayTotal))
 	return nil
 }
 

@@ -446,9 +446,9 @@ func TestRenderCurrentGapSuppressed(t *testing.T) {
 		now  time.Time
 		want string
 	}{
-		{"at stop", stop, "last Fix login bug [Backend] 09:15-10:30\nToday: 1h15m\n"},
-		{"sub-minute noise", stop.Add(30 * time.Second), "last Fix login bug [Backend] 09:15-10:30\nToday: 1h15m\n"},
-		{"across midnight", stop.Add(20 * time.Hour), "last Fix login bug [Backend] 09:15-10:30 (gap 20h00m)\nToday: 1h15m\n"},
+		{"at stop", stop, "Fix login bug [Backend] 09:15-10:30 Today: 1h15m\n"},
+		{"sub-minute noise", stop.Add(30 * time.Second), "Fix login bug [Backend] 09:15-10:30 Today: 1h15m\n"},
+		{"across midnight", stop.Add(20 * time.Hour), "Fix login bug [Backend] 09:15-10:30 (gap 20h00m) Today: 1h15m\n"},
 	}
 	for _, c := range cases {
 		var buf bytes.Buffer
@@ -523,7 +523,7 @@ func TestRenderCurrentTruncatesName(t *testing.T) {
 	if strings.Contains(got, "since") {
 		t.Errorf("status line still shows wall-clock start: %q", got)
 	}
-	want := "run This task name is definitely … [Backend] (0h45m)\nToday: 0h45m\n"
+	want := "run This task name is definitely … [Backend] (0h45m) Today: 0h45m\n"
 	if got != want {
 		t.Errorf("status line = %q, want %q", got, want)
 	}

@@ -2031,7 +2031,7 @@ func TestCurrentCommandLastEntryAndGap(t *testing.T) {
 	if err := cmdCurrent(&buf, s, now, time.UTC, false); err != nil {
 		t.Fatalf("current: %v", err)
 	}
-	want := "last Code review [Backend] 10:30-11:00 (gap 0h25m)\nToday: 1h45m\n"
+	want := "Code review [Backend] 10:30-11:00 (gap 0h25m) Today: 1h45m\n"
 	if buf.String() != want {
 		t.Errorf("status = %q, want %q", buf.String(), want)
 	}
@@ -2059,7 +2059,7 @@ func TestCurrentCommandEmptyStore(t *testing.T) {
 	if err := cmdCurrent(&buf, s, testStart, time.UTC, false); err != nil {
 		t.Fatalf("current: %v", err)
 	}
-	if want := "No entries.\nToday: 0h00m\n"; buf.String() != want {
+	if want := "No entries. Today: 0h00m\n"; buf.String() != want {
 		t.Errorf("status = %q, want %q", buf.String(), want)
 	}
 }
@@ -2085,7 +2085,7 @@ func TestCurrentCommandRunningWinsOverNewerEntry(t *testing.T) {
 	if err := cmdCurrent(&buf, s, now, time.UTC, false); err != nil {
 		t.Fatalf("current: %v", err)
 	}
-	want := "run Code review [Backend] (0h30m)\nToday: 1h30m\n"
+	want := "run Code review [Backend] (0h30m) Today: 1h30m\n"
 	if buf.String() != want {
 		t.Errorf("status = %q, want %q", buf.String(), want)
 	}

@@ -141,8 +141,7 @@ wall-clock range, the idle gap since it stopped, and today's tracked total.
 
 ```sh
 $ tg status
-last Code review [Backend] 10:30-11:00 (gap 0h25m)
-Today: 6h30m
+Code review [Backend] 10:30-11:00 (gap 0h25m) Today: 6h30m
 ```
 
 The task name is truncated to 30 characters so the line fits a status bar. The
@@ -153,8 +152,7 @@ reported as running with its live elapsed time instead:
 
 ```sh
 $ tg status
-run Code review [Backend] (0h45m)
-Today: 2h00m
+run Code review [Backend] (0h45m) Today: 2h00m
 ```
 
 With `--json` the same facts come back as
