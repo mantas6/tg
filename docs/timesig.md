@@ -1,8 +1,7 @@
 # Time signature ("timesign") spec
 
 A *timesign* is the compact wall-clock notation `tg` accepts wherever a command
-needs a finished time range (today: `tg add`; later also `tg mod`). Two forms
-exist:
+needs a finished time range (`tg add`, `tg mod`). Two forms exist:
 
 | Form     | Shape         | Example  | Meaning                                    |
 | -------- | ------------- | -------- | ------------------------------------------ |
@@ -92,6 +91,38 @@ Examples (assuming now = 15:07 unless noted):
 
 Relative timesigns always floor (never round to the *nearest* mark), so a freshly
 added entry can never claim time in the future.
+
+## Interpretation per command
+
+The parser above is shared, but a command decides which reference instant a
+timesign is resolved against, and `tg mod` deliberately reads the relative form
+differently from `tg add`.
+
+### `tg add <timesign>`
+
+The plain reading of both forms: absolute ranges land on **today**, and a
+relative span **ends at now** (floored to the preceding 5-minute mark) and
+starts `DURATION` earlier. This is the "I just worked that long" case.
+
+### `tg mod [num] <timesign>`
+
+`mod` retimes an entry that already exists, so both forms are anchored to that
+entry instead of to today/now:
+
+| Form                | Effect on the entry                                        |
+| ------------------- | ---------------------------------------------------------- |
+| absolute `9-10:30`  | start and stop are set on the **entry's own calendar day** |
+| relative `+:20`     | the entry **keeps its start**; stop becomes start + `DURATION` |
+
+So a relative timesign sets the entry's **length**, it does not re-anchor the
+entry to now: `tg mod +:30` means "that entry was 30 minutes long", leaving the
+start where it is. Fixing a length is the common correction, and re-anchoring
+would silently move an entry recorded hours (or days) ago.
+
+The duration rules are otherwise unchanged: `+0` and friends are still errors,
+and the 5-minute flooring is irrelevant here because only `DURATION` is used.
+Absolute ranges still cannot cross midnight, and the resulting span must not
+overlap another entry.
 
 ## Error cases
 

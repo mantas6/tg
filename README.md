@@ -83,6 +83,37 @@ carried through to Toggl on push:
 tg add 9-:30 --desc "reset password flow" <task>
 ```
 
+### Fixing and removing entries
+
+`mod` edits an entry that already exists and `del` removes one. Both address
+entries by the small local numbers printed by `tg ls` (see below); `mod` also
+defaults to the most recent entry when no number is given.
+
+```sh
+tg mod +:30                      # the last entry was 30 minutes long
+tg mod 2 +1:15                   # entry 2 was 1h15m long
+tg mod 2 9-10:30                 # set entry 2's range explicitly
+tg mod --desc "reset password"   # only change the last entry's description
+tg mod 2 +:45 --desc "rebased"   # retime and re-describe entry 2
+tg del 3                         # remove entry 3
+```
+
+A timesign is read relative to the entry, not to today:
+
+- an **absolute** range (`9-10:30`) sets start and stop on the entry's *own*
+  calendar day, so an entry from yesterday stays on yesterday;
+- a **relative** timesign (`+:30`) sets only the entry's *length*: the start is
+  kept and the stop moves to start + duration. It does **not** re-anchor the
+  entry to now the way `tg add` does.
+
+`mod` requires at least one change (a timesign, `--desc`, or both), refuses a new
+range that would overlap a *different* entry, and `--desc ""` clears the
+description. `del` is a soft delete: the entry disappears from listings at once
+and the removal is pushed to Toggl. Both mark the entry dirty and best-effort
+push, just like `add`, so a failed or skipped sync just leaves the change for the
+next `tg push`. A number that no longer resolves (the listing is stale, or the
+entry is gone) is an error telling you to re-run `tg ls`.
+
 To see how much time you have tracked against particular tasks, use `total`.
 It queries the Toggl Reports API directly (no local cache) and lists one line
 per matched task plus a grand total. By default it covers the last 3 months
@@ -153,6 +184,8 @@ usage: tg <command> [flags]
 commands:
   auth [token]              verify a Toggl API token and store config
   add <timesign> [project] <task>  add a finished entry [--desc TEXT]
+  mod [num] [timesign]      retime/rename an entry (default: last) [--desc TEXT]
+  del <num>                 delete the entry numbered by `tg ls`
   current | status          last entry, gap, day total        [--json]
   today   | list | ls       show today's entries     [--days N] [--json]
   tasks                     list cached tasks         [--all] [--json]
@@ -167,6 +200,10 @@ commands:
 timesign: absolute 9-:30, 10-11, 10:30-11:15 (today) or relative
       +:20, +1, +1:20 (that long, ending at the last 5m mark).
       Full spec: docs/timesig.md
+mod:  numbers come from the last `tg ls`; without one the last entry
+      is modified. An absolute timesign sets the range on the entry's
+      own day; a relative one only sets its LENGTH, keeping the start
+      (`tg mod +:30` makes the entry 30m long).
 ```
 
 ### Syncing

@@ -239,12 +239,21 @@ func (s *Store) EntriesBetween(from, to time.Time) ([]Entry, error) {
 // fine). A running entry (stop NULL or duration -1) has no end yet, so it is
 // treated as open-ended and overlaps whenever it began before stop.
 func (s *Store) FindOverlapping(start, stop time.Time) ([]Entry, error) {
+	return s.FindOverlappingExcluding(start, stop, 0)
+}
+
+// FindOverlappingExcluding is FindOverlapping with one entry left out of the
+// search by local id. It backs the overlap guard in `tg mod`, which must not
+// see the entry it is retiming as a conflict with itself. Ids start at 1, so
+// excludeID 0 excludes nothing (that is what FindOverlapping passes).
+func (s *Store) FindOverlappingExcluding(start, stop time.Time, excludeID int64) ([]Entry, error) {
 	rows, err := s.db.Query(entrySelect+`
 WHERE e.deleted = 0
+  AND e.id <> ?
   AND e.start < ?
   AND (e.stop IS NULL OR e.duration < 0 OR e.stop > ?)
 ORDER BY e.start ASC`,
-		fmtTime(stop), fmtTime(start))
+		excludeID, fmtTime(stop), fmtTime(start))
 	if err != nil {
 		return nil, err
 	}
@@ -304,6 +313,53 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		return 0, err
 	}
 	return res.LastInsertId()
+}
+
+// UpdateEntry writes the locally editable fields of an entry — description,
+// start, stop and duration — back to the row identified by e.ID, then records
+// e.UpdatedAt as the LWW clock and marks the row dirty so a later `tg push`
+// sends the change. It backs `tg mod`; remote_id, synced_at and the deleted
+// flag are deliberately left alone, so an already-synced entry keeps its remote
+// identity and is PUT rather than re-created. A missing id is an error.
+func (s *Store) UpdateEntry(e Entry) error {
+	res, err := s.db.Exec(`
+UPDATE entries SET description = ?, start = ?, stop = ?, duration = ?,
+  updated_at = ?, dirty = 1 WHERE id = ?`,
+		e.Description, fmtTime(e.Start), nullTime(e.Stop), e.Duration,
+		fmtTime(e.UpdatedAt), e.ID)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res, e.ID)
+}
+
+// SoftDeleteEntry marks an entry deleted and dirty, keeping the row so the
+// deletion can be pushed: sync.Push DELETEs it remotely (when it has a remote
+// id) and only then drops the row. Every read path filters deleted rows out, so
+// the entry disappears from listings immediately. It backs `tg del`; at becomes
+// the entry's LWW clock. A missing id is an error.
+func (s *Store) SoftDeleteEntry(id int64, at time.Time) error {
+	res, err := s.db.Exec(
+		"UPDATE entries SET deleted = 1, dirty = 1, updated_at = ? WHERE id = ?",
+		fmtTime(at), id)
+	if err != nil {
+		return err
+	}
+	return checkAffected(res, id)
+}
+
+// checkAffected turns an UPDATE that matched no row into an error, so a stale
+// entry id fails loudly instead of silently doing nothing. Drivers that cannot
+// report the count are treated as success.
+func checkAffected(res sql.Result, id int64) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil
+	}
+	if n == 0 {
+		return fmt.Errorf("no entry with id %d", id)
+	}
+	return nil
 }
 
 // MarkSynced records a successful push: stores the remote id, clears dirty, and

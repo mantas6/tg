@@ -110,6 +110,135 @@ func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, proj
 	}
 }
 
+// cmdMod edits a single existing entry in place: its times (from a timesign),
+// its description, or both. At least one change must be requested.
+//
+// ref selects the entry: a local number published by the last `tg ls` (see
+// store.EntryByRef), or 0 meaning "the most recent entry" (store.LastEntry).
+//
+// The timesign is interpreted by form (see docs/timesig.md):
+//
+//	absolute (9-10:30)  start and stop are set on the ENTRY's calendar day,
+//	                    not today's, so an entry from yesterday stays there.
+//	relative (+:20)     only the DURATION is taken: the entry keeps its start
+//	                    and its stop moves to start+duration. Fixing an
+//	                    entry's length is what mod is for, so a relative
+//	                    timesign is not re-anchored to now here (unlike `add`).
+//
+// setDesc distinguishes an omitted --desc from an explicit empty one, so a
+// description can be cleared with --desc "".
+//
+// Retiming is refused when the new span would overlap another entry (the entry
+// being modified is excluded from the check). The entry is stored dirty so a
+// later `tg push` sends it; when c is non-nil the push is attempted immediately,
+// best-effort, exactly like `tg add`.
+func cmdMod(w io.Writer, st *store.Store, c *api.Client, ref int, timesign, desc string, setDesc bool, now time.Time, loc *time.Location) error {
+	if timesign == "" && !setDesc {
+		return errors.New("usage: tg mod [entry-number] [timesign] [--desc TEXT]")
+	}
+
+	e, err := modTarget(st, ref)
+	if err != nil {
+		return err
+	}
+
+	if timesign != "" {
+		start, stop, err := modSpan(e, timesign, now, loc)
+		if err != nil {
+			return err
+		}
+		// Time is exclusive (see cmdAdd), but the entry may of course keep
+		// overlapping itself, so it is excluded from the conflict search.
+		clashes, err := st.FindOverlappingExcluding(start, stop, e.ID)
+		if err != nil {
+			return err
+		}
+		if len(clashes) > 0 {
+			return fmt.Errorf("%s-%s overlaps existing entry %s",
+				formatClock(start, loc), formatClock(stop, loc), overlapLabel(clashes[0], loc))
+		}
+		e.Start = start
+		e.Stop = &stop
+		e.Duration = int64(stop.Sub(start) / time.Second)
+	}
+	if setDesc {
+		e.Description = strings.TrimSpace(desc)
+	}
+
+	e.UpdatedAt = now
+	if err := st.UpdateEntry(e); err != nil {
+		return err
+	}
+	renderEntryChange(w, "Modified", e, loc)
+	if c != nil {
+		if _, err := sync.Push(st, c, now); err != nil {
+			fmt.Fprintf(w, "warning: could not sync to Toggl: %v\n", err)
+		}
+	}
+	return nil
+}
+
+// modTarget resolves the entry `tg mod` acts on: the local number ref when it is
+// positive, otherwise the most recent entry.
+func modTarget(st *store.Store, ref int) (store.Entry, error) {
+	if ref > 0 {
+		return st.EntryByRef(ref)
+	}
+	last, err := st.LastEntry()
+	if err != nil {
+		return store.Entry{}, err
+	}
+	if last == nil {
+		return store.Entry{}, errors.New("no entries to modify")
+	}
+	return *last, nil
+}
+
+// modSpan computes an entry's new [start, stop) from a timesign: an absolute
+// sign is resolved on the entry's own calendar day, while a relative sign
+// contributes only its duration, keeping the entry's start (see cmdMod).
+func modSpan(e store.Entry, timesign string, now time.Time, loc *time.Location) (time.Time, time.Time, error) {
+	if timesig.IsRelative(timesign) {
+		span, err := timesig.ParseRelative(timesign, now, loc)
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		return e.Start, e.Start.Add(span.Duration()), nil
+	}
+	// e.Start stands in for "now" so the range lands on the entry's day.
+	span, err := timesig.ParseAbsolute(timesign, e.Start, loc)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	return span.Start, span.Stop, nil
+}
+
+// cmdDel deletes the entry addressed by the local number ref (published by the
+// last `tg ls`; see store.EntryByRef). The deletion is soft: the row is marked
+// deleted and dirty so it vanishes from every listing at once and the removal
+// can still be pushed to Toggl, which is where the row is finally dropped (see
+// sync.Push). When c is non-nil that push is attempted immediately,
+// best-effort, exactly like `tg add`.
+func cmdDel(w io.Writer, st *store.Store, c *api.Client, ref int, now time.Time, loc *time.Location) error {
+	if ref < 1 {
+		return errors.New("usage: tg del <entry-number>")
+	}
+	e, err := st.EntryByRef(ref)
+	if err != nil {
+		return err
+	}
+	if err := st.SoftDeleteEntry(e.ID, now); err != nil {
+		return err
+	}
+	renderEntryChange(w, "Deleted", e, loc)
+	if c != nil {
+		if _, err := sync.Push(st, c, now); err != nil {
+			fmt.Fprintf(w, "warning: could not sync to Toggl: %v\n", err)
+		}
+	}
+	return nil
+}
+
 // cmdTotal reports per-task tracked totals straight from the Toggl Reports API
 // (never the local store): it fetches every task's summed seconds over the date
 // range [since, now] (both taken as calendar days in loc) and then keeps only

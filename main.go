@@ -36,6 +36,10 @@ func run(cmd string, args []string) error {
 		return runAuth(args)
 	case "add":
 		return runAdd(args)
+	case "mod":
+		return runMod(args)
+	case "del":
+		return runDel(args)
 	case "current", "status":
 		return runCurrent(args)
 	case "today", "list", "ls":
@@ -107,6 +111,66 @@ func runAdd(args []string) error {
 		fragment = rest[1]
 	}
 	return cmdAdd(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectID, timesign, fragment, desc, time.Now(), time.Local)
+}
+
+func runMod(args []string) error {
+	fs := newFlagSet("mod")
+	// Same --desc/--description alias pair as `add`; here an explicitly empty
+	// value clears the description, which is why the flag's presence is tracked
+	// separately (see setDesc below).
+	var desc string
+	fs.StringVar(&desc, "desc", "", "new entry description")
+	fs.StringVar(&desc, "description", "", "new entry description (alias of --desc)")
+	rest, err := parseArgsAndFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	setDesc := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "desc" || f.Name == "description" {
+			setDesc = true
+		}
+	})
+
+	ref, timesign, err := parseModArgs(rest)
+	if err != nil {
+		return err
+	}
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	c, err := optionalClient()
+	if err != nil {
+		return err
+	}
+	return cmdMod(os.Stdout, st, c, ref, timesign, desc, setDesc, time.Now(), time.Local)
+}
+
+func runDel(args []string) error {
+	fs := newFlagSet("del")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) != 1 {
+		return errors.New("usage: tg del <entry-number>")
+	}
+	ref, err := parseEntryRef(rest[0])
+	if err != nil {
+		return err
+	}
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	c, err := optionalClient()
+	if err != nil {
+		return err
+	}
+	return cmdDel(os.Stdout, st, c, ref, time.Now(), time.Local)
 }
 
 func runCurrent(args []string) error {
@@ -307,6 +371,90 @@ func openStore() (*store.Store, error) {
 	return store.Open(path)
 }
 
+// optionalClient builds an API client from the stored config for the
+// best-effort pushes done by the mutating commands. A missing config is not an
+// error: the local edit still applies and stays dirty for a later `tg push`,
+// which keeps `mod`/`del` usable before `tg auth`.
+func optionalClient() (*api.Client, error) {
+	cfg, err := config.Load()
+	if errors.Is(err, config.ErrNotConfigured) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return api.New(cfg.APIToken), nil
+}
+
+// parseArgsAndFlags parses args with fs and returns the positional arguments,
+// tolerating flags that appear AFTER a positional. The flag package stops at the
+// first non-flag argument, which would make `tg mod 2 --desc x` treat --desc as
+// a positional; parsing is therefore resumed after each positional is peeled
+// off. Flag values set by earlier rounds are retained, so the order in which
+// flags and positionals are mixed does not matter.
+func parseArgsAndFlags(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positional []string
+	rest := args
+	for {
+		if err := fs.Parse(rest); err != nil {
+			return nil, err
+		}
+		rest = fs.Args()
+		if len(rest) == 0 {
+			return positional, nil
+		}
+		positional = append(positional, rest[0])
+		rest = rest[1:]
+	}
+}
+
+// parseModArgs classifies `tg mod`'s positional arguments. An all-digits
+// argument is a local entry number (0 when absent, meaning the last entry);
+// anything else is the timesign, since neither timesign form is bare digits (an
+// absolute one needs a `-`, a relative one a leading `+`). Order does not
+// matter, and neither may be given twice.
+func parseModArgs(args []string) (ref int, timesign string, err error) {
+	for _, a := range args {
+		if isDigits(a) {
+			if ref != 0 {
+				return 0, "", fmt.Errorf("unexpected second entry number %q", a)
+			}
+			if ref, err = parseEntryRef(a); err != nil {
+				return 0, "", err
+			}
+			continue
+		}
+		if timesign != "" {
+			return 0, "", fmt.Errorf("unexpected second timesign %q", a)
+		}
+		timesign = a
+	}
+	return ref, timesign, nil
+}
+
+// parseEntryRef parses a local entry number (1, 2, 3... as shown by `tg ls`).
+func parseEntryRef(s string) (int, error) {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("invalid entry number %q; run `tg ls` to list entries", s)
+	}
+	return n, nil
+}
+
+// isDigits reports whether s is a non-empty run of ASCII digits (no sign, no
+// separators), which is what distinguishes an entry number from a timesign.
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // projectIDFromEnv parses TOGGL_PROJECT_ID, returning nil when unset/invalid.
 func projectIDFromEnv() *int64 {
 	v := strings.TrimSpace(os.Getenv("TOGGL_PROJECT_ID"))
@@ -383,6 +531,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "commands:")
 	fmt.Fprintln(w, "  auth [token]              verify a Toggl API token and store config")
 	fmt.Fprintln(w, "  add <timesign> [project] <task>  add a finished entry [--desc TEXT]")
+	fmt.Fprintln(w, "  mod [num] [timesign]      retime/rename an entry (default: last) [--desc TEXT]")
+	fmt.Fprintln(w, "  del <num>                 delete the entry numbered by `tg ls`")
 	fmt.Fprintln(w, "  current | status          last entry, gap, day total        [--json]")
 	fmt.Fprintln(w, "  today   | list | ls       show today's entries     [--days N] [--json]")
 	fmt.Fprintln(w, "  tasks                     list cached tasks                 [--all] [--json]")
@@ -397,6 +547,10 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "timesign: absolute 9-:30, 10-11, 10:30-11:15 (today) or relative")
 	fmt.Fprintln(w, "      +:20, +1, +1:20 (that long, ending at the last 5m mark).")
 	fmt.Fprintln(w, "      Full spec: docs/timesig.md")
+	fmt.Fprintln(w, "mod:  numbers come from the last `tg ls`; without one the last entry")
+	fmt.Fprintln(w, "      is modified. An absolute timesign sets the range on the entry's")
+	fmt.Fprintln(w, "      own day; a relative one only sets its LENGTH, keeping the start")
+	fmt.Fprintln(w, "      (`tg mod +:30` makes the entry 30m long).")
 	fmt.Fprintln(w, "sync: run `tg pull` then `tg push` for correct last-writer-wins.")
 	fmt.Fprintln(w, "env:  TOGGL_PROJECT_ID scopes `add`/`tasks`/`update` to one project")
 	fmt.Fprintln(w, "      (and sets the project on entries created by `add`). `pull`")

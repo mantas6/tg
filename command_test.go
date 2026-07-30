@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"flag"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -484,6 +485,614 @@ func TestAddSyncFailureIsNonFatal(t *testing.T) {
 	}
 	if entries[0].RemoteID != nil {
 		t.Errorf("remote_id = %v, want nil (never synced)", entries[0].RemoteID)
+	}
+}
+
+// --- mod / del ---------------------------------------------------------------
+
+// modNow is the reference instant `mod`/`del` resolve relative timesigns and
+// updated_at against. It sits after the fixture entries below (which live on
+// 2026-01-02 morning), like a real invocation later in the day.
+var modNow = time.Date(2026, 1, 2, 15, 7, 0, 0, time.UTC)
+
+// seedModDay inserts two clean, already-synced finished entries on testStart's
+// day (09:00-10:00 Fix login bug, 10:00-11:00 Code review) and publishes the
+// `tg ls` numbering for them, so entry 1 and 2 are addressable. Both carry a
+// remote id and are non-dirty, so a later mod/del has to mark them dirty itself.
+func seedModDay(t *testing.T, s *store.Store) []store.Entry {
+	t.Helper()
+	stop1 := testStart.Add(time.Hour)
+	start2 := stop1
+	stop2 := start2.Add(time.Hour)
+	if _, err := s.CreateEntry(store.Entry{
+		RemoteID: p(9001), WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
+		Start: testStart, Stop: &stop1, Duration: 3600, UpdatedAt: stop1,
+		SyncedAt: &stop1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateEntry(store.Entry{
+		RemoteID: p(9002), WorkspaceID: 1, ProjectID: p(1), TaskID: p(12),
+		Start: start2, Stop: &stop2, Duration: 3600, UpdatedAt: stop2,
+		SyncedAt: &stop2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := s.EntriesBetween(testStart.Add(-24*time.Hour), testStart.Add(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("fixture has %d entries, want 2", len(entries))
+	}
+	ids := make([]int64, len(entries))
+	for i, e := range entries {
+		ids[i] = e.ID
+	}
+	if err := s.SaveEntryRefs(ids); err != nil {
+		t.Fatal(err)
+	}
+	return entries
+}
+
+// entryByID reads a single entry back from the store by local id, including
+// deleted ones (which no listing returns), so tests can assert on the row that
+// a mutation left behind.
+func entryByID(t *testing.T, s *store.Store, id int64) store.Entry {
+	t.Helper()
+	dirty, err := s.DirtyEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range dirty {
+		if e.ID == id {
+			return e
+		}
+	}
+	entries, err := s.EntriesBetween(testStart.Add(-48*time.Hour), testStart.Add(48*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.ID == id {
+			return e
+		}
+	}
+	t.Fatalf("no entry with id %d", id)
+	return store.Entry{}
+}
+
+// TestModLastEntryRelativeTimesign covers the default target (no number = the
+// last entry) and mod's reading of a relative timesign: the start is kept and
+// the stop moves to start+duration, so the entry is simply made 30m long. It is
+// deliberately NOT re-anchored to now the way `tg add` would.
+func TestModLastEntryRelativeTimesign(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+	last := entries[1] // 10:00-11:00 Code review
+
+	var buf bytes.Buffer
+	if err := cmdMod(&buf, s, nil, 0, "+:30", "", false, modNow, time.UTC); err != nil {
+		t.Fatalf("mod: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"Modified: Code review", "10:00-10:30", "0h30m"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output = %q, want %q", out, want)
+		}
+	}
+
+	got := entryByID(t, s, last.ID)
+	if !got.Start.Equal(last.Start) {
+		t.Errorf("start = %v, want it unchanged at %v", got.Start, last.Start)
+	}
+	wantStop := last.Start.Add(30 * time.Minute)
+	if got.Stop == nil || !got.Stop.Equal(wantStop) {
+		t.Errorf("stop = %v, want %v", got.Stop, wantStop)
+	}
+	if got.Duration != 1800 {
+		t.Errorf("duration = %d, want 1800", got.Duration)
+	}
+	if !got.Dirty {
+		t.Error("modified entry should be dirty for a later push")
+	}
+	if !got.UpdatedAt.Equal(modNow) {
+		t.Errorf("updated_at = %v, want %v", got.UpdatedAt, modNow)
+	}
+	// The remote identity survives, so the push is an update, not a re-create.
+	if got.RemoteID == nil || *got.RemoteID != 9002 {
+		t.Errorf("remote_id = %v, want 9002", got.RemoteID)
+	}
+	// The untargeted entry is untouched.
+	if first := entryByID(t, s, entries[0].ID); first.Dirty {
+		t.Error("mod touched the entry it was not addressing")
+	}
+}
+
+// TestModEntryByNumber verifies an explicit local number addresses that entry
+// (not the last one) and that an absolute timesign sets the range on the
+// ENTRY's own calendar day rather than today's.
+func TestModEntryByNumber(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+
+	// modNow is 15:07 on the same day as the fixture; to prove the entry's own
+	// day is used, run mod a day later.
+	nextDay := modNow.AddDate(0, 0, 1)
+	var buf bytes.Buffer
+	if err := cmdMod(&buf, s, nil, 1, "8-9:30", "", false, nextDay, time.UTC); err != nil {
+		t.Fatalf("mod: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "Modified: Fix login bug") || !strings.Contains(out, "08:00-09:30") {
+		t.Errorf("output = %q, want the retimed first entry", out)
+	}
+
+	got := entryByID(t, s, entries[0].ID)
+	wantStart := time.Date(2026, 1, 2, 8, 0, 0, 0, time.UTC)
+	wantStop := time.Date(2026, 1, 2, 9, 30, 0, 0, time.UTC)
+	if !got.Start.Equal(wantStart) {
+		t.Errorf("start = %v, want %v (the entry's own day)", got.Start, wantStart)
+	}
+	if got.Stop == nil || !got.Stop.Equal(wantStop) {
+		t.Errorf("stop = %v, want %v", got.Stop, wantStop)
+	}
+	if got.Duration != 5400 {
+		t.Errorf("duration = %d, want 5400", got.Duration)
+	}
+	if second := entryByID(t, s, entries[1].ID); second.Dirty {
+		t.Error("mod 1 must not touch entry 2")
+	}
+}
+
+// TestModDescriptionOnly verifies --desc alone is a valid change and leaves the
+// times exactly as they were.
+func TestModDescriptionOnly(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+	target := entries[0]
+
+	var buf bytes.Buffer
+	if err := cmdMod(&buf, s, nil, 1, "", "rebased onto main", true, modNow, time.UTC); err != nil {
+		t.Fatalf("mod: %v", err)
+	}
+	got := entryByID(t, s, target.ID)
+	if got.Description != "rebased onto main" {
+		t.Errorf("description = %q, want %q", got.Description, "rebased onto main")
+	}
+	if !got.Start.Equal(target.Start) || got.Stop == nil || !got.Stop.Equal(*target.Stop) {
+		t.Errorf("times = %v-%v, want them unchanged", got.Start, got.Stop)
+	}
+	if got.Duration != target.Duration {
+		t.Errorf("duration = %d, want %d", got.Duration, target.Duration)
+	}
+	if !got.Dirty {
+		t.Error("modified entry should be dirty")
+	}
+
+	// An explicitly empty --desc clears the description again.
+	buf.Reset()
+	if err := cmdMod(&buf, s, nil, 1, "", "", true, modNow, time.UTC); err != nil {
+		t.Fatalf("mod --desc \"\": %v", err)
+	}
+	if got := entryByID(t, s, target.ID); got.Description != "" {
+		t.Errorf("description = %q, want it cleared", got.Description)
+	}
+}
+
+// TestModTimesignAndDescription verifies both changes can be applied at once.
+func TestModTimesignAndDescription(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdMod(&buf, s, nil, 2, "+:45", "pairing", true, modNow, time.UTC); err != nil {
+		t.Fatalf("mod: %v", err)
+	}
+	got := entryByID(t, s, entries[1].ID)
+	if got.Duration != 2700 {
+		t.Errorf("duration = %d, want 2700", got.Duration)
+	}
+	wantStop := entries[1].Start.Add(45 * time.Minute)
+	if got.Stop == nil || !got.Stop.Equal(wantStop) {
+		t.Errorf("stop = %v, want %v", got.Stop, wantStop)
+	}
+	if got.Description != "pairing" {
+		t.Errorf("description = %q, want %q", got.Description, "pairing")
+	}
+}
+
+// TestModRequiresAChange keeps a no-op invocation a usage error instead of a
+// silent dirty write.
+func TestModRequiresAChange(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+
+	var buf bytes.Buffer
+	err := cmdMod(&buf, s, nil, 1, "", "", false, modNow, time.UTC)
+	if err == nil {
+		t.Fatal("mod with no changes = nil error, want a usage error")
+	}
+	if !strings.Contains(err.Error(), "usage: tg mod") {
+		t.Errorf("err = %v, want a usage message", err)
+	}
+	if got := entryByID(t, s, entries[0].ID); got.Dirty {
+		t.Error("a rejected mod must not mark the entry dirty")
+	}
+}
+
+// TestModRejectsOverlap covers the overlap guard: growing an entry into its
+// neighbour is refused, the error names the neighbour, and nothing is written.
+// Growing it up to the neighbour's start stays allowed (half-open intervals),
+// which also proves the entry is not compared against itself.
+func TestModRejectsOverlap(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+
+	// Entry 1 is 09:00-10:00 and entry 2 is 10:00-11:00, so making entry 1 90
+	// minutes long would run into entry 2.
+	var buf bytes.Buffer
+	err := cmdMod(&buf, s, nil, 1, "+1:30", "", false, modNow, time.UTC)
+	if err == nil {
+		t.Fatal("overlapping mod = nil error, want an error")
+	}
+	for _, want := range []string{"overlaps existing entry", "10:00-11:00", "Code review"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to mention %q", err, want)
+		}
+	}
+	if buf.Len() != 0 {
+		t.Errorf("output = %q, want nothing written", buf.String())
+	}
+	got := entryByID(t, s, entries[0].ID)
+	if got.Duration != 3600 || got.Dirty {
+		t.Errorf("entry = %+v, want the original 1h clean entry", got)
+	}
+
+	// Exactly meeting the neighbour is fine, and the entry keeping its own
+	// (unchanged) span is not a self-overlap either.
+	buf.Reset()
+	if err := cmdMod(&buf, s, nil, 1, "+1", "", false, modNow, time.UTC); err != nil {
+		t.Fatalf("touching mod: %v", err)
+	}
+}
+
+// TestModStaleNumber verifies an unknown/stale local number is reported as such
+// (wrapping store.ErrNoEntryRef) rather than silently modifying something else.
+func TestModStaleNumber(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	seedModDay(t, s)
+
+	var buf bytes.Buffer
+	err := cmdMod(&buf, s, nil, 7, "+:30", "", false, modNow, time.UTC)
+	if !errors.Is(err, store.ErrNoEntryRef) {
+		t.Fatalf("err = %v, want ErrNoEntryRef", err)
+	}
+	if !strings.Contains(err.Error(), "tg ls") {
+		t.Errorf("err = %v, want it to suggest `tg ls`", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("output = %q, want nothing written", buf.String())
+	}
+}
+
+// TestModNoEntries verifies the default target is an error, not a panic, in an
+// empty store.
+func TestModNoEntries(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdMod(&buf, s, nil, 0, "+:30", "", false, modNow, time.UTC); err == nil {
+		t.Fatal("mod on an empty store = nil error, want an error")
+	}
+}
+
+// TestModInvalidTimesign keeps a malformed timesign from touching the store.
+func TestModInvalidTimesign(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+
+	for _, sign := range []string{"+:00", "10-9", "nonsense"} {
+		var buf bytes.Buffer
+		if err := cmdMod(&buf, s, nil, 1, sign, "", false, modNow, time.UTC); err == nil {
+			t.Errorf("mod %q = nil error, want an error", sign)
+		}
+	}
+	if got := entryByID(t, s, entries[0].ID); got.Dirty {
+		t.Error("a rejected mod must not mark the entry dirty")
+	}
+}
+
+// TestModPushesBestEffort verifies a successful mod pushes the change straight
+// to Toggl as an update (the entry keeps its remote id) and comes back clean.
+func TestModPushesBestEffort(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+
+	var method, path string
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method, path = r.Method, r.URL.Path
+		raw, _ := io.ReadAll(r.Body)
+		json.Unmarshal(raw, &body)
+		w.Write([]byte(`{"id":9002,"at":"2026-01-02T15:07:00Z"}`))
+	}))
+	defer srv.Close()
+	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+
+	var buf bytes.Buffer
+	if err := cmdMod(&buf, s, c, 2, "+:30", "", false, modNow, time.UTC); err != nil {
+		t.Fatalf("mod: %v", err)
+	}
+	if method != http.MethodPut {
+		t.Errorf("method = %s %s, want PUT (an update, not a create)", method, path)
+	}
+	if got, _ := body["stop"].(string); got != "2026-01-02T10:30:00Z" {
+		t.Errorf("pushed stop = %v, want 2026-01-02T10:30:00Z", body["stop"])
+	}
+	if got := entryByID(t, s, entries[1].ID); got.Dirty {
+		t.Error("entry should be clean after a successful push")
+	}
+}
+
+// TestModSyncFailureIsNonFatal verifies a failed push only warns: the local
+// edit stands and stays dirty for a later `tg push`.
+func TestModSyncFailureIsNonFatal(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+
+	var buf bytes.Buffer
+	if err := cmdMod(&buf, s, c, 2, "+:30", "", false, modNow, time.UTC); err != nil {
+		t.Fatalf("mod should not fail on a sync error: %v", err)
+	}
+	if !strings.Contains(buf.String(), "warning") {
+		t.Errorf("output = %q, want a sync warning", buf.String())
+	}
+	got := entryByID(t, s, entries[1].ID)
+	if !got.Dirty || got.Duration != 1800 {
+		t.Errorf("entry = %+v, want the 30m edit kept and dirty", got)
+	}
+}
+
+// TestDelRemovesEntry covers the happy path: the addressed entry is confirmed,
+// disappears from listings, and the other entry survives.
+func TestDelRemovesEntry(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdDel(&buf, s, nil, 1, modNow, time.UTC); err != nil {
+		t.Fatalf("del: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"Deleted: Fix login bug", "09:00-10:00", "1h00m"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output = %q, want %q", out, want)
+		}
+	}
+
+	left, _ := s.EntriesBetween(testStart.Add(-24*time.Hour), testStart.Add(24*time.Hour))
+	if len(left) != 1 || left[0].ID != entries[1].ID {
+		t.Fatalf("remaining entries = %+v, want only entry 2", left)
+	}
+	// The number now resolves to nothing rather than to another entry.
+	if _, err := s.EntryByRef(1); !errors.Is(err, store.ErrNoEntryRef) {
+		t.Errorf("EntryByRef(1) after del = %v, want ErrNoEntryRef", err)
+	}
+}
+
+// TestDelMarksDeletedAndDirty pins the soft delete: the row survives, flagged
+// deleted and dirty with a fresh LWW clock, so sync.Push can DELETE it remotely
+// before dropping it.
+func TestDelMarksDeletedAndDirty(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdDel(&buf, s, nil, 2, modNow, time.UTC); err != nil {
+		t.Fatalf("del: %v", err)
+	}
+	dirty, err := s.DirtyEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dirty) != 1 {
+		t.Fatalf("dirty entries = %d, want 1 (the pending deletion)", len(dirty))
+	}
+	got := dirty[0]
+	if got.ID != entries[1].ID {
+		t.Errorf("dirty entry id = %d, want %d", got.ID, entries[1].ID)
+	}
+	if !got.Deleted {
+		t.Error("deleted flag not set")
+	}
+	if !got.Dirty {
+		t.Error("dirty flag not set")
+	}
+	if !got.UpdatedAt.Equal(modNow) {
+		t.Errorf("updated_at = %v, want %v", got.UpdatedAt, modNow)
+	}
+	if got.RemoteID == nil || *got.RemoteID != 9002 {
+		t.Errorf("remote_id = %v, want 9002 kept for the remote DELETE", got.RemoteID)
+	}
+}
+
+// TestDelStaleNumber verifies an unknown/stale number is an error naming
+// `tg ls`, and that nothing is deleted.
+func TestDelStaleNumber(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	seedModDay(t, s)
+
+	var buf bytes.Buffer
+	err := cmdDel(&buf, s, nil, 9, modNow, time.UTC)
+	if !errors.Is(err, store.ErrNoEntryRef) {
+		t.Fatalf("err = %v, want ErrNoEntryRef", err)
+	}
+	if !strings.Contains(err.Error(), "tg ls") {
+		t.Errorf("err = %v, want it to suggest `tg ls`", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("output = %q, want nothing written", buf.String())
+	}
+	if left, _ := s.EntriesBetween(testStart.Add(-24*time.Hour), testStart.Add(24*time.Hour)); len(left) != 2 {
+		t.Errorf("entries = %d, want both kept", len(left))
+	}
+
+	// Deleting the same entry twice hits the same stale path, since the first
+	// delete unpublishes the number.
+	if err := cmdDel(&buf, s, nil, 1, modNow, time.UTC); err != nil {
+		t.Fatalf("del: %v", err)
+	}
+	if err := cmdDel(&buf, s, nil, 1, modNow, time.UTC); !errors.Is(err, store.ErrNoEntryRef) {
+		t.Errorf("second del error = %v, want ErrNoEntryRef", err)
+	}
+}
+
+// TestDelRequiresNumber verifies del never guesses a target.
+func TestDelRequiresNumber(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	seedModDay(t, s)
+
+	var buf bytes.Buffer
+	err := cmdDel(&buf, s, nil, 0, modNow, time.UTC)
+	if err == nil || !strings.Contains(err.Error(), "usage: tg del") {
+		t.Fatalf("err = %v, want a usage error", err)
+	}
+}
+
+// TestDelPushesBestEffort verifies a successful del DELETEs the entry remotely
+// and drops the local row.
+func TestDelPushesBestEffort(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	seedModDay(t, s)
+
+	var method, path string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method, path = r.Method, r.URL.Path
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+
+	var buf bytes.Buffer
+	if err := cmdDel(&buf, s, c, 1, modNow, time.UTC); err != nil {
+		t.Fatalf("del: %v", err)
+	}
+	if method != http.MethodDelete {
+		t.Errorf("method = %s %s, want DELETE", method, path)
+	}
+	if !strings.Contains(path, "9001") {
+		t.Errorf("path = %s, want the entry's remote id 9001", path)
+	}
+	if dirty, _ := s.DirtyEntries(); len(dirty) != 0 {
+		t.Errorf("dirty entries = %+v, want the row dropped after the remote delete", dirty)
+	}
+}
+
+// --- argument parsing --------------------------------------------------------
+
+// TestParseModArgs covers `tg mod`'s positional disambiguation: bare digits are
+// the entry number, everything else is the timesign, in either order.
+func TestParseModArgs(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		ref      int
+		timesign string
+		wantErr  bool
+	}{
+		{name: "empty"},
+		{name: "number only", args: []string{"2"}, ref: 2},
+		{name: "timesign only", args: []string{"+:30"}, timesign: "+:30"},
+		{name: "number and timesign", args: []string{"2", "+:30"}, ref: 2, timesign: "+:30"},
+		{name: "reversed", args: []string{"+:30", "2"}, ref: 2, timesign: "+:30"},
+		{name: "absolute timesign", args: []string{"3", "9-10:30"}, ref: 3, timesign: "9-10:30"},
+		{name: "two numbers", args: []string{"2", "3"}, wantErr: true},
+		{name: "two timesigns", args: []string{"+:30", "9-10"}, wantErr: true},
+		{name: "zero is not a number", args: []string{"0"}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ref, timesign, err := parseModArgs(tt.args)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parseModArgs(%q) = (%d, %q, nil), want an error", tt.args, ref, timesign)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseModArgs(%q): %v", tt.args, err)
+			}
+			if ref != tt.ref || timesign != tt.timesign {
+				t.Errorf("parseModArgs(%q) = (%d, %q), want (%d, %q)",
+					tt.args, ref, timesign, tt.ref, tt.timesign)
+			}
+		})
+	}
+}
+
+// TestParseArgsAndFlags verifies flags are still recognized after a positional
+// argument, which is what makes `tg mod 2 --desc x` work (the flag package on
+// its own stops parsing at "2").
+func TestParseArgsAndFlags(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		wantPos  []string
+		wantDesc string
+		wantSet  bool
+	}{
+		{name: "flag last", args: []string{"2", "--desc", "x"}, wantPos: []string{"2"}, wantDesc: "x", wantSet: true},
+		{name: "flag first", args: []string{"--desc", "x", "2"}, wantPos: []string{"2"}, wantDesc: "x", wantSet: true},
+		{name: "flag between", args: []string{"2", "--desc", "x", "+:30"}, wantPos: []string{"2", "+:30"}, wantDesc: "x", wantSet: true},
+		{name: "alias", args: []string{"2", "--description", "x"}, wantPos: []string{"2"}, wantDesc: "x", wantSet: true},
+		{name: "no flag", args: []string{"2", "+:30"}, wantPos: []string{"2", "+:30"}},
+		{name: "empty value counts as set", args: []string{"--desc", ""}, wantSet: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := newFlagSet("mod")
+			fs.SetOutput(io.Discard)
+			var desc string
+			fs.StringVar(&desc, "desc", "", "")
+			fs.StringVar(&desc, "description", "", "")
+			pos, err := parseArgsAndFlags(fs, tt.args)
+			if err != nil {
+				t.Fatalf("parseArgsAndFlags(%q): %v", tt.args, err)
+			}
+			if strings.Join(pos, ",") != strings.Join(tt.wantPos, ",") {
+				t.Errorf("positional = %q, want %q", pos, tt.wantPos)
+			}
+			if desc != tt.wantDesc {
+				t.Errorf("desc = %q, want %q", desc, tt.wantDesc)
+			}
+			set := false
+			fs.Visit(func(*flag.Flag) { set = true })
+			if set != tt.wantSet {
+				t.Errorf("flag set = %v, want %v", set, tt.wantSet)
+			}
+		})
 	}
 }
 

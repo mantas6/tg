@@ -499,6 +499,182 @@ func TestFindOverlappingRunningEntry(t *testing.T) {
 	}
 }
 
+// TestFindOverlappingExcluding pins the `tg mod` variant: the excluded entry is
+// invisible to the search (so retiming an entry never conflicts with itself)
+// while every other entry still blocks the range.
+func TestFindOverlappingExcluding(t *testing.T) {
+	s := openTest(t)
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	at := func(h, m int) time.Time { return day.Add(time.Duration(h)*time.Hour + time.Duration(m)*time.Minute) }
+	first := mustCreate(t, s, Entry{
+		WorkspaceID: 1, Start: at(9, 0), Stop: ptrTime(at(10, 0)),
+		Duration: 3600, UpdatedAt: at(9, 0),
+	})
+	second := mustCreate(t, s, Entry{
+		WorkspaceID: 1, Start: at(10, 0), Stop: ptrTime(at(11, 0)),
+		Duration: 3600, UpdatedAt: at(10, 0),
+	})
+
+	// Excluding the first entry hides it from a range it fully covers.
+	got, err := s.FindOverlappingExcluding(at(9, 0), at(10, 0), first)
+	if err != nil {
+		t.Fatalf("FindOverlappingExcluding: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d entries, want 0 (the excluded entry itself)", len(got))
+	}
+
+	// The other entry is still reported when the range grows into it.
+	got, err = s.FindOverlappingExcluding(at(9, 0), at(10, 30), first)
+	if err != nil {
+		t.Fatalf("FindOverlappingExcluding: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != second {
+		t.Fatalf("got %v, want the second entry %d", got, second)
+	}
+
+	// FindOverlapping is the same search with nothing excluded.
+	got, err = s.FindOverlapping(at(9, 0), at(10, 30))
+	if err != nil {
+		t.Fatalf("FindOverlapping: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("FindOverlapping = %d entries, want both", len(got))
+	}
+}
+
+// TestUpdateEntry pins `tg mod`'s write: the editable fields change, the LWW
+// clock advances, the row is marked dirty, and the remote identity (remote_id,
+// synced_at) is preserved so the push is an update rather than a re-create.
+func TestUpdateEntry(t *testing.T) {
+	s := openTest(t)
+	at := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
+	stop := at.Add(time.Hour)
+	id := mustCreate(t, s, Entry{
+		RemoteID: ptrInt(4242), WorkspaceID: 1, Description: "old",
+		Start: at, Stop: ptrTime(stop), Duration: 3600,
+		UpdatedAt: at, SyncedAt: ptrTime(at), Dirty: false,
+	})
+
+	newStart := at.Add(30 * time.Minute)
+	newStop := newStart.Add(45 * time.Minute)
+	modAt := time.Date(2026, 1, 2, 15, 0, 0, 0, time.UTC)
+	if err := s.UpdateEntry(Entry{
+		ID: id, Description: "new", Start: newStart, Stop: &newStop,
+		Duration: 2700, UpdatedAt: modAt,
+	}); err != nil {
+		t.Fatalf("UpdateEntry: %v", err)
+	}
+
+	dirty, err := s.DirtyEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dirty) != 1 {
+		t.Fatalf("dirty entries = %d, want 1", len(dirty))
+	}
+	got := dirty[0]
+	if got.Description != "new" {
+		t.Errorf("description = %q, want %q", got.Description, "new")
+	}
+	if !got.Start.Equal(newStart) {
+		t.Errorf("start = %v, want %v", got.Start, newStart)
+	}
+	if got.Stop == nil || !got.Stop.Equal(newStop) {
+		t.Errorf("stop = %v, want %v", got.Stop, newStop)
+	}
+	if got.Duration != 2700 {
+		t.Errorf("duration = %d, want 2700", got.Duration)
+	}
+	if !got.UpdatedAt.Equal(modAt) {
+		t.Errorf("updated_at = %v, want %v", got.UpdatedAt, modAt)
+	}
+	if got.RemoteID == nil || *got.RemoteID != 4242 {
+		t.Errorf("remote_id = %v, want 4242 preserved", got.RemoteID)
+	}
+	if got.SyncedAt == nil || !got.SyncedAt.Equal(at) {
+		t.Errorf("synced_at = %v, want %v preserved", got.SyncedAt, at)
+	}
+	if got.Deleted {
+		t.Error("deleted flag must not be touched by an update")
+	}
+}
+
+// TestUpdateEntryMissing verifies an update against an unknown id fails loudly
+// instead of silently matching no row.
+func TestUpdateEntryMissing(t *testing.T) {
+	s := openTest(t)
+	at := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
+	err := s.UpdateEntry(Entry{ID: 999, Start: at, Duration: 60, UpdatedAt: at})
+	if err == nil {
+		t.Fatal("UpdateEntry on a missing id = nil error, want an error")
+	}
+	if !strings.Contains(err.Error(), "999") {
+		t.Errorf("err = %v, want it to name the id", err)
+	}
+}
+
+// TestSoftDeleteEntry pins `tg del`'s write: the row survives flagged deleted
+// and dirty (so the deletion can be pushed) while dropping out of every read
+// path immediately.
+func TestSoftDeleteEntry(t *testing.T) {
+	s := openTest(t)
+	at := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
+	stop := at.Add(time.Hour)
+	id := mustCreate(t, s, Entry{
+		RemoteID: ptrInt(4242), WorkspaceID: 1, Start: at, Stop: ptrTime(stop),
+		Duration: 3600, UpdatedAt: at, SyncedAt: ptrTime(at),
+	})
+	if err := s.SaveEntryRefs([]int64{id}); err != nil {
+		t.Fatal(err)
+	}
+
+	delAt := time.Date(2026, 1, 2, 15, 0, 0, 0, time.UTC)
+	if err := s.SoftDeleteEntry(id, delAt); err != nil {
+		t.Fatalf("SoftDeleteEntry: %v", err)
+	}
+
+	dirty, err := s.DirtyEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dirty) != 1 || dirty[0].ID != id {
+		t.Fatalf("dirty entries = %v, want the pending deletion of %d", dirty, id)
+	}
+	if !dirty[0].Deleted || !dirty[0].Dirty {
+		t.Errorf("flags = deleted:%v dirty:%v, want both set", dirty[0].Deleted, dirty[0].Dirty)
+	}
+	if !dirty[0].UpdatedAt.Equal(delAt) {
+		t.Errorf("updated_at = %v, want %v", dirty[0].UpdatedAt, delAt)
+	}
+	if dirty[0].RemoteID == nil || *dirty[0].RemoteID != 4242 {
+		t.Errorf("remote_id = %v, want 4242 kept for the remote DELETE", dirty[0].RemoteID)
+	}
+
+	// Every read path hides it at once, including the number it was listed as.
+	if got, err := s.EntriesBetween(at.Add(-time.Hour), at.Add(2*time.Hour)); err != nil || len(got) != 0 {
+		t.Errorf("EntriesBetween = %v err=%v, want no entries", got, err)
+	}
+	if got, err := s.LastEntry(); err != nil || got != nil {
+		t.Errorf("LastEntry = %v err=%v, want nil", got, err)
+	}
+	if _, err := s.EntryByRef(1); !errors.Is(err, ErrNoEntryRef) {
+		t.Errorf("EntryByRef(1) = %v, want ErrNoEntryRef", err)
+	}
+}
+
+// TestSoftDeleteEntryMissing verifies deleting an unknown id is an error.
+func TestSoftDeleteEntryMissing(t *testing.T) {
+	s := openTest(t)
+	err := s.SoftDeleteEntry(999, time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC))
+	if err == nil {
+		t.Fatal("SoftDeleteEntry on a missing id = nil error, want an error")
+	}
+	if !strings.Contains(err.Error(), "999") {
+		t.Errorf("err = %v, want it to name the id", err)
+	}
+}
+
 func TestEntryJoinsProjectColor(t *testing.T) {
 	s := openTest(t)
 	if err := s.ReplaceProjects([]Project{

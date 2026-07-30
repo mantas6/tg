@@ -51,6 +51,28 @@ func overlapLabel(e store.Entry, loc *time.Location) string {
 	return rng
 }
 
+// renderEntryChange writes the one-line confirmation for a command that changed
+// exactly one entry (`mod`, `del`), mirroring `add`'s "Added: ..." shape:
+//
+//	Modified: Fix login bug [Backend]  09:00-09:30 (0h30m)
+//
+// verb is the past-tense action ("Modified", "Deleted"). A running entry has no
+// stop, so its range reads "HH:MM-running" and no duration is shown (the stored
+// duration is the -1 running marker, not a length).
+func renderEntryChange(w io.Writer, verb string, e store.Entry, loc *time.Location) {
+	label := entryLabel(e)
+	if e.ProjectName != "" {
+		label += " [" + e.ProjectName + "]"
+	}
+	if e.Stop == nil {
+		fmt.Fprintf(w, "%s: %s  %s-running\n", verb, label, formatClock(e.Start, loc))
+		return
+	}
+	fmt.Fprintf(w, "%s: %s  %s-%s (%s)\n", verb, label,
+		formatClock(e.Start, loc), formatClock(*e.Stop, loc),
+		formatHM(time.Duration(e.Duration)*time.Second))
+}
+
 // statusNameMax caps the task name shown by `status`/`current` so the terse
 // status line stays short enough for a status bar.
 const statusNameMax = 30
