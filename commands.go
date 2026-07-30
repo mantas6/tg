@@ -13,6 +13,7 @@ import (
 	"github.com/mantas6/tg/config"
 	"github.com/mantas6/tg/store"
 	"github.com/mantas6/tg/sync"
+	"github.com/mantas6/tg/timesig"
 )
 
 // cmdStart resolves a task-title fragment to a single task and starts tracking
@@ -83,8 +84,8 @@ func cmdStart(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, pr
 	}
 }
 
-// cmdAdd records a single, already-stopped time entry from an explicit
-// START-STOP timesign (see parseTimesign) and a task-title fragment, without
+// cmdAdd records a single, already-stopped time entry from a timesign (see the
+// timesig package and docs/timesig.md) and a task-title fragment, without
 // touching the timer. Unlike cmdStart it never stops a running entry and the
 // created entry is complete (has a stop and a positive duration). The task
 // fragment is resolved exactly like `tg start` (FindTasksByFragment scoped by
@@ -99,10 +100,11 @@ func cmdStart(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, pr
 // desc is the entry's free-form description (from `--desc`/`--description`); an
 // empty desc leaves the description blank, matching the prior behavior.
 func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, projectID *int64, timesign, fragment, desc string, now time.Time, loc *time.Location) error {
-	start, stop, err := parseTimesign(timesign, now, loc)
+	span, err := timesig.Parse(timesign, now, loc)
 	if err != nil {
 		return err
 	}
+	start, stop := span.Start, span.Stop
 
 	fragment = strings.TrimSpace(fragment)
 	if fragment == "" {
@@ -252,117 +254,6 @@ func quoteAll(ss []string) []string {
 		out[i] = strconv.Quote(s)
 	}
 	return out
-}
-
-// parseTimesign parses a START-STOP timesign into two wall-clock times on now's
-// calendar day in loc. The grammar is:
-//
-//	timesign = START "-" STOP
-//	START    = H | H ":" MM
-//	STOP     = H | H ":" MM | ":" MM
-//	H        = hour   0-23
-//	MM       = minute 0-59
-//
-// A minutes-only STOP (":MM") inherits the START hour, so "9-:30" is
-// 09:00-09:30. Each side defaults its minutes to 0 ("10-11" is 10:00-11:00).
-// STOP must be strictly after START; anything else (bad hour/minute, missing
-// dash, empty side, stop <= start) is a clear error.
-func parseTimesign(s string, now time.Time, loc *time.Location) (start, stop time.Time, err error) {
-	s = strings.TrimSpace(s)
-	dash := strings.IndexByte(s, '-')
-	if dash < 0 {
-		return time.Time{}, time.Time{}, fmt.Errorf("invalid timesign %q: expected START-STOP", s)
-	}
-	left := strings.TrimSpace(s[:dash])
-	right := strings.TrimSpace(s[dash+1:])
-	if left == "" {
-		return time.Time{}, time.Time{}, fmt.Errorf("invalid timesign %q: empty START", s)
-	}
-	if right == "" {
-		return time.Time{}, time.Time{}, fmt.Errorf("invalid timesign %q: empty STOP", s)
-	}
-
-	sh, sm, err := parseClockPart(left, false, 0)
-	if err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("invalid START %q: %w", left, err)
-	}
-	eh, em, err := parseClockPart(right, true, sh)
-	if err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("invalid STOP %q: %w", right, err)
-	}
-
-	day := now.In(loc)
-	y, mo, d := day.Date()
-	start = time.Date(y, mo, d, sh, sm, 0, 0, loc)
-	stop = time.Date(y, mo, d, eh, em, 0, 0, loc)
-	if !stop.After(start) {
-		return time.Time{}, time.Time{}, fmt.Errorf(
-			"invalid timesign %q: STOP %s must be after START %s",
-			s, formatClock(stop, loc), formatClock(start, loc))
-	}
-	return start, stop, nil
-}
-
-// parseClockPart parses one side of a timesign ("H", "H:MM", or, when
-// allowMinuteOnly, ":MM") into an hour and minute. A minutes-only part inherits
-// inheritHour for its hour.
-func parseClockPart(s string, allowMinuteOnly bool, inheritHour int) (hour, min int, err error) {
-	if strings.HasPrefix(s, ":") {
-		if !allowMinuteOnly {
-			return 0, 0, errors.New("minutes-only form is not allowed here")
-		}
-		min, err = parseMinute(s[1:])
-		if err != nil {
-			return 0, 0, err
-		}
-		return inheritHour, min, nil
-	}
-	if i := strings.IndexByte(s, ':'); i >= 0 {
-		hour, err = parseHour(s[:i])
-		if err != nil {
-			return 0, 0, err
-		}
-		min, err = parseMinute(s[i+1:])
-		if err != nil {
-			return 0, 0, err
-		}
-		return hour, min, nil
-	}
-	hour, err = parseHour(s)
-	if err != nil {
-		return 0, 0, err
-	}
-	return hour, 0, nil
-}
-
-// parseHour parses a 0-23 hour from a non-empty decimal string.
-func parseHour(s string) (int, error) {
-	if s == "" {
-		return 0, errors.New("missing hour")
-	}
-	v, err := strconv.Atoi(s)
-	if err != nil {
-		return 0, fmt.Errorf("bad hour %q", s)
-	}
-	if v < 0 || v > 23 {
-		return 0, fmt.Errorf("hour %d out of range (0-23)", v)
-	}
-	return v, nil
-}
-
-// parseMinute parses a 0-59 minute from a non-empty decimal string.
-func parseMinute(s string) (int, error) {
-	if s == "" {
-		return 0, errors.New("missing minutes")
-	}
-	v, err := strconv.Atoi(s)
-	if err != nil {
-		return 0, fmt.Errorf("bad minutes %q", s)
-	}
-	if v < 0 || v > 59 {
-		return 0, fmt.Errorf("minutes %d out of range (0-59)", v)
-	}
-	return v, nil
 }
 
 // cmdStop finalizes the running entry (snapping start/end to the nearest

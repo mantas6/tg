@@ -307,71 +307,9 @@ func TestProjectIDFromEnv(t *testing.T) {
 	}
 }
 
-// addDay is the calendar day timesigns resolve onto in the tests below.
+// addNow is the reference instant `add` timesigns resolve against in the tests
+// below; the timesign grammar itself is covered by the timesig package.
 var addNow = time.Date(2026, 1, 2, 15, 0, 0, 0, time.UTC)
-
-func TestParseTimesignValid(t *testing.T) {
-	hm := func(h, m int) time.Time {
-		return time.Date(2026, 1, 2, h, m, 0, 0, time.UTC)
-	}
-	cases := []struct {
-		in                     string
-		wantStartH, wantStartM int
-		wantStopH, wantStopM   int
-	}{
-		{"9-:30", 9, 0, 9, 30},      // minutes-only stop inherits start hour
-		{"10-11", 10, 0, 11, 0},     // bare hours default minutes to 0
-		{"10:30-11", 10, 30, 11, 0}, // H:MM start, bare-hour stop
-		{"9:15-9:45", 9, 15, 9, 45}, // both sides H:MM
-		{"0-:01", 0, 0, 0, 1},       // midnight hour, one-minute span
-		{"23-23:59", 23, 0, 23, 59}, // last hour of the day
-		{" 9 - :30 ", 9, 0, 9, 30},  // surrounding/inner whitespace tolerated
-	}
-	for _, tc := range cases {
-		t.Run(tc.in, func(t *testing.T) {
-			start, stop, err := parseTimesign(tc.in, addNow, time.UTC)
-			if err != nil {
-				t.Fatalf("parseTimesign(%q): %v", tc.in, err)
-			}
-			if !start.Equal(hm(tc.wantStartH, tc.wantStartM)) {
-				t.Errorf("start = %v, want %02d:%02d", start, tc.wantStartH, tc.wantStartM)
-			}
-			if !stop.Equal(hm(tc.wantStopH, tc.wantStopM)) {
-				t.Errorf("stop = %v, want %02d:%02d", stop, tc.wantStopH, tc.wantStopM)
-			}
-		})
-	}
-}
-
-func TestParseTimesignErrors(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-	}{
-		{"missing dash", "9"},
-		{"empty", ""},
-		{"empty start", "-11"},
-		{"empty stop", "9-"},
-		{"empty both", "-"},
-		{"bad start hour", "24-25"},
-		{"bad stop hour", "9-24"},
-		{"bad start minutes", "9:60-10"},
-		{"bad stop minutes", "9-9:60"},
-		{"minutes-only start", ":30-10"},
-		{"stop equals start", "9-9"},
-		{"stop before start", "10-9"},
-		{"minutes-only stop not after start", "9-:00"},
-		{"non-numeric hour", "ab-cd"},
-		{"non-numeric minutes", "9:aa-10"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if _, _, err := parseTimesign(tc.in, addNow, time.UTC); err == nil {
-				t.Errorf("parseTimesign(%q) = nil error, want an error", tc.in)
-			}
-		})
-	}
-}
 
 func TestAddCreatesFinishedEntry(t *testing.T) {
 	s := newStore(t)
@@ -422,6 +360,57 @@ func TestAddCreatesFinishedEntry(t *testing.T) {
 	}
 	if r, _ := s.Running(); r != nil {
 		t.Errorf("add must not create a running entry, got %+v", r)
+	}
+}
+
+// TestAddAcceptsRelativeTimesign checks that `add` resolves a relative
+// timesign through the timesig package: the entry ends at now floored to the
+// preceding 5-minute mark and starts that many minutes earlier. (Overlap
+// checks are a separate concern.)
+func TestAddAcceptsRelativeTimesign(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	// 15:07 floors to 15:05, so "+:20" spans 14:45-15:05.
+	now := time.Date(2026, 1, 2, 15, 7, 0, 0, time.UTC)
+	var buf bytes.Buffer
+	if err := cmdAdd(&buf, s, nil, 1, nil, "+:20", "login", "", now, time.UTC); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "14:45-15:05") {
+		t.Errorf("output = %q, want 14:45-15:05", out)
+	}
+
+	entries, _ := s.EntriesBetween(now.Add(-24*time.Hour), now.Add(24*time.Hour))
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	wantStart := time.Date(2026, 1, 2, 14, 45, 0, 0, time.UTC)
+	wantStop := time.Date(2026, 1, 2, 15, 5, 0, 0, time.UTC)
+	if !e.Start.Equal(wantStart) {
+		t.Errorf("start = %v, want %v", e.Start, wantStart)
+	}
+	if e.Stop == nil || !e.Stop.Equal(wantStop) {
+		t.Errorf("stop = %v, want %v", e.Stop, wantStop)
+	}
+	if e.Duration != 1200 {
+		t.Errorf("duration = %d, want 1200", e.Duration)
+	}
+}
+
+// TestAddRejectsInvalidRelativeTimesign keeps the zero-duration relative form
+// out of the store.
+func TestAddRejectsInvalidRelativeTimesign(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdAdd(&buf, s, nil, 1, nil, "+:00", "login", "", addNow, time.UTC); err == nil {
+		t.Fatal("add with +:00 = nil error, want an error")
+	}
+	if entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 0 {
+		t.Errorf("entries = %d, want 0", len(entries))
 	}
 }
 

@@ -55,7 +55,7 @@ _tg() {
       commands=(
         'auth:verify a Toggl API token and store config'
         'start:start tracking the task matching a fragment'
-        'add:add a finished entry from a START-STOP range'
+        'add:add a finished entry from a timesign (9-:30, +:20)'
         'stop:stop the running entry (snaps to 5m)'
         'current:show the running entry'
         'status:show the running entry'
@@ -80,12 +80,13 @@ _tg() {
           __tg_tasks
           ;;
         add)
-          # First positional is the START-STOP range; later args are task
-          # names. --desc/--description set the entry description.
+          # First positional is the timesign (absolute 9-:30 or relative
+          # +:20); later args are task names. --desc/--description set the
+          # entry description.
           _arguments \
             '--desc[entry description]:description:' \
             '--description[entry description (alias of --desc)]:description:' \
-            '1:time range:' \
+            '1:timesign:' \
             '*:task fragment:__tg_tasks'
           ;;
         current|status|push)

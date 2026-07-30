@@ -49,16 +49,23 @@ tg stop                     # stop the running entry
 ```
 
 To record a finished block of time without using the timer, use `add` with a
-`START-STOP` range on today's clock:
+*timesign*: either an absolute `START-STOP` range on today's clock, or a
+relative `+DURATION` span counted back from now.
 
 ```sh
 tg add 9-:30 <task>         # 09:00-09:30
 tg add 10-11 <task>         # 10:00-11:00
 tg add 10:30-11 <task>      # 10:30-11:00
+tg add +:20 <task>          # the last 20 minutes
+tg add +1:20 <task>         # the last 1h20m
 ```
 
-Each side is `H` or `H:MM`; the stop side may also be `:MM`, inheriting the
-start hour. Hours are 0-23, minutes 0-59, and the stop must be after the start.
+For absolute ranges each side is `H` or `H:MM`; the stop side may also be `:MM`,
+inheriting the start hour. Hours are 0-23, minutes 0-59, and the stop must be
+after the start. A relative timesign ends at now rounded *down* to the preceding
+5-minute mark (14:23 -> 14:20) and starts that duration earlier. The full
+grammar, rounding rules, and error cases are in [docs/timesig.md](docs/timesig.md).
+
 Like `start`, `add` accepts `<project> <task>` to scope by project name (or set
 `TOGGL_PROJECT_ID`), stores the entry locally marked dirty, and best-effort
 pushes it to Toggl.
@@ -92,7 +99,7 @@ usage: tg <command> [flags]
 commands:
   auth [token]              verify a Toggl API token and store config
   start [project] <task>    start tracking the task matching <task>
-  add <range> [project] <task>  add a finished entry (e.g. 9-:30, 10:30-11) [--desc TEXT]
+  add <timesign> [project] <task>  add a finished entry [--desc TEXT]
   stop                      stop the running entry (snaps to 5m)
   current | status          show the running entry            [--json]
   today   | list | ls       show today's entries     [--days N] [--json]
@@ -104,6 +111,10 @@ commands:
   pull [project]            fetch changes; all projects, or one [--since DATE] [--json]
   total <task>...           total tracked hours per task; last 3 months [--since DATE] [--json]
   completion zsh            print the zsh completion script
+
+timesign: absolute 9-:30, 10-11, 10:30-11:15 (today) or relative
+      +:20, +1, +1:20 (that long, ending at the last 5m mark).
+      Full spec: docs/timesig.md
 ```
 
 ### Syncing
