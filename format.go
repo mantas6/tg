@@ -12,20 +12,6 @@ import (
 	"github.com/mantas6/tg/store"
 )
 
-// snap5 rounds t to the nearest wall-clock 5-minute boundary: minutes land on
-// {00,05,10,...,55} with seconds and sub-second components zeroed. Exact ties
-// (e.g. HH:02:30) round up. Boundaries carry across hour and day rollovers
-// (e.g. 10:58 -> 11:00, 23:58 -> 00:00 the next day). Snapping happens in t's
-// own location so the result sits on a wall-clock mark, not a UTC one.
-func snap5(t time.Time) time.Time {
-	const step = 5 * time.Minute
-	// Top of t's hour, in its own location; offset within the hour is snapped.
-	hour := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, t.Location())
-	off := t.Sub(hour)
-	snapped := ((off + step/2) / step) * step
-	return hour.Add(snapped)
-}
-
 // formatHM renders a duration as "<h>h<mm>m" (e.g. 75m -> "1h15m", 50m ->
 // "0h50m"). Negative durations clamp to zero.
 func formatHM(d time.Duration) string {
@@ -90,6 +76,20 @@ func displayDuration(e store.Entry, now time.Time) time.Duration {
 
 const todayDivider = "----------------------------------------"
 
+// totalDuration sums the displayed durations of entries (live elapsed for a
+// running entry, the stored duration otherwise) and reports whether any of them
+// is still running. It is the shared tracked-time total behind `today`'s footer
+// and `status`'s day total.
+func totalDuration(entries []store.Entry, now time.Time) (total time.Duration, anyRunning bool) {
+	for _, e := range entries {
+		total += displayDuration(e, now)
+		if e.Stop == nil {
+			anyRunning = true
+		}
+	}
+	return total, anyRunning
+}
+
 // parseHexColor parses a "#RRGGBB" hex color (as stored on projects) into its
 // 8-bit channels. ok is false for any other shape (empty, short, bad digits).
 func parseHexColor(s string) (r, g, b uint8, ok bool) {
@@ -114,9 +114,9 @@ func colorBlock(hex string) string {
 	return fmt.Sprintf("\x1b[38;2;%d;%d;%dm\u25a0\x1b[0m", r, g, b)
 }
 
-// gapThreshold is the smallest stop-to-start distance rendered as a gap line.
-// Start/stop times snap to 5-minute wall-clock marks (snap5), so sub-minute
-// gaps are snapping noise from adjacent entries rather than real idle time.
+// gapThreshold is the smallest distance rendered as a gap (in the daily table
+// and in the status line). Entry times land on whole minutes at best, so a
+// sub-minute distance is rounding noise rather than real idle time.
 const gapThreshold = time.Minute
 
 // gapBetween returns the idle time between prev and next worth showing, or 0.
@@ -157,8 +157,7 @@ func renderToday(w io.Writer, entries []store.Entry, now time.Time, loc *time.Lo
 		leadPad = "  "
 	}
 
-	var total time.Duration
-	anyRunning := false
+	total, anyRunning := totalDuration(entries, now)
 	for i, e := range entries {
 		if i > 0 {
 			if gap := gapBetween(entries[i-1], e, loc); gap > 0 {
@@ -170,11 +169,8 @@ func renderToday(w io.Writer, entries []store.Entry, now time.Time, loc *time.Lo
 		stopClk := "  *"
 		if e.Stop != nil {
 			stopClk = formatClock(*e.Stop, loc)
-		} else {
-			anyRunning = true
 		}
 		dur := displayDuration(e, now)
-		total += dur
 
 		label := entryLabel(e)
 		project := ""
@@ -202,40 +198,84 @@ func renderToday(w io.Writer, entries []store.Entry, now time.Time, loc *time.Lo
 	fmt.Fprintln(w, footer)
 }
 
-// currentJSON is the stable --json shape for `current`.
+// currentJSON is the stable --json shape for `current`/`status`. The fields
+// describe the last entry (running or finished): ElapsedSeconds is its live
+// elapsed time while running and its stored duration once stopped, GapSeconds
+// is the idle time between its stop and now (0 while running or with no
+// entries), and DayTotalSeconds is today's tracked total.
 type currentJSON struct {
-	Running        bool   `json:"running"`
-	Task           string `json:"task,omitempty"`
-	Project        string `json:"project,omitempty"`
-	Start          string `json:"start,omitempty"`
-	ElapsedSeconds int64  `json:"elapsed_seconds,omitempty"`
-	ID             int64  `json:"id,omitempty"`
+	Running         bool   `json:"running"`
+	Task            string `json:"task,omitempty"`
+	Project         string `json:"project,omitempty"`
+	Start           string `json:"start,omitempty"`
+	Stop            string `json:"stop,omitempty"`
+	ElapsedSeconds  int64  `json:"elapsed_seconds,omitempty"`
+	GapSeconds      int64  `json:"gap_seconds"`
+	DayTotalSeconds int64  `json:"day_total_seconds"`
+	ID              int64  `json:"id,omitempty"`
 }
 
-// renderCurrent writes the running entry (or its absence) to w.
-func renderCurrent(w io.Writer, e *store.Entry, now time.Time, loc *time.Location, jsonOut bool) error {
+// statusGap returns the idle time between last's stop and now worth reporting,
+// or 0. Nothing is reported for a missing or still-running entry, nor for a
+// sub-gapThreshold distance (5-minute quantization noise). Unlike the gaps in
+// the daily table this deliberately spans calendar days: "nothing tracked for
+// 18h" is exactly what the status line is for.
+func statusGap(last *store.Entry, now time.Time) time.Duration {
+	if last == nil || last.Stop == nil {
+		return 0
+	}
+	gap := now.Sub(*last.Stop)
+	if gap < gapThreshold {
+		return 0
+	}
+	return gap
+}
+
+// renderCurrent writes the status line for the last entry (nil when nothing has
+// ever been tracked) plus today's tracked total dayTotal. A running entry is
+// reported as running with its live elapsed time; a finished one is reported
+// with its wall-clock range and, when now has moved past its stop, the idle gap.
+func renderCurrent(w io.Writer, last *store.Entry, dayTotal time.Duration, now time.Time, loc *time.Location, jsonOut bool) error {
+	gap := statusGap(last, now)
 	if jsonOut {
-		out := currentJSON{Running: e != nil}
-		if e != nil {
-			out.Task = entryLabel(*e)
-			out.Project = e.ProjectName
-			out.Start = e.Start.UTC().Format(time.RFC3339)
-			out.ElapsedSeconds = int64(now.Sub(e.Start) / time.Second)
-			out.ID = e.ID
+		out := currentJSON{
+			Running:         last != nil && last.Stop == nil,
+			GapSeconds:      int64(gap / time.Second),
+			DayTotalSeconds: int64(dayTotal / time.Second),
+		}
+		if last != nil {
+			out.Task = entryLabel(*last)
+			out.Project = last.ProjectName
+			out.Start = last.Start.UTC().Format(time.RFC3339)
+			if last.Stop != nil {
+				out.Stop = last.Stop.UTC().Format(time.RFC3339)
+			}
+			out.ElapsedSeconds = int64(displayDuration(*last, now) / time.Second)
+			out.ID = last.ID
 		}
 		return writeJSON(w, out)
 	}
 
-	if e == nil {
-		fmt.Fprintln(w, "No entry running.")
+	if last == nil {
+		fmt.Fprintln(w, "No entries.")
+		fmt.Fprintln(w, "Today: "+formatHM(dayTotal))
 		return nil
 	}
-	elapsed := formatHM(now.Sub(e.Start))
-	label := truncName(entryLabel(*e), statusNameMax)
-	if e.ProjectName != "" {
-		label += " [" + e.ProjectName + "]"
+	label := truncName(entryLabel(*last), statusNameMax)
+	if last.ProjectName != "" {
+		label += " [" + last.ProjectName + "]"
 	}
-	fmt.Fprintf(w, "run %s (%s)\n", label, elapsed)
+	if last.Stop == nil {
+		fmt.Fprintf(w, "run %s (%s)\n", label, formatHM(now.Sub(last.Start)))
+	} else {
+		line := fmt.Sprintf("last %s %s-%s", label,
+			formatClock(last.Start, loc), formatClock(*last.Stop, loc))
+		if gap > 0 {
+			line += " (gap " + formatHM(gap) + ")"
+		}
+		fmt.Fprintln(w, line)
+	}
+	fmt.Fprintln(w, "Today: "+formatHM(dayTotal))
 	return nil
 }
 
@@ -259,10 +299,8 @@ type todayJSON struct {
 // renderTodayJSON writes the daily entries as the stable JSON shape.
 func renderTodayJSON(w io.Writer, entries []store.Entry, now time.Time) error {
 	out := todayJSON{Entries: []todayEntryJSON{}}
-	var total time.Duration
 	for _, e := range entries {
 		dur := displayDuration(e, now)
-		total += dur
 		je := todayEntryJSON{
 			ID:              e.ID,
 			Task:            e.TaskName,
@@ -279,6 +317,7 @@ func renderTodayJSON(w io.Writer, entries []store.Entry, now time.Time) error {
 		}
 		out.Entries = append(out.Entries, je)
 	}
+	total, _ := totalDuration(entries, now)
 	out.TotalSeconds = int64(total / time.Second)
 	return writeJSON(w, out)
 }

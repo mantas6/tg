@@ -19,11 +19,11 @@ func cmdCompletion(w io.Writer, shell string) error {
 // zshCompletion is the zsh completion script emitted by `tg completion zsh`.
 // It is written to work both ways: dropped on $fpath as a #compdef file, or
 // eval'd/sourced after compinit (the trailing guard calls compdef itself).
-// `tg start` completion pulls task names from `tg tasks --json`, which reads
+// `tg add` completion pulls task names from `tg tasks --json`, which reads
 // the local SQLite cache and honours TOGGL_PROJECT_ID scoping.
 const zshCompletion = `#compdef tg
 
-# Complete task names for ` + "`tg start`" + ` from the local catalog cache.
+# Complete task names for ` + "`tg add`" + ` from the local catalog cache.
 __tg_tasks() {
   local json name
   local MATCH MBEGIN MEND
@@ -54,11 +54,9 @@ _tg() {
       local -a commands
       commands=(
         'auth:verify a Toggl API token and store config'
-        'start:start tracking the task matching a fragment'
         'add:add a finished entry from a timesign (9-:30, +:20)'
-        'stop:stop the running entry (snaps to 5m)'
-        'current:show the running entry'
-        'status:show the running entry'
+        "current:show the last entry, idle gap and today's total"
+        "status:show the last entry, idle gap and today's total"
         "today:show today's entries"
         "list:show today's entries"
         "ls:show today's entries"
@@ -76,9 +74,6 @@ _tg() {
       ;;
     args)
       case $words[1] in
-        start)
-          __tg_tasks
-          ;;
         add)
           # First positional is the timesign (absolute 9-:30 or relative
           # +:20); later args are task names. --desc/--description set the

@@ -16,86 +16,20 @@ import (
 	"github.com/mantas6/tg/timesig"
 )
 
-// cmdStart resolves a task-title fragment to a single task and starts tracking
-// it: 1 match -> auto-stop the running entry and create a new running entry
-// (empty description, task + project set); many -> error listing candidates;
-// none -> error suggesting `tg update`. projectID scopes the candidates when
-// set; it comes from TOGGL_PROJECT_ID or, for the 2-argument form
-// (`tg start <project> <task>`), from the resolved project-name argument (see
-// runStart / resolveStartProject).
-//
-// When c is non-nil the newly created running entry (and any just auto-stopped
-// entry) is pushed to Toggl immediately so the entry shows as running in the
-// web app with its task_id set, rather than waiting for a later `tg push`. The
-// push is best-effort: a sync failure leaves the entries dirty (a warning is
-// printed) so the local-first flow still works offline.
-func cmdStart(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, projectID *int64, fragment string, now time.Time) error {
-	fragment = strings.TrimSpace(fragment)
-	if fragment == "" {
-		return errors.New("usage: tg start <task-fragment>")
-	}
-
-	tasks, err := st.FindTasksByFragment(fragment, projectID)
-	if err != nil {
-		return err
-	}
-
-	switch len(tasks) {
-	case 0:
-		return fmt.Errorf("no task matches %q; run `tg update` to refresh the catalog", fragment)
-	case 1:
-		task := tasks[0]
-		if _, err := st.StopRunning(now, snap5); err != nil {
-			return err
-		}
-		taskID := task.ID
-		projID := task.ProjectID
-		// Carry the project's billable flag onto the entry: workspaces can
-		// reject non-billable entries in billable projects.
-		billable, err := projectBillable(st, projID)
-		if err != nil {
-			return err
-		}
-		if _, err := st.CreateEntry(store.Entry{
-			WorkspaceID: workspaceID,
-			ProjectID:   &projID,
-			TaskID:      &taskID,
-			Description: "",
-			Start:       snap5(now),
-			Duration:    -1,
-			Billable:    billable,
-			UpdatedAt:   now,
-			Dirty:       true,
-		}); err != nil {
-			return err
-		}
-		fmt.Fprintf(w, "Started: %s\n", task.Name)
-		// Push the running entry (and any just auto-stopped entry) so Toggl
-		// shows it as running with its task set. Best-effort: keep the local
-		// entry dirty for a later `tg push` if the sync fails.
-		if c != nil {
-			if _, err := sync.Push(st, c, now); err != nil {
-				fmt.Fprintf(w, "warning: could not sync to Toggl: %v\n", err)
-			}
-		}
-		return nil
-	default:
-		return fmt.Errorf("multiple tasks match %q:\n%s", fragment, candidateList(tasks))
-	}
-}
-
 // cmdAdd records a single, already-stopped time entry from a timesign (see the
-// timesig package and docs/timesig.md) and a task-title fragment, without
-// touching the timer. Unlike cmdStart it never stops a running entry and the
-// created entry is complete (has a stop and a positive duration). The task
-// fragment is resolved exactly like `tg start` (FindTasksByFragment scoped by
-// projectID): 1 match -> create the entry; many -> error listing candidates;
-// none -> error suggesting `tg update`. The entry is stored dirty so a later
-// `tg push` (or the best-effort push below) sends it to Toggl.
+// timesig package and docs/timesig.md) and a task-title fragment. The created
+// entry is complete (has a stop and a positive duration); tg has no timer, so
+// this is the only way entries are created locally. The task fragment is
+// resolved with FindTasksByFragment scoped by projectID (from TOGGL_PROJECT_ID
+// or, for the 2-argument form `tg add <timesign> <project> <task>`, from the
+// resolved project-name argument; see runAdd / resolveAddProject): 1 match ->
+// create the entry; many -> error listing candidates; none -> error suggesting
+// `tg update`. The entry is stored dirty so a later `tg push` (or the
+// best-effort push below) sends it to Toggl.
 //
-// When c is non-nil the new entry is pushed to Toggl immediately, mirroring
-// cmdStart; the push is best-effort so a sync failure just leaves the entry
-// dirty (a warning is printed) for a later `tg push`.
+// When c is non-nil the new entry is pushed to Toggl immediately; the push is
+// best-effort so a sync failure just leaves the entry dirty (a warning is
+// printed) for a later `tg push`.
 //
 // desc is the entry's free-form description (from `--desc`/`--description`); an
 // empty desc leaves the description blank, matching the prior behavior.
@@ -182,7 +116,7 @@ func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, proj
 // the tasks whose names match the given fragments. The window defaults to the
 // last three months (see runTotal/resolveTotalSince) and can be overridden with
 // `--since`. Each fragment is matched against the reported task names with the
-// same case-insensitive substring / exact-title-wins semantics as `tg start`
+// same case-insensitive substring / exact-title-wins semantics as `tg add`
 // (see matchSummaryTasks); tasks matched by more than one fragment are listed
 // once. Output is one line per matched task with its total, followed by the sum
 // of all listed tasks. No fragments, or no matches at all, is an error.
@@ -269,29 +203,32 @@ func quoteAll(ss []string) []string {
 	return out
 }
 
-// cmdStop finalizes the running entry (snapping start/end to the nearest
-// 5-minute wall-clock mark).
-func cmdStop(w io.Writer, st *store.Store, now time.Time) error {
-	stopped, err := st.StopRunning(now, snap5)
-	if err != nil {
-		return err
-	}
-	if stopped == nil {
-		fmt.Fprintln(w, "Nothing is running.")
-		return nil
-	}
-	dur := time.Duration(stopped.Duration) * time.Second
-	fmt.Fprintf(w, "Stopped: %s (%s)\n", entryLabel(*stopped), formatHM(dur))
-	return nil
-}
-
-// cmdCurrent shows the running entry (or its absence).
+// cmdCurrent shows the terse status line: the most recent entry, the idle gap
+// between its stop and now, and today's tracked total.
+//
+// A running entry wins over a newer finished one. tg itself never starts a
+// timer, so a running entry can only arrive from a `tg pull` of remote data;
+// when one exists it is still what the user is tracking and is reported as
+// running. Otherwise the newest entry by start time is used, regardless of the
+// day it falls on (see store.LastEntry), so the status line is never empty just
+// because nothing was tracked today. The total always covers today only.
 func cmdCurrent(w io.Writer, st *store.Store, now time.Time, loc *time.Location, jsonOut bool) error {
-	e, err := st.Running()
+	last, err := st.Running()
 	if err != nil {
 		return err
 	}
-	return renderCurrent(w, e, now, loc, jsonOut)
+	if last == nil {
+		if last, err = st.LastEntry(); err != nil {
+			return err
+		}
+	}
+	dayStart := startOfDay(now, loc)
+	entries, err := st.EntriesBetween(dayStart, dayStart.Add(24*time.Hour))
+	if err != nil {
+		return err
+	}
+	total, _ := totalDuration(entries, now)
+	return renderCurrent(w, last, total, now, loc, jsonOut)
 }
 
 // cmdToday lists entries for the current day (or the last `days` days). color
@@ -454,7 +391,7 @@ func cmdPull(w io.Writer, st *store.Store, c *api.Client, fragment string, since
 // is non-nil it wins and fragment is ignored. Otherwise fragment is required
 // (emptyErr is returned verbatim when it is blank) and must resolve to exactly
 // one cached project: none -> error + noMatchHint; many -> error listing
-// candidates. This is the shared machinery that keeps `start`, `pull`, and
+// candidates. This is the shared machinery that keeps `add`, `pull`, and
 // `update` scoped to a single project rather than the whole workspace.
 func resolveCachedProject(st *store.Store, projectID *int64, fragment string, emptyErr error, noMatchHint string) (*int64, error) {
 	if projectID != nil {
@@ -512,12 +449,12 @@ func resolveUpdateProject(st *store.Store, projectID *int64, fragment string) (*
 		"; set TOGGL_PROJECT_ID to its id to update a project not yet cached")
 }
 
-// resolveStartProject resolves the project-name argument accepted by the 2-arg
-// form of `tg start` (`tg start <project> <task>`) to exactly one cached
+// resolveAddProject resolves the project-name argument accepted by the 2-fragment
+// form of `tg add` (`tg add <timesign> <project> <task>`) to exactly one cached
 // project id, so the task search can be scoped to it.
-func resolveStartProject(st *store.Store, fragment string) (*int64, error) {
+func resolveAddProject(st *store.Store, fragment string) (*int64, error) {
 	return resolveCachedProject(st, nil, fragment,
-		errors.New("usage: tg start [project] <task-fragment>"),
+		errors.New("usage: tg add <timesign> [project] <task-fragment>"),
 		"; run `tg update` to refresh the catalog")
 }
 

@@ -90,9 +90,8 @@ Examples (assuming now = 15:07 unless noted):
 | `+:20`  | 14:00 | 13:40          | 14:00 | 20m      |
 | `+2`    | 00:30 | 22:30 prev day | 00:30 | 2h       |
 
-Note the asymmetry with `tg start`/`tg stop`, which snap to the *nearest*
-5-minute mark (rounding up on ties). Relative timesigns always floor, so a
-freshly added entry can never claim time in the future.
+Relative timesigns always floor (never round to the *nearest* mark), so a freshly
+added entry can never claim time in the future.
 
 ## Error cases
 

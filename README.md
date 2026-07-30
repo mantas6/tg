@@ -8,7 +8,7 @@ on demand, so tracking works offline and syncs when you choose.
 
 - Local-first: every action is written to SQLite first and works offline.
 - On-demand sync with Toggl Track using last-writer-wins reconciliation.
-- Fuzzy task matching — start tracking with just a fragment of a task name.
+- Fuzzy task matching — record time with just a fragment of a task name.
 - Cached project/task catalog for fast, offline-friendly lookups.
 - Human-readable output with project colors, plus `--json` on most commands.
 - zsh completion.
@@ -39,18 +39,18 @@ tg auth <token>
 tg auth
 ```
 
-Refresh the local catalog, then start tracking:
+Refresh the local catalog, then record time:
 
 ```sh
 tg update-projects          # sync all workspace projects
 tg update <project>         # fetch tasks for one project
-tg start <task>             # start tracking the matching task
-tg stop                     # stop the running entry
+tg add +:20 <task>          # record the last 20 minutes against the task
+tg status                   # last entry, idle gap, today's total
 ```
 
-To record a finished block of time without using the timer, use `add` with a
-*timesign*: either an absolute `START-STOP` range on today's clock, or a
-relative `+DURATION` span counted back from now.
+There is no timer: time is always recorded as a finished block with `add` and a
+*timesign*, either an absolute `START-STOP` range on today's clock or a relative
+`+DURATION` span counted back from now.
 
 ```sh
 tg add 9-:30 <task>         # 09:00-09:30
@@ -66,15 +66,15 @@ after the start. A relative timesign ends at now rounded *down* to the preceding
 5-minute mark (14:23 -> 14:20) and starts that duration earlier. The full
 grammar, rounding rules, and error cases are in [docs/timesig.md](docs/timesig.md).
 
-Like `start`, `add` accepts `<project> <task>` to scope by project name (or set
+`add` accepts `<project> <task>` to scope by project name (or set
 `TOGGL_PROJECT_ID`), stores the entry locally marked dirty, and best-effort
 pushes it to Toggl.
 
 Time is exclusive: `add` refuses a span that overlaps an entry you already
 tracked and reports the conflict instead of recording it. Back-to-back entries
-are fine (one may start exactly when another ends); a running entry counts as
-occupying everything from its start onwards, so only spans ending at or before
-it are accepted while the timer runs.
+are fine (one may start exactly when another ends); an entry still running in
+Toggl (pulled by `tg pull`) counts as occupying everything from its start
+onwards, so only spans ending at or before it are accepted while it runs.
 
 Pass `--desc` (alias `--description`) to set the entry's description, which is
 carried through to Toggl on push:
@@ -95,7 +95,32 @@ tg total --since 2025-01-01 login     # from 2025-01-01 through today
 ```
 
 Each argument is a task-name fragment, matched the same case-insensitive way as
-`tg start`. A task matched by more than one fragment is listed once.
+`tg add`. A task matched by more than one fragment is listed once.
+
+`status` (alias `current`) is the terse one-glance line: the last entry with its
+wall-clock range, the idle gap since it stopped, and today's tracked total.
+
+```sh
+$ tg status
+last Code review [Backend] 10:30-11:00 (gap 0h25m)
+Today: 6h30m
+```
+
+The task name is truncated to 30 characters so the line fits a status bar. The
+gap only appears once now has moved past the entry's stop, and it deliberately
+spans days, so a stale `gap 20h00m` tells you nothing has been tracked since
+yesterday. An entry that is still running in Toggl (pulled by `tg pull`) is
+reported as running with its live elapsed time instead:
+
+```sh
+$ tg status
+run Code review [Backend] (0h45m)
+Today: 2h00m
+```
+
+With `--json` the same facts come back as
+`{"running":false,"task":"Code review",...,"gap_seconds":1500,"day_total_seconds":23400}`,
+where `elapsed_seconds` is the last entry's length (live while running).
 
 ## Usage
 
@@ -104,10 +129,8 @@ usage: tg <command> [flags]
 
 commands:
   auth [token]              verify a Toggl API token and store config
-  start [project] <task>    start tracking the task matching <task>
   add <timesign> [project] <task>  add a finished entry [--desc TEXT]
-  stop                      stop the running entry (snaps to 5m)
-  current | status          show the running entry            [--json]
+  current | status          last entry, gap, day total        [--json]
   today   | list | ls       show today's entries     [--days N] [--json]
   tasks                     list cached tasks         [--all] [--json]
   projects                  list cached projects with ids     [--all] [--json]
@@ -132,17 +155,17 @@ tg pull    # fetch remote changes into the local store
 tg push    # send local changes to Toggl
 ```
 
-`tg push` runs automatically (best-effort) when you `tg start`, so a running
-entry shows up in the Toggl web app immediately. If the network is unavailable,
-the entry stays local and dirty until the next `tg push`.
+`tg push` runs automatically (best-effort) when you `tg add`, so the entry shows
+up in the Toggl web app immediately. If the network is unavailable, the entry
+stays local and dirty until the next `tg push`.
 
 ### Environment
 
-- `TOGGL_PROJECT_ID` scopes `start`, `tasks`, and `update` to one project (and
-  sets the project on entries created by `start`). `pull` ignores it and always
+- `TOGGL_PROJECT_ID` scopes `add`, `tasks`, and `update` to one project (and
+  sets the project on entries created by `add`). `pull` ignores it and always
   reconciles every project; pass a `<project>` name to `pull` to scope it
   explicitly. When unset, `update` requires a unique `<project>` name and
-  `start` accepts `<project> <task>` to scope by project name.
+  `add` accepts `<timesign> <project> <task>` to scope by project name.
 - `XDG_STATE_HOME` controls where state is stored (`$XDG_STATE_HOME/tg`,
   falling back to `~/.local/state/tg`). This holds `config.json` (mode 0600)
   and the SQLite database.

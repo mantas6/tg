@@ -9,15 +9,6 @@ import (
 
 func ptrInt(v int64) *int64 { return &v }
 
-// snap5 mirrors the production wall-clock snapping so stop assertions are
-// realistic (nearest 5-minute mark, seconds zeroed, ties round up).
-func snap5(t time.Time) time.Time {
-	const step = 5 * time.Minute
-	hour := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, t.Location())
-	off := t.Sub(hour)
-	return hour.Add(((off + step/2) / step) * step)
-}
-
 func openTest(t *testing.T) *Store {
 	t.Helper()
 	s, err := Open(filepath.Join(t.TempDir(), "tg.db"))
@@ -130,74 +121,34 @@ func TestProjectByIDMissing(t *testing.T) {
 	}
 }
 
-func TestStopRunningSetsFields(t *testing.T) {
-	s := openTest(t)
-	start := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
-	id := mustCreate(t, s, Entry{
-		WorkspaceID: 1, TaskID: ptrInt(7), Start: start,
-		Duration: -1, UpdatedAt: start, Dirty: true,
-	})
-
-	now := start.Add(46 * time.Minute) // 09:46 -> snaps back to 09:45
-	stopped, err := s.StopRunning(now, snap5)
-	if err != nil {
-		t.Fatalf("stop: %v", err)
-	}
-	if stopped == nil || stopped.ID != id {
-		t.Fatalf("stopped entry mismatch: %+v", stopped)
-	}
-	if stopped.Duration != int64((45 * time.Minute).Seconds()) {
-		t.Errorf("duration = %d, want %d", stopped.Duration, int64((45 * time.Minute).Seconds()))
-	}
-	wantStop := start.Add(45 * time.Minute)
-	if stopped.Stop == nil || !stopped.Stop.Equal(wantStop) {
-		t.Errorf("stop = %v, want %v", stopped.Stop, wantStop)
-	}
-	if !stopped.Dirty {
-		t.Error("entry should be dirty after stop")
-	}
-	if !stopped.UpdatedAt.Equal(now) {
-		t.Errorf("updated_at = %v, want %v", stopped.UpdatedAt, now)
-	}
-
-	// No longer running.
-	if r, _ := s.Running(); r != nil {
-		t.Errorf("expected nothing running, got %+v", r)
-	}
-	// Stopping again is a no-op returning nil.
-	if again, err := s.StopRunning(now, snap5); err != nil || again != nil {
-		t.Errorf("second stop: entry=%v err=%v", again, err)
-	}
-}
-
-func TestStopRunningNothing(t *testing.T) {
-	s := openTest(t)
-	got, err := s.StopRunning(time.Now(), snap5)
-	if err != nil || got != nil {
-		t.Fatalf("stop with nothing running: entry=%v err=%v", got, err)
-	}
-}
-
-func TestSingleRunningInvariant(t *testing.T) {
+// TestRunningPicksNewest pins Running()'s tie-breaking: tg no longer starts
+// entries itself, so running rows arrive from pulls and the store can end up
+// holding more than one. The newest by start wins, and deleted rows are ignored.
+func TestRunningPicksNewest(t *testing.T) {
 	s := openTest(t)
 	base := time.Date(2026, 1, 2, 8, 0, 0, 0, time.UTC)
-	mustCreate(t, s, Entry{WorkspaceID: 1, Start: base, Duration: -1, UpdatedAt: base, Dirty: true})
+	mustCreate(t, s, Entry{WorkspaceID: 1, TaskID: ptrInt(7), Start: base, Duration: -1, UpdatedAt: base})
+	newest := mustCreate(t, s, Entry{
+		WorkspaceID: 1, TaskID: ptrInt(8), Start: base.Add(time.Hour), Duration: -1, UpdatedAt: base,
+	})
 
-	// Auto-stop before starting another, mirroring the start command.
-	if _, err := s.StopRunning(base.Add(10*time.Minute), snap5); err != nil {
-		t.Fatalf("auto-stop: %v", err)
+	r, err := s.Running()
+	if err != nil {
+		t.Fatalf("Running: %v", err)
 	}
-	mustCreate(t, s, Entry{WorkspaceID: 1, Start: base.Add(10 * time.Minute), Duration: -1, UpdatedAt: base, Dirty: true})
+	if r == nil || r.ID != newest {
+		t.Fatalf("Running = %+v, want id %d", r, newest)
+	}
 
-	if r, _ := s.Running(); r == nil {
-		t.Fatal("expected a running entry")
+	if _, err := s.db.Exec("UPDATE entries SET deleted = 1 WHERE id = ?", newest); err != nil {
+		t.Fatal(err)
 	}
-	var n int
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM entries WHERE stop IS NULL AND deleted = 0").Scan(&n); err != nil {
-		t.Fatalf("count: %v", err)
+	r, err = s.Running()
+	if err != nil {
+		t.Fatalf("Running (deleted): %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("running entries = %d, want 1", n)
+	if r == nil || !r.Start.Equal(base) {
+		t.Fatalf("Running (deleted) = %+v, want the 08:00 entry", r)
 	}
 }
 
@@ -225,6 +176,52 @@ func TestEntriesBetweenOrdering(t *testing.T) {
 		if got[i].Start.Before(got[i-1].Start) {
 			t.Fatalf("entries not ordered by start: %v", got)
 		}
+	}
+}
+
+// TestLastEntry covers the query behind `tg status`: the newest entry by start
+// wins regardless of the day it falls on, deleted entries are skipped, and an
+// empty store yields nil.
+func TestLastEntry(t *testing.T) {
+	s := openTest(t)
+
+	got, err := s.LastEntry()
+	if err != nil {
+		t.Fatalf("LastEntry (empty): %v", err)
+	}
+	if got != nil {
+		t.Fatalf("LastEntry (empty) = %+v, want nil", got)
+	}
+
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	mk := func(start time.Time) int64 {
+		return mustCreate(t, s, Entry{
+			WorkspaceID: 1, Start: start, Stop: ptrTime(start.Add(time.Hour)),
+			Duration: 3600, UpdatedAt: start,
+		})
+	}
+	mk(day.Add(9 * time.Hour))
+	mk(day.AddDate(0, 0, -3).Add(9 * time.Hour)) // an older day
+	newest := mk(day.Add(14 * time.Hour))
+
+	got, err = s.LastEntry()
+	if err != nil {
+		t.Fatalf("LastEntry: %v", err)
+	}
+	if got == nil || got.ID != newest {
+		t.Fatalf("LastEntry = %+v, want id %d", got, newest)
+	}
+
+	// A deleted newest entry is skipped in favour of the previous one.
+	if _, err := s.db.Exec("UPDATE entries SET deleted = 1 WHERE id = ?", newest); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.LastEntry()
+	if err != nil {
+		t.Fatalf("LastEntry (deleted): %v", err)
+	}
+	if got == nil || !got.Start.Equal(day.Add(9*time.Hour)) {
+		t.Fatalf("LastEntry (deleted) = %+v, want the 09:00 entry", got)
 	}
 }
 

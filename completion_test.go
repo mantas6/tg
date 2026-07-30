@@ -18,12 +18,18 @@ func TestCompletionZsh(t *testing.T) {
 		"__tg_tasks",
 		"compdef _tg tg",
 		"tg tasks --json",
-		"auth:", "start:", "stop:", "current:", "status:",
+		"auth:", "add:", "current:", "status:",
 		"today:", "list:", "ls:", "tasks:", "projects:",
 		"update:", "push:", "pull:", "completion:", "help:",
 	} {
 		if !strings.Contains(out, marker) {
 			t.Errorf("completion script missing %q", marker)
+		}
+	}
+	// start/stop are gone: the script must not offer them any more.
+	for _, gone := range []string{"'start:", "'stop:", "        start)"} {
+		if strings.Contains(out, gone) {
+			t.Errorf("completion script still offers %q", gone)
 		}
 	}
 }

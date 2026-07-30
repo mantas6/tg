@@ -47,248 +47,19 @@ func seedCatalog(t *testing.T, s *store.Store) {
 	}
 }
 
+// testStart is the reference day used by the entry fixtures below.
 var testStart = time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 
-func TestStartSingleMatch(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	if err := cmdStart(&buf, s, nil, 1, nil, "login", testStart); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	if !strings.Contains(buf.String(), "Started: Fix login bug") {
-		t.Errorf("output = %q", buf.String())
-	}
-
-	r, _ := s.Running()
-	if r == nil {
-		t.Fatal("expected a running entry")
-	}
-	if r.TaskID == nil || *r.TaskID != 10 {
-		t.Errorf("task_id = %v, want 10", r.TaskID)
-	}
-	if r.ProjectID == nil || *r.ProjectID != 1 {
-		t.Errorf("project_id = %v, want 1", r.ProjectID)
-	}
-	if r.Description != "" {
-		t.Errorf("description = %q, want empty", r.Description)
-	}
-	if !r.Start.Equal(testStart) {
-		t.Errorf("start = %v, want %v", r.Start, testStart)
-	}
-	if !r.Dirty {
-		t.Error("new entry should be dirty")
-	}
-}
-
-// TestStartPushesRunningEntryWithTaskID verifies that when a client is
-// supplied, `start` immediately POSTs the running entry to Toggl carrying its
-// task_id (so the web app shows it running against the right task), and that
-// the pushed entry is marked synced locally.
-func TestStartPushesRunningEntryWithTaskID(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var body map[string]any
-	var gotMethod string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotMethod = r.Method
-		raw, _ := io.ReadAll(r.Body)
-		json.Unmarshal(raw, &body)
-		w.Write([]byte(`{"id":9001,"at":"2026-01-02T09:00:00Z"}`))
-	}))
-	defer srv.Close()
-	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
-
-	var buf bytes.Buffer
-	if err := cmdStart(&buf, s, c, 1, nil, "login", testStart); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	if gotMethod != http.MethodPost {
-		t.Errorf("method = %s, want POST", gotMethod)
-	}
-	// The running entry must be pushed with its task_id set (JSON numbers
-	// decode to float64).
-	if v, ok := body["task_id"].(float64); !ok || int64(v) != 10 {
-		t.Errorf("task_id = %v, want 10", body["task_id"])
-	}
-	if v, ok := body["project_id"].(float64); !ok || int64(v) != 1 {
-		t.Errorf("project_id = %v, want 1", body["project_id"])
-	}
-	if v, ok := body["duration"].(float64); !ok || int64(v) != -1 {
-		t.Errorf("duration = %v, want -1 (running)", body["duration"])
-	}
-
-	// The pushed entry is marked synced locally (remote id set, clean).
-	r, _ := s.EntryByRemoteID(9001)
-	if r == nil {
-		t.Fatal("expected the running entry to be synced with its remote id")
-	}
-	if r.Dirty {
-		t.Error("running entry should be clean after a successful push")
-	}
-	if r.TaskID == nil || *r.TaskID != 10 {
-		t.Errorf("task_id = %v, want 10", r.TaskID)
-	}
-}
-
-// TestStartSyncFailureIsNonFatal verifies a push failure on start does not fail
-// the command: the running entry is still created locally (dirty) for a later
-// `tg push`, and a warning is surfaced.
-func TestStartSyncFailureIsNonFatal(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
-
-	var buf bytes.Buffer
-	if err := cmdStart(&buf, s, c, 1, nil, "login", testStart); err != nil {
-		t.Fatalf("start should not fail on a sync error: %v", err)
-	}
-	if !strings.Contains(buf.String(), "warning") {
-		t.Errorf("output = %q, want a sync warning", buf.String())
-	}
-	r, _ := s.Running()
-	if r == nil {
-		t.Fatal("expected a running entry despite the sync failure")
-	}
-	if !r.Dirty {
-		t.Error("running entry should stay dirty for a later push")
-	}
-	if r.RemoteID != nil {
-		t.Errorf("remote_id = %v, want nil (never synced)", r.RemoteID)
-	}
-}
-
-func TestStartAutoStops(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	if err := cmdStart(&buf, s, nil, 1, nil, "login", testStart); err != nil {
-		t.Fatalf("first start: %v", err)
-	}
-	second := testStart.Add(30 * time.Minute)
-	if err := cmdStart(&buf, s, nil, 1, nil, "review", second); err != nil {
-		t.Fatalf("second start: %v", err)
-	}
-
-	r, _ := s.Running()
-	if r == nil || r.TaskID == nil || *r.TaskID != 12 {
-		t.Fatalf("running entry = %+v, want Code review", r)
-	}
-
-	entries, _ := s.EntriesBetween(testStart.Add(-time.Hour), testStart.Add(24*time.Hour))
-	if len(entries) != 2 {
-		t.Fatalf("entries = %d, want 2", len(entries))
-	}
-	running := 0
-	for _, e := range entries {
-		if e.Stop == nil {
-			running++
-		}
-	}
-	if running != 1 {
-		t.Errorf("running entries = %d, want exactly 1", running)
-	}
-}
-
-func TestStartExactWins(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	// "Fix" exactly matches task 11 even though it is a substring of others.
-	if err := cmdStart(&buf, s, nil, 1, nil, "Fix", testStart); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	r, _ := s.Running()
-	if r == nil || r.TaskID == nil || *r.TaskID != 11 {
-		t.Fatalf("running entry = %+v, want task 11 (Fix)", r)
-	}
-}
-
-func TestStartManyAmbiguous(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	err := cmdStart(&buf, s, nil, 1, nil, "write", testStart)
-	if err == nil {
-		t.Fatal("expected ambiguity error")
-	}
-	if !strings.Contains(err.Error(), "Write tests") || !strings.Contains(err.Error(), "Write docs") {
-		t.Errorf("error should list candidates: %v", err)
-	}
-	if r, _ := s.Running(); r != nil {
-		t.Errorf("nothing should be running, got %+v", r)
-	}
-}
-
-func TestStartNoneSuggestsUpdate(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	err := cmdStart(&buf, s, nil, 1, nil, "nonexistent", testStart)
-	if err == nil || !strings.Contains(err.Error(), "tg update") {
-		t.Errorf("error = %v, want suggestion to run `tg update`", err)
-	}
-}
-
-func TestStartProjectScope(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	pid := int64(2)
-	var buf bytes.Buffer
-	// "fix" matches several tasks, but scoping to project 2 leaves only one.
-	if err := cmdStart(&buf, s, nil, 1, &pid, "fix", testStart); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	r, _ := s.Running()
-	if r == nil || r.TaskID == nil || *r.TaskID != 20 {
-		t.Fatalf("running entry = %+v, want task 20 (Payment fix)", r)
-	}
-	if r.ProjectID == nil || *r.ProjectID != 2 {
-		t.Errorf("project_id = %v, want 2", r.ProjectID)
-	}
-}
-
-func TestStartCarriesProjectBillable(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	// A task in the billable project (Payments, id 2) must produce a billable
-	// entry so the workspace accepts it.
-	pid := int64(2)
-	var buf bytes.Buffer
-	if err := cmdStart(&buf, s, nil, 1, &pid, "fix", testStart); err != nil {
-		t.Fatalf("start billable: %v", err)
-	}
-	r, _ := s.Running()
-	if r == nil || !r.Billable {
-		t.Fatalf("running entry = %+v, want Billable=true", r)
-	}
-}
-
-func TestStartNonBillableProject(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	// A task in a non-billable project (Backend, id 1) stays non-billable.
-	var buf bytes.Buffer
-	if err := cmdStart(&buf, s, nil, 1, nil, "login", testStart); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	r, _ := s.Running()
-	if r == nil || r.Billable {
-		t.Fatalf("running entry = %+v, want Billable=false", r)
+// seedRunning inserts a running entry (duration -1, no stop) the way a `tg pull`
+// of a timer started in the Toggl web app would: tg itself no longer starts
+// entries, but it must keep handling the ones it pulls.
+func seedRunning(t *testing.T, s *store.Store, taskID int64, start time.Time) {
+	t.Helper()
+	if _, err := s.CreateEntry(store.Entry{
+		WorkspaceID: 1, ProjectID: p(1), TaskID: &taskID,
+		Start: start, Duration: -1, UpdatedAt: start,
+	}); err != nil {
+		t.Fatalf("seed running entry: %v", err)
 	}
 }
 
@@ -457,17 +228,52 @@ func TestAddDescriptionInPushPayload(t *testing.T) {
 	}
 }
 
-func TestAddDoesNotStopRunning(t *testing.T) {
+// TestAddExactWins covers the shared fragment matching: an exact task title
+// beats the longer titles it is a substring of.
+func TestAddExactWins(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	// A running entry created by start must survive an `add`. The added span
-	// sits before the running entry began (09:00) so the overlap guard is
-	// happy: a running entry occupies everything from its start onwards.
 	var buf bytes.Buffer
-	if err := cmdStart(&buf, s, nil, 1, nil, "review", testStart); err != nil {
-		t.Fatalf("start: %v", err)
+	// "Fix" exactly matches task 11 even though it is a substring of others.
+	if err := cmdAdd(&buf, s, nil, 1, nil, "9-10", "Fix", "", addNow, time.UTC); err != nil {
+		t.Fatalf("add: %v", err)
 	}
+	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	if entries[0].TaskID == nil || *entries[0].TaskID != 11 {
+		t.Errorf("task_id = %v, want 11 (Fix)", entries[0].TaskID)
+	}
+}
+
+// TestAddNonBillableProject verifies a task in a non-billable project (Backend,
+// id 1) yields a non-billable entry (the billable counterpart is covered by
+// TestAddProjectScopeViaEnvID).
+func TestAddNonBillableProject(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdAdd(&buf, s, nil, 1, nil, "9-10", "login", "", addNow, time.UTC); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	if len(entries) != 1 || entries[0].Billable {
+		t.Fatalf("entries = %+v, want a single non-billable entry", entries)
+	}
+}
+
+func TestAddKeepsRunningEntry(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	// A pulled running entry must survive an `add`. The added span sits before
+	// the running entry began (09:00) so the overlap guard is happy: a running
+	// entry occupies everything from its start onwards.
+	seedRunning(t, s, 12, testStart)
+	var buf bytes.Buffer
 	if err := cmdAdd(&buf, s, nil, 1, nil, "7-8", "login", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add: %v", err)
 	}
@@ -526,12 +332,9 @@ func TestAddRejectsOverlapWithRunningEntry(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	var buf bytes.Buffer
-	if err := cmdStart(&buf, s, nil, 1, nil, "review", testStart); err != nil {
-		t.Fatalf("start: %v", err)
-	}
+	seedRunning(t, s, 12, testStart)
 
-	buf.Reset()
+	var buf bytes.Buffer
 	err := cmdAdd(&buf, s, nil, 1, nil, "8:30-9:30", "login", "", addNow, time.UTC)
 	if err == nil {
 		t.Fatal("add over a running entry = nil error, want an error")
@@ -680,68 +483,6 @@ func TestAddSyncFailureIsNonFatal(t *testing.T) {
 	}
 	if entries[0].RemoteID != nil {
 		t.Errorf("remote_id = %v, want nil (never synced)", entries[0].RemoteID)
-	}
-}
-
-func TestStopSnaps(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	if err := cmdStart(&buf, s, nil, 1, nil, "login", testStart); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-
-	var stopBuf bytes.Buffer
-	now := testStart.Add(46 * time.Minute) // 09:46 -> snaps back to 09:45
-	if err := cmdStop(&stopBuf, s, now); err != nil {
-		t.Fatalf("stop: %v", err)
-	}
-	if !strings.Contains(stopBuf.String(), "0h45m") {
-		t.Errorf("stop output = %q, want 0h45m", stopBuf.String())
-	}
-
-	entries, _ := s.EntriesBetween(testStart.Add(-time.Hour), testStart.Add(24*time.Hour))
-	if len(entries) != 1 {
-		t.Fatalf("entries = %d, want 1", len(entries))
-	}
-	e := entries[0]
-	if e.Duration != 2700 {
-		t.Errorf("duration = %d, want 2700", e.Duration)
-	}
-	wantStop := testStart.Add(45 * time.Minute)
-	if e.Stop == nil || !e.Stop.Equal(wantStop) {
-		t.Errorf("stop = %v, want %v", e.Stop, wantStop)
-	}
-}
-
-// TestStartSnapsStart verifies the entry's start time is snapped to the nearest
-// 5-minute wall-clock mark at creation.
-func TestStartSnapsStart(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	// 09:03 should snap up to 09:05.
-	start := time.Date(2026, 1, 2, 9, 3, 0, 0, time.UTC)
-	if err := cmdStart(&buf, s, nil, 1, nil, "login", start); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	r, _ := s.Running()
-	want := time.Date(2026, 1, 2, 9, 5, 0, 0, time.UTC)
-	if r == nil || !r.Start.Equal(want) {
-		t.Fatalf("start = %v, want %v", r.Start, want)
-	}
-}
-
-func TestStopNothingRunning(t *testing.T) {
-	s := newStore(t)
-	var buf bytes.Buffer
-	if err := cmdStop(&buf, s, time.Now()); err != nil {
-		t.Fatalf("stop: %v", err)
-	}
-	if !strings.Contains(buf.String(), "Nothing is running") {
-		t.Errorf("output = %q", buf.String())
 	}
 }
 
@@ -1233,11 +974,11 @@ func TestResolveTotalSinceInvalid(t *testing.T) {
 	}
 }
 
-func TestResolveStartProjectUnique(t *testing.T) {
+func TestResolveAddProjectUnique(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	got, err := resolveStartProject(s, "pay")
+	got, err := resolveAddProject(s, "pay")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -1246,11 +987,11 @@ func TestResolveStartProjectUnique(t *testing.T) {
 	}
 }
 
-func TestResolveStartProjectNone(t *testing.T) {
+func TestResolveAddProjectNone(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	_, err := resolveStartProject(s, "nonexistent")
+	_, err := resolveAddProject(s, "nonexistent")
 	if err == nil || !strings.Contains(err.Error(), "tg update") {
 		t.Errorf("err = %v, want suggestion to run `tg update`", err)
 	}
@@ -1473,6 +1214,91 @@ func TestCurrentCommandGolden(t *testing.T) {
 		t.Fatalf("current: %v", err)
 	}
 	assertGolden(t, "current.txt", buf.String())
+}
+
+// TestCurrentCommandLastEntryAndGap covers the no-timer path: with nothing
+// running, status reports the newest finished entry, the idle gap since it
+// stopped, and today's total (both entries, 1h15m + 0h30m).
+func TestCurrentCommandLastEntryAndGap(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	first := time.Date(2026, 1, 2, 9, 15, 0, 0, time.UTC)
+	firstStop := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	last := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	lastStop := time.Date(2026, 1, 2, 11, 0, 0, 0, time.UTC)
+	for _, e := range []store.Entry{
+		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(10), Start: first, Stop: &firstStop, Duration: 4500, UpdatedAt: firstStop},
+		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(12), Start: last, Stop: &lastStop, Duration: 1800, UpdatedAt: lastStop},
+	} {
+		if _, err := s.CreateEntry(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	now := time.Date(2026, 1, 2, 11, 25, 0, 0, time.UTC)
+	var buf bytes.Buffer
+	if err := cmdCurrent(&buf, s, now, time.UTC, false); err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	want := "last Code review [Backend] 10:30-11:00 (gap 0h25m)\nToday: 1h45m\n"
+	if buf.String() != want {
+		t.Errorf("status = %q, want %q", buf.String(), want)
+	}
+
+	// The JSON shape carries the same facts.
+	buf.Reset()
+	if err := cmdCurrent(&buf, s, now, time.UTC, true); err != nil {
+		t.Fatalf("current --json: %v", err)
+	}
+	for _, want := range []string{
+		`"running":false`, `"task":"Code review"`,
+		`"stop":"2026-01-02T11:00:00Z"`, `"gap_seconds":1500`, `"day_total_seconds":6300`,
+	} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("json = %s, want it to contain %s", buf.String(), want)
+		}
+	}
+}
+
+// TestCurrentCommandEmptyStore verifies status still reports a day total when
+// nothing has ever been tracked.
+func TestCurrentCommandEmptyStore(t *testing.T) {
+	s := newStore(t)
+	var buf bytes.Buffer
+	if err := cmdCurrent(&buf, s, testStart, time.UTC, false); err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	if want := "No entries.\nToday: 0h00m\n"; buf.String() != want {
+		t.Errorf("status = %q, want %q", buf.String(), want)
+	}
+}
+
+// TestCurrentCommandRunningWinsOverNewerEntry verifies a pulled running entry is
+// reported as running even when a finished entry started later.
+func TestCurrentCommandRunningWinsOverNewerEntry(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	seedRunning(t, s, 12, testStart) // 09:00, still running
+	later := testStart.Add(-2 * time.Hour)
+	laterStop := testStart.Add(-time.Hour)
+	if _, err := s.CreateEntry(store.Entry{
+		WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
+		Start: later, Stop: &laterStop, Duration: 3600, UpdatedAt: laterStop,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	now := testStart.Add(30 * time.Minute)
+	if err := cmdCurrent(&buf, s, now, time.UTC, false); err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	want := "run Code review [Backend] (0h30m)\nToday: 1h30m\n"
+	if buf.String() != want {
+		t.Errorf("status = %q, want %q", buf.String(), want)
+	}
 }
 
 func meHandler(t *testing.T) http.HandlerFunc {

@@ -36,51 +36,6 @@ func assertGolden(t *testing.T, name, got string) {
 	}
 }
 
-func TestSnap5(t *testing.T) {
-	// Fixed reference day in UTC; only the time-of-day matters per case.
-	at := func(h, m, s int) time.Time {
-		return time.Date(2026, 1, 2, h, m, s, 0, time.UTC)
-	}
-	cases := []struct {
-		name     string
-		in, want time.Time
-	}{
-		{"already on mark", at(10, 5, 0), at(10, 5, 0)},
-		{"round down", at(10, 2, 0), at(10, 0, 0)},
-		{"round up", at(10, 3, 0), at(10, 5, 0)},
-		{"tie rounds up", at(10, 2, 30), at(10, 5, 0)},
-		{"just under tie rounds down", at(10, 2, 29), at(10, 0, 0)},
-		{"seconds zeroed on mark", at(10, 5, 42), at(10, 5, 0)},
-		{"nearest lower", at(10, 6, 0), at(10, 5, 0)},
-		{"nearest upper", at(10, 8, 0), at(10, 10, 0)},
-		{"hour rollover", at(10, 58, 0), at(11, 0, 0)},
-		{"day rollover", at(23, 58, 0), time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)},
-	}
-	for _, c := range cases {
-		if got := snap5(c.in); !got.Equal(c.want) {
-			t.Errorf("%s: snap5(%v) = %v, want %v", c.name, c.in, got, c.want)
-		}
-	}
-}
-
-func TestSnap5WallClockLocation(t *testing.T) {
-	// Non-UTC zone: snapping must land on a wall-clock 5-minute mark, and the
-	// result must keep t's location.
-	loc, err := time.LoadLocation("Asia/Kolkata") // UTC+05:30
-	if err != nil {
-		t.Skipf("tzdata unavailable: %v", err)
-	}
-	in := time.Date(2026, 1, 2, 10, 3, 0, 0, loc)
-	got := snap5(in)
-	want := time.Date(2026, 1, 2, 10, 5, 0, 0, loc)
-	if !got.Equal(want) {
-		t.Errorf("snap5(%v) = %v, want %v", in, got, want)
-	}
-	if got.Location() != loc {
-		t.Errorf("location = %v, want %v", got.Location(), loc)
-	}
-}
-
 func TestFormatHM(t *testing.T) {
 	cases := []struct {
 		in   time.Duration
@@ -303,18 +258,91 @@ func TestRenderTodayEmpty(t *testing.T) {
 func TestRenderCurrentGolden(t *testing.T) {
 	entries, now := sampleDay()
 	running := entries[1] // the running entry
+	total, _ := totalDuration(entries, now)
 
 	var human bytes.Buffer
-	if err := renderCurrent(&human, &running, now, time.UTC, false); err != nil {
+	if err := renderCurrent(&human, &running, total, now, time.UTC, false); err != nil {
 		t.Fatal(err)
 	}
 	assertGolden(t, "current.txt", human.String())
 
 	var js bytes.Buffer
-	if err := renderCurrent(&js, &running, now, time.UTC, true); err != nil {
+	if err := renderCurrent(&js, &running, total, now, time.UTC, true); err != nil {
 		t.Fatal(err)
 	}
 	assertGolden(t, "current.json", js.String())
+}
+
+// TestRenderCurrentLastGolden covers the no-timer status line: the newest
+// finished entry with its wall-clock range plus the idle gap up to now.
+func TestRenderCurrentLastGolden(t *testing.T) {
+	entries, _ := sampleDay()
+	last := entries[0] // 09:15-10:30
+	now := time.Date(2026, 1, 2, 10, 55, 0, 0, time.UTC)
+	total, _ := totalDuration(entries[:1], now)
+
+	var human bytes.Buffer
+	if err := renderCurrent(&human, &last, total, now, time.UTC, false); err != nil {
+		t.Fatal(err)
+	}
+	assertGolden(t, "current_last.txt", human.String())
+
+	var js bytes.Buffer
+	if err := renderCurrent(&js, &last, total, now, time.UTC, true); err != nil {
+		t.Fatal(err)
+	}
+	assertGolden(t, "current_last.json", js.String())
+}
+
+// TestRenderCurrentGapSuppressed verifies no gap is shown while now sits at (or
+// within the 5-minute quantization noise of) the last entry's stop, and that the
+// gap deliberately spans calendar days once it is real.
+func TestRenderCurrentGapSuppressed(t *testing.T) {
+	entries, _ := sampleDay()
+	last := entries[0] // stops 10:30
+	stop := *last.Stop
+
+	cases := []struct {
+		name string
+		now  time.Time
+		want string
+	}{
+		{"at stop", stop, "last Fix login bug [Backend] 09:15-10:30\nToday: 1h15m\n"},
+		{"sub-minute noise", stop.Add(30 * time.Second), "last Fix login bug [Backend] 09:15-10:30\nToday: 1h15m\n"},
+		{"across midnight", stop.Add(20 * time.Hour), "last Fix login bug [Backend] 09:15-10:30 (gap 20h00m)\nToday: 1h15m\n"},
+	}
+	for _, c := range cases {
+		var buf bytes.Buffer
+		if err := renderCurrent(&buf, &last, 75*time.Minute, c.now, time.UTC, false); err != nil {
+			t.Fatal(err)
+		}
+		if buf.String() != c.want {
+			t.Errorf("%s: status = %q, want %q", c.name, buf.String(), c.want)
+		}
+	}
+}
+
+func TestTotalDuration(t *testing.T) {
+	entries, now := sampleDay()
+	total, anyRunning := totalDuration(entries, now)
+	if want := 2 * time.Hour; total != want { // 1h15m stored + 0h45m live
+		t.Errorf("total = %v, want %v", total, want)
+	}
+	if !anyRunning {
+		t.Error("anyRunning = false, want true (fixture has a running entry)")
+	}
+
+	total, anyRunning = totalDuration(entries[:1], now)
+	if want := 75 * time.Minute; total != want {
+		t.Errorf("total = %v, want %v", total, want)
+	}
+	if anyRunning {
+		t.Error("anyRunning = true, want false")
+	}
+
+	if total, anyRunning := totalDuration(nil, now); total != 0 || anyRunning {
+		t.Errorf("empty total = %v, %v, want 0, false", total, anyRunning)
+	}
 }
 
 func TestTruncName(t *testing.T) {
@@ -349,14 +377,14 @@ func TestRenderCurrentTruncatesName(t *testing.T) {
 		ProjectName: "Backend", Start: start, Duration: -1,
 	}
 	var buf bytes.Buffer
-	if err := renderCurrent(&buf, &e, now, time.UTC, false); err != nil {
+	if err := renderCurrent(&buf, &e, 45*time.Minute, now, time.UTC, false); err != nil {
 		t.Fatal(err)
 	}
 	got := buf.String()
 	if strings.Contains(got, "since") {
 		t.Errorf("status line still shows wall-clock start: %q", got)
 	}
-	want := "run This task name is definitely … [Backend] (0h45m)\n"
+	want := "run This task name is definitely … [Backend] (0h45m)\nToday: 0h45m\n"
 	if got != want {
 		t.Errorf("status line = %q, want %q", got, want)
 	}
@@ -427,13 +455,13 @@ func TestRenderProjectsEmpty(t *testing.T) {
 
 func TestRenderCurrentNoneGolden(t *testing.T) {
 	var human bytes.Buffer
-	if err := renderCurrent(&human, nil, time.Now(), time.UTC, false); err != nil {
+	if err := renderCurrent(&human, nil, 0, time.Now(), time.UTC, false); err != nil {
 		t.Fatal(err)
 	}
 	assertGolden(t, "current_none.txt", human.String())
 
 	var js bytes.Buffer
-	if err := renderCurrent(&js, nil, time.Now(), time.UTC, true); err != nil {
+	if err := renderCurrent(&js, nil, 0, time.Now(), time.UTC, true); err != nil {
 		t.Fatal(err)
 	}
 	assertGolden(t, "current_none.json", js.String())

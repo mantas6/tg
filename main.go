@@ -34,12 +34,8 @@ func run(cmd string, args []string) error {
 	switch cmd {
 	case "auth":
 		return runAuth(args)
-	case "start":
-		return runStart(args)
 	case "add":
 		return runAdd(args)
-	case "stop":
-		return runStop(args)
 	case "current", "status":
 		return runCurrent(args)
 	case "today", "list", "ls":
@@ -71,38 +67,6 @@ func run(cmd string, args []string) error {
 
 // --- command wiring ----------------------------------------------------------
 
-func runStart(args []string) error {
-	fs := newFlagSet("start")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-
-	// Two positional args mean `tg start <project> <task>`: the first scopes to
-	// a project (overriding TOGGL_PROJECT_ID) and the second is the task
-	// fragment. Any other count is the task fragment alone, scoped by env.
-	rest := fs.Args()
-	projectID := projectIDFromEnv()
-	fragment := strings.Join(rest, " ")
-	if len(rest) == 2 {
-		pid, err := resolveStartProject(st, rest[0])
-		if err != nil {
-			return err
-		}
-		projectID = pid
-		fragment = rest[1]
-	}
-	return cmdStart(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectID, fragment, time.Now())
-}
-
 func runAdd(args []string) error {
 	fs := newFlagSet("add")
 	// --desc and --description are aliases bound to the same variable, so
@@ -125,8 +89,7 @@ func runAdd(args []string) error {
 
 	// First positional arg is the timesign. After it, two fragments mean
 	// `<project> <task>` (the first scopes to a project, overriding
-	// TOGGL_PROJECT_ID); one means `<task>` scoped by env. This mirrors
-	// runStart's project/task resolution.
+	// TOGGL_PROJECT_ID); one means `<task>` scoped by env.
 	rest := fs.Args()
 	if len(rest) < 2 {
 		return errors.New("usage: tg add <timesign> [project] <task-fragment>")
@@ -136,7 +99,7 @@ func runAdd(args []string) error {
 	projectID := projectIDFromEnv()
 	fragment := strings.Join(rest, " ")
 	if len(rest) == 2 {
-		pid, err := resolveStartProject(st, rest[0])
+		pid, err := resolveAddProject(st, rest[0])
 		if err != nil {
 			return err
 		}
@@ -144,19 +107,6 @@ func runAdd(args []string) error {
 		fragment = rest[1]
 	}
 	return cmdAdd(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectID, timesign, fragment, desc, time.Now(), time.Local)
-}
-
-func runStop(args []string) error {
-	fs := newFlagSet("stop")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	return cmdStop(os.Stdout, st, time.Now())
 }
 
 func runCurrent(args []string) error {
@@ -299,7 +249,7 @@ func runPull(args []string) error {
 		return err
 	}
 	fragment := strings.Join(fs.Args(), " ")
-	// pull deliberately ignores TOGGL_PROJECT_ID (unlike start/tasks/update):
+	// pull deliberately ignores TOGGL_PROJECT_ID (unlike add/tasks/update):
 	// it always reconciles every project. Scoping happens only via an explicit
 	// <project> argument, so the env project id is never passed through here.
 	return cmdPull(os.Stdout, st, api.New(cfg.APIToken), fragment, since, now, *jsonOut)
@@ -432,10 +382,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "commands:")
 	fmt.Fprintln(w, "  auth [token]              verify a Toggl API token and store config")
-	fmt.Fprintln(w, "  start [project] <task>    start tracking the task matching <task>")
 	fmt.Fprintln(w, "  add <timesign> [project] <task>  add a finished entry [--desc TEXT]")
-	fmt.Fprintln(w, "  stop                      stop the running entry (snaps to 5m)")
-	fmt.Fprintln(w, "  current | status          show the running entry            [--json]")
+	fmt.Fprintln(w, "  current | status          last entry, gap, day total        [--json]")
 	fmt.Fprintln(w, "  today   | list | ls       show today's entries     [--days N] [--json]")
 	fmt.Fprintln(w, "  tasks                     list cached tasks                 [--all] [--json]")
 	fmt.Fprintln(w, "  projects                  list cached projects with ids     [--all] [--json]")
@@ -450,10 +398,10 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "      +:20, +1, +1:20 (that long, ending at the last 5m mark).")
 	fmt.Fprintln(w, "      Full spec: docs/timesig.md")
 	fmt.Fprintln(w, "sync: run `tg pull` then `tg push` for correct last-writer-wins.")
-	fmt.Fprintln(w, "env:  TOGGL_PROJECT_ID scopes `start`/`tasks`/`update` to one project")
-	fmt.Fprintln(w, "      (and sets the project on entries created by `start`). `pull`")
+	fmt.Fprintln(w, "env:  TOGGL_PROJECT_ID scopes `add`/`tasks`/`update` to one project")
+	fmt.Fprintln(w, "      (and sets the project on entries created by `add`). `pull`")
 	fmt.Fprintln(w, "      ignores it and always reconciles every project; pass a")
 	fmt.Fprintln(w, "      <project> name to `pull` to scope it explicitly. When unset,")
-	fmt.Fprintln(w, "      `update` requires a unique <project> name and `start` accepts")
-	fmt.Fprintln(w, "      `<project> <task>` to scope by project name.")
+	fmt.Fprintln(w, "      `update` requires a unique <project> name and `add` accepts")
+	fmt.Fprintln(w, "      `<timesign> <project> <task>` to scope by project name.")
 }
