@@ -196,7 +196,7 @@ commands:
   del <num>                 delete the entry numbered by `tg ls`
   current | status          last entry, gap, day total        [--json]
   today   | list | ls       show today's entries     [--days N] [--json]
-  tasks                     list cached tasks         [--all] [--json]
+  tasks                     list cached tasks                 [--all] [--json]
   projects                  list cached projects with ids     [--all] [--json]
   update <project>          refresh one project's tasks       [--all] [--json]
   update-projects           sync all workspace projects       [--all] [--json]

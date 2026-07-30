@@ -55,6 +55,8 @@ _tg() {
       commands=(
         'auth:verify a Toggl API token and store config'
         'add:add a finished entry from a timesign (9-:30, +:20)'
+        'mod:retime or rename an entry (default: the last one)'
+        'del:delete an entry by its number from tg ls'
         "current:show the last entry, idle gap and today's total"
         "status:show the last entry, idle gap and today's total"
         "today:show today's entries"
@@ -83,6 +85,19 @@ _tg() {
             '--description[entry description (alias of --desc)]:description:' \
             '1:timesign:' \
             '*:task fragment:__tg_tasks'
+          ;;
+        mod)
+          # Positionals are an entry number from tg ls (optional, defaults to
+          # the last entry) and a timesign, in either order; both are transient
+          # so only the slots are described. --desc/--description retitle it.
+          _arguments \
+            '--desc[new entry description]:description:' \
+            '--description[new entry description (alias of --desc)]:description:' \
+            '1:entry number or timesign:' \
+            '2:entry number or timesign:'
+          ;;
+        del)
+          _arguments '1:entry number from tg ls:'
           ;;
         current|status|push)
           _arguments '--json[emit JSON]'
