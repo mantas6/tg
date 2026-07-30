@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mantas6/tg/api"
 	"github.com/mantas6/tg/store"
 )
 
@@ -464,6 +463,7 @@ func renderProjectsJSON(w io.Writer, projects []store.Project) error {
 // totalTaskJSON / totalJSON are the stable --json shapes for `total`.
 type totalTaskJSON struct {
 	Task            string `json:"task"`
+	Project         string `json:"project,omitempty"`
 	DurationSeconds int64  `json:"duration_seconds"`
 }
 
@@ -473,9 +473,11 @@ type totalJSON struct {
 }
 
 // renderTotals writes the per-task totals table to w, one line per task with
-// its tracked time, then a divider and the summed total. Task names are padded
-// to the widest name so the duration column lines up (mirroring renderToday).
-func renderTotals(w io.Writer, rows []api.SummaryTask) {
+// its tracked time and project, then a divider and the summed total. Task names
+// are padded to the widest name so the duration column lines up (mirroring
+// renderToday). The project is omitted when the task is not in the local
+// catalog (see cmdTotal).
+func renderTotals(w io.Writer, rows []totalRow) {
 	if len(rows) == 0 {
 		fmt.Fprintln(w, "No matching tasks.")
 		return
@@ -490,19 +492,25 @@ func renderTotals(w io.Writer, rows []api.SummaryTask) {
 	for _, r := range rows {
 		d := time.Duration(r.Seconds) * time.Second
 		total += d
-		fmt.Fprintf(w, "%-*s  %s\n", width, r.Name, formatHM(d))
+		project := ""
+		if r.ProjectName != "" {
+			project = "  [" + r.ProjectName + "]"
+		}
+		fmt.Fprintf(w, "%-*s  %s%s\n", width, r.Name, formatHM(d), project)
 	}
 	fmt.Fprintln(w, todayDivider)
 	fmt.Fprintln(w, "Total: "+formatHM(total))
 }
 
 // renderTotalsJSON writes the per-task totals as the stable JSON shape.
-func renderTotalsJSON(w io.Writer, rows []api.SummaryTask) error {
+func renderTotalsJSON(w io.Writer, rows []totalRow) error {
 	out := totalJSON{Tasks: make([]totalTaskJSON, 0, len(rows))}
 	var total int64
 	for _, r := range rows {
 		total += r.Seconds
-		out.Tasks = append(out.Tasks, totalTaskJSON{Task: r.Name, DurationSeconds: r.Seconds})
+		out.Tasks = append(out.Tasks, totalTaskJSON{
+			Task: r.Name, Project: r.ProjectName, DurationSeconds: r.Seconds,
+		})
 	}
 	out.TotalSeconds = total
 	return writeJSON(w, out)

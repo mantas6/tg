@@ -1386,9 +1386,13 @@ func TestPullIgnoresProjectEnv(t *testing.T) {
 }
 
 // totalReportsServer returns a client whose Reports API points at a test server
-// serving a fixed summary payload (two projects; tasks Fix login bug 4500s,
-// Code review 2700s, Write tests 3600s, Write docs 900s), and records the
-// request body seen.
+// serving a fixed summary payload, and records the request body seen.
+//
+// The payload deliberately mirrors what the real endpoint sends: task
+// sub-groups carry ids and seconds but NO titles (task 10 4500s, 12 2700s, 13
+// 3600s, 14 900s, all in seedCatalog), so anything that matched on reported
+// titles would match nothing. Two extra rows are not in the local catalog: 98
+// (with a title, as older responses carried) and 99 (untitled).
 func totalReportsServer(t *testing.T) (*api.Client, *map[string]any) {
 	t.Helper()
 	body := map[string]any{}
@@ -1400,10 +1404,13 @@ func totalReportsServer(t *testing.T) (*api.Client, *map[string]any) {
 		json.Unmarshal(raw, &body)
 		w.Write([]byte(`{"groups":[
 		  {"id":1,"sub_groups":[
-		    {"id":10,"title":"Fix login bug","seconds":4500},
-		    {"id":12,"title":"Code review","seconds":2700},
-		    {"id":13,"title":"Write tests","seconds":3600},
-		    {"id":14,"title":"Write docs","seconds":900}]}]}`))
+		    {"id":10,"seconds":4500},
+		    {"id":12,"seconds":2700},
+		    {"id":13,"seconds":3600},
+		    {"id":14,"seconds":900},
+		    {"id":98,"title":"Legacy work","seconds":600},
+		    {"id":99,"seconds":1200},
+		    {"id":null,"seconds":300}]}]}`))
 	}))
 	t.Cleanup(srv.Close)
 	c := api.New("tok", api.WithReportsBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
@@ -1416,25 +1423,30 @@ var totalNow = time.Date(2026, 1, 2, 15, 0, 0, 0, time.UTC)
 // before totalNow (see resolveTotalSince), i.e. 2025-10-02.
 var totalSince = totalNow.AddDate(0, -3, 0)
 
-// TestTotalMultipleFragments verifies each positional fragment selects its
-// matching task, the totals come from the Reports API, and the bottom line sums
-// all listed tasks. It also checks the default 3-month date range is sent.
-func TestTotalMultipleFragments(t *testing.T) {
+// TestTotalMatchesLocalCatalogByID is the regression test for `tg total`
+// matching nothing: the fragment is matched against the LOCAL catalog and the
+// summary rows are joined to it by task id, so a titleless report still yields
+// a named, project-tagged line. It also checks the default 3-month range.
+func TestTotalMatchesLocalCatalogByID(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
 	c, body := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, c, 1, []string{"login", "review"}, totalSince, totalNow, time.UTC, false); err != nil {
+	if err := cmdTotal(&buf, s, c, 1, "login", totalSince, totalNow, time.UTC, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	out := buf.String()
-	for _, want := range []string{"Fix login bug", "1h15m", "Code review", "0h45m", "Total: 2h00m"} {
+	for _, want := range []string{"Fix login bug", "1h15m", "[Backend]", "Total: 1h15m"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
 	}
-	// Fragments that were not asked for must not appear.
-	if strings.Contains(out, "Write tests") || strings.Contains(out, "Write docs") {
-		t.Errorf("output should only list matched tasks:\n%s", out)
+	// Only the matched task is listed.
+	for _, unwanted := range []string{"Code review", "Write tests", "Write docs", "task #99"} {
+		if strings.Contains(out, unwanted) {
+			t.Errorf("output should only list the matched task, has %q:\n%s", unwanted, out)
+		}
 	}
 	// The default 3-month start date and today's end date are sent.
 	if (*body)["start_date"] != "2025-10-02" {
@@ -1445,15 +1457,38 @@ func TestTotalMultipleFragments(t *testing.T) {
 	}
 }
 
+// TestTotalJoinsFragment verifies the positionals form ONE fragment like
+// `tg add` does: "write docs" is a single search, not two.
+func TestTotalJoinsFragment(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	c, _ := totalReportsServer(t)
+
+	var buf bytes.Buffer
+	// runTotal joins the positionals with a space before calling cmdTotal.
+	if err := cmdTotal(&buf, s, c, 1, strings.Join([]string{"write", "docs"}, " "), totalSince, totalNow, time.UTC, false); err != nil {
+		t.Fatalf("total: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Write docs") || !strings.Contains(out, "Total: 0h15m") {
+		t.Errorf("joined fragment should match only Write docs:\n%s", out)
+	}
+	if strings.Contains(out, "Write tests") {
+		t.Errorf("joined fragment must not be treated as two searches:\n%s", out)
+	}
+}
+
 // TestTotalSinceOverridesStart verifies an explicit since date sets the Reports
 // API start_date instead of the default 3-month window, while end_date stays
 // today.
 func TestTotalSinceOverridesStart(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
 	c, body := totalReportsServer(t)
 
 	since := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, c, 1, []string{"login"}, since, totalNow, time.UTC, false); err != nil {
+	if err := cmdTotal(&buf, s, c, 1, "login", since, totalNow, time.UTC, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	if (*body)["start_date"] != "2025-01-01" {
@@ -1465,12 +1500,14 @@ func TestTotalSinceOverridesStart(t *testing.T) {
 }
 
 // TestTotalFragmentMatchingMany verifies one fragment can match several tasks
-// (substring semantics), all of which are listed and summed.
+// (the store's substring semantics), all of which are listed and summed.
 func TestTotalFragmentMatchingMany(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, c, 1, []string{"write"}, totalSince, totalNow, time.UTC, false); err != nil {
+	if err := cmdTotal(&buf, s, c, 1, "write", totalSince, totalNow, time.UTC, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	out := buf.String()
@@ -1482,30 +1519,69 @@ func TestTotalFragmentMatchingMany(t *testing.T) {
 	}
 }
 
-// TestTotalDedupesAcrossFragments verifies a task caught by two overlapping
-// fragments is listed and summed only once.
-func TestTotalDedupesAcrossFragments(t *testing.T) {
+// TestTotalExactNameWins verifies the store's exact-match-wins rule reaches
+// `total`: "fix" is a full task name (task 11) as well as a substring of
+// "Fix login bug", and only the exact one is considered.
+func TestTotalExactNameWins(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, c, 1, []string{"write", "docs"}, totalSince, totalNow, time.UTC, false); err != nil {
+	// Task 11 ("Fix") has no tracked time in the report, so the exact match
+	// winning is what makes this an empty result rather than "Fix login bug".
+	err := cmdTotal(&buf, s, c, 1, "fix", totalSince, totalNow, time.UTC, false)
+	if err == nil || !strings.Contains(err.Error(), "no tracked time") {
+		t.Errorf("err = %v, want a no-tracked-time error for the exact match", err)
+	}
+}
+
+// TestTotalNoFragmentListsAll verifies an empty fragment lists every task with
+// tracked time, including rows whose task id is missing from the local catalog:
+// those keep the API's title when it sent one, else fall back to `task #<id>`.
+func TestTotalNoFragmentListsAll(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	c, _ := totalReportsServer(t)
+
+	var buf bytes.Buffer
+	if err := cmdTotal(&buf, s, c, 1, "", totalSince, totalNow, time.UTC, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	out := buf.String()
-	if n := strings.Count(out, "Write docs"); n != 1 {
-		t.Errorf("Write docs listed %d times, want 1:\n%s", n, out)
+	for _, want := range []string{
+		"Fix login bug", "Code review", "Write tests", "Write docs",
+		"Legacy work", // uncatalogued but titled by the API
+		"task #99",    // uncatalogued and untitled
+		"Total: 3h45m",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
 	}
-	// Write tests (1h00m) + Write docs (0h15m), counted once each.
-	if !strings.Contains(out, "Total: 1h15m") {
-		t.Errorf("total should count each task once:\n%s", out)
+}
+
+// TestTotalUncataloguedNotMatchable verifies a row that only the API named
+// cannot be reached by a fragment: matching is catalog-only.
+func TestTotalUncataloguedNotMatchable(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	c, _ := totalReportsServer(t)
+
+	var buf bytes.Buffer
+	err := cmdTotal(&buf, s, c, 1, "legacy", totalSince, totalNow, time.UTC, false)
+	if err == nil || !strings.Contains(err.Error(), "no task matches") {
+		t.Errorf("err = %v, want a no-match error for an API-only title", err)
 	}
 }
 
 func TestTotalNoMatches(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	err := cmdTotal(&buf, c, 1, []string{"nonexistent"}, totalSince, totalNow, time.UTC, false)
+	err := cmdTotal(&buf, s, c, 1, "nonexistent", totalSince, totalNow, time.UTC, false)
 	if err == nil || !strings.Contains(err.Error(), "no task matches") {
 		t.Errorf("err = %v, want a no-match error", err)
 	}
@@ -1514,26 +1590,34 @@ func TestTotalNoMatches(t *testing.T) {
 	}
 }
 
-func TestTotalRequiresFragment(t *testing.T) {
+// TestTotalMatchedButUntracked verifies a task that exists locally but has no
+// tracked time in the range reports that, rather than a bogus no-match.
+func TestTotalMatchedButUntracked(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	err := cmdTotal(&buf, c, 1, []string{"  "}, totalSince, totalNow, time.UTC, false)
-	if err == nil || !strings.Contains(err.Error(), "usage") {
-		t.Errorf("err = %v, want a usage error for a blank fragment", err)
+	// "payment" matches task 20, which the report does not mention.
+	err := cmdTotal(&buf, s, c, 1, "payment", totalSince, totalNow, time.UTC, false)
+	if err == nil || !strings.Contains(err.Error(), "no tracked time") {
+		t.Errorf("err = %v, want a no-tracked-time error", err)
 	}
 }
 
 func TestTotalJSON(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, c, 1, []string{"login", "review"}, totalSince, totalNow, time.UTC, true); err != nil {
+	if err := cmdTotal(&buf, s, c, 1, "write", totalSince, totalNow, time.UTC, true); err != nil {
 		t.Fatalf("total --json: %v", err)
 	}
 	var got struct {
 		Tasks []struct {
 			Task            string `json:"task"`
+			Project         string `json:"project"`
 			DurationSeconds int64  `json:"duration_seconds"`
 		} `json:"tasks"`
 		TotalSeconds int64 `json:"total_seconds"`
@@ -1544,8 +1628,16 @@ func TestTotalJSON(t *testing.T) {
 	if len(got.Tasks) != 2 {
 		t.Fatalf("tasks = %d, want 2", len(got.Tasks))
 	}
-	if got.TotalSeconds != 7200 {
-		t.Errorf("total_seconds = %d, want 7200", got.TotalSeconds)
+	// Sorted by name: Write docs (900s) then Write tests (3600s), both named
+	// and project-tagged from the local catalog.
+	if got.Tasks[0].Task != "Write docs" || got.Tasks[0].Project != "Backend" || got.Tasks[0].DurationSeconds != 900 {
+		t.Errorf("tasks[0] = %+v, want Write docs / Backend / 900s", got.Tasks[0])
+	}
+	if got.Tasks[1].Task != "Write tests" {
+		t.Errorf("tasks[1] = %+v, want Write tests", got.Tasks[1])
+	}
+	if got.TotalSeconds != 4500 {
+		t.Errorf("total_seconds = %d, want 4500", got.TotalSeconds)
 	}
 }
 

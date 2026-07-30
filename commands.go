@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -239,26 +238,35 @@ func cmdDel(w io.Writer, st *store.Store, c *api.Client, ref int, now time.Time,
 	return nil
 }
 
-// cmdTotal reports per-task tracked totals straight from the Toggl Reports API
-// (never the local store): it fetches every task's summed seconds over the date
-// range [since, now] (both taken as calendar days in loc) and then keeps only
-// the tasks whose names match the given fragments. The window defaults to the
-// last three months (see runTotal/resolveTotalSince) and can be overridden with
-// `--since`. Each fragment is matched against the reported task names with the
-// same case-insensitive substring / exact-title-wins semantics as `tg add`
-// (see matchSummaryTasks); tasks matched by more than one fragment are listed
-// once. Output is one line per matched task with its total, followed by the sum
-// of all listed tasks. No fragments, or no matches at all, is an error.
-func cmdTotal(w io.Writer, c *api.Client, workspaceID int64, fragments []string, since, now time.Time, loc *time.Location, jsonOut bool) error {
-	var cleaned []string
-	for _, f := range fragments {
-		if f = strings.TrimSpace(f); f != "" {
-			cleaned = append(cleaned, f)
-		}
-	}
-	if len(cleaned) == 0 {
-		return errors.New("usage: tg total <task-fragment> [task-fragment...]")
-	}
+// totalRow is one line of `tg total`: the seconds come from the Reports API,
+// the display name and project from the local catalog.
+type totalRow struct {
+	TaskID      int64
+	Name        string
+	ProjectName string
+	Seconds     int64
+}
+
+// cmdTotal reports per-task tracked totals for the date range [since, now]
+// (both taken as calendar days in loc). The seconds come from the Reports API
+// (see api.SummaryByTask); everything about task identity comes from the local
+// catalog: summary rows are joined to cached tasks BY TASK ID. That join is
+// what makes fragment matching work at all, since the summary sub-groups
+// routinely carry no titles, so matching reported names matched nothing.
+//
+// fragment is a single task-name fragment (`tg total code review` searches for
+// "code review", exactly like `tg add`), matched against the cached task names
+// by the store's own matcher (store.FindTasksByFragment: case-insensitive
+// substring, exact name wins). An empty fragment lists every task with tracked
+// time in the range. Rows whose task id is not in the local catalog cannot
+// match a fragment; unfiltered they are still listed, labelled with whatever
+// title the API supplied or `task #<id>`.
+//
+// The window defaults to the last three months (see runTotal/resolveTotalSince)
+// and can be overridden with `--since`. Output is one line per task with its
+// total, followed by the sum of all listed tasks.
+func cmdTotal(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, fragment string, since, now time.Time, loc *time.Location, jsonOut bool) error {
+	fragment = strings.TrimSpace(fragment)
 
 	startDate := since.In(loc).Format("2006-01-02")
 	endDate := now.In(loc).Format("2006-01-02")
@@ -267,69 +275,67 @@ func cmdTotal(w io.Writer, c *api.Client, workspaceID int64, fragments []string,
 		return err
 	}
 
-	// Collect the union of tasks matched by any fragment, deduped by task id so
-	// a task caught by two fragments is only listed (and summed) once.
-	var matched []api.SummaryTask
-	seen := map[int64]bool{}
-	for _, frag := range cleaned {
-		for _, r := range matchSummaryTasks(rows, frag) {
-			if seen[r.TaskID] {
-				continue
-			}
-			seen[r.TaskID] = true
-			matched = append(matched, r)
-		}
+	// Catalog lookup for display: inactive tasks are included so a row for an
+	// archived task still gets a name, and ListTasks joins the project name.
+	catalog, err := st.ListTasks(true, nil)
+	if err != nil {
+		return err
 	}
-	if len(matched) == 0 {
-		return fmt.Errorf("no task matches %s", strings.Join(quoteAll(cleaned), ", "))
+	byID := make(map[int64]store.Task, len(catalog))
+	for _, t := range catalog {
+		byID[t.ID] = t
 	}
 
-	sort.Slice(matched, func(i, j int) bool {
-		if matched[i].Name != matched[j].Name {
-			return matched[i].Name < matched[j].Name
+	// Fragment matching happens on the local catalog (never on report titles);
+	// the resulting task ids are what filters the summary rows.
+	var keep map[int64]bool
+	if fragment != "" {
+		matched, err := st.FindTasksByFragment(fragment, nil)
+		if err != nil {
+			return err
 		}
-		return matched[i].TaskID < matched[j].TaskID
+		if len(matched) == 0 {
+			return fmt.Errorf("no task matches %q", fragment)
+		}
+		keep = make(map[int64]bool, len(matched))
+		for _, t := range matched {
+			keep[t.ID] = true
+		}
+	}
+
+	var out []totalRow
+	for _, r := range rows {
+		if keep != nil && !keep[r.TaskID] {
+			continue
+		}
+		row := totalRow{TaskID: r.TaskID, Name: r.Name, Seconds: r.Seconds}
+		if t, ok := byID[r.TaskID]; ok {
+			row.Name = t.Name
+			row.ProjectName = t.ProjectName
+		} else if row.Name == "" {
+			row.Name = fmt.Sprintf("task #%d", r.TaskID)
+		}
+		out = append(out, row)
+	}
+	if len(out) == 0 {
+		if fragment != "" {
+			return fmt.Errorf("no tracked time for %q in %s..%s", fragment, startDate, endDate)
+		}
+		return fmt.Errorf("no tracked time in %s..%s", startDate, endDate)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].TaskID < out[j].TaskID
 	})
 
 	if jsonOut {
-		return renderTotalsJSON(w, matched)
+		return renderTotalsJSON(w, out)
 	}
-	renderTotals(w, matched)
+	renderTotals(w, out)
 	return nil
-}
-
-// matchSummaryTasks mirrors the store's matchTasks for Reports API rows: a
-// case-insensitive substring match on the task name, with an exact
-// (case-insensitive) full-name match taking precedence over mere substrings.
-func matchSummaryTasks(rows []api.SummaryTask, fragment string) []api.SummaryTask {
-	frag := strings.ToLower(strings.TrimSpace(fragment))
-	if frag == "" {
-		return nil
-	}
-	var subs, exact []api.SummaryTask
-	for _, r := range rows {
-		name := strings.ToLower(r.Name)
-		if !strings.Contains(name, frag) {
-			continue
-		}
-		subs = append(subs, r)
-		if name == frag {
-			exact = append(exact, r)
-		}
-	}
-	if len(exact) > 0 {
-		return exact
-	}
-	return subs
-}
-
-// quoteAll wraps each string in double quotes for a readable error listing.
-func quoteAll(ss []string) []string {
-	out := make([]string, len(ss))
-	for i, s := range ss {
-		out[i] = strconv.Quote(s)
-	}
-	return out
 }
 
 // cmdCurrent shows the terse status line: the most recent entry, the idle gap

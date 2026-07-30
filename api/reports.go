@@ -9,7 +9,10 @@ const reportAllTimeStart = "2006-01-01"
 
 // SummaryTask is a single task's total tracked time as reported by the Reports
 // API summary endpoint. Seconds is the total tracked duration across the whole
-// requested date range; TaskID/Name come from the summary sub-group.
+// requested date range; TaskID/Name come from the summary sub-group. Name is
+// best-effort: the endpoint often returns sub-groups carrying only ids, so
+// callers must resolve display names from the local catalog (see cmdTotal) and
+// never rely on Name being set.
 type SummaryTask struct {
 	TaskID  int64
 	Name    string
@@ -46,8 +49,11 @@ type summaryResponse struct {
 // come straight from the Reports API (POST
 // /workspace/{workspace_id}/summary/time_entries, grouping=projects,
 // sub_grouping=tasks); nothing is read from or written to the local store.
-// Sub-groups without a task (e.g. untitled/no-task time) are skipped, and
-// sub-groups sharing a task id are summed.
+// Sub-groups without a task id (e.g. no-task time) are skipped, and sub-groups
+// sharing a task id are summed. A sub-group that carries an id but no title is
+// KEPT with an empty Name: the endpoint frequently omits titles, and dropping
+// those rows used to make every `tg total` fragment match nothing. Resolving
+// names is the caller's job.
 func (c *Client) SummaryByTask(workspaceID int64, startDate, endDate string) ([]SummaryTask, error) {
 	if startDate == "" {
 		startDate = reportAllTimeStart
@@ -70,12 +76,15 @@ func (c *Client) SummaryByTask(workspaceID int64, startDate, endDate string) ([]
 	index := map[int64]int{}
 	for _, g := range resp.Groups {
 		for _, sg := range g.SubGroups {
-			if sg.ID == nil || sg.Title == "" {
-				continue // no task -> nothing to match a fragment against
+			if sg.ID == nil {
+				continue // no task -> nothing a caller could attribute time to
 			}
 			id := *sg.ID
 			if i, ok := index[id]; ok {
 				out[i].Seconds += sg.Seconds
+				if out[i].Name == "" {
+					out[i].Name = sg.Title // first title seen for this id wins
+				}
 				continue
 			}
 			index[id] = len(out)

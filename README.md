@@ -115,18 +115,26 @@ next `tg push`. A number that no longer resolves (the listing is stale, or the
 entry is gone) is an error telling you to re-run `tg ls`.
 
 To see how much time you have tracked against particular tasks, use `total`.
-It queries the Toggl Reports API directly (no local cache) and lists one line
-per matched task plus a grand total. By default it covers the last 3 months
-(from today minus three months through today); pass `--since DATE` (YYYY-MM-DD)
-to override the start of the range:
+The hours come from the Toggl Reports API, while the task names come from the
+local catalog: report rows are joined to cached tasks by task id, because the
+API's summary rows often carry ids only. It lists one line per task with its
+project plus a grand total. By default it covers the last 3 months (from today
+minus three months through today); pass `--since DATE` (YYYY-MM-DD) to override
+the start of the range:
 
 ```sh
-tg total login review                 # last 3 months for "login" and "review"
+tg total login                        # last 3 months for "login"
+tg total code review                  # one fragment: "code review"
+tg total                              # every task with tracked time
 tg total --since 2025-01-01 login     # from 2025-01-01 through today
 ```
 
-Each argument is a task-name fragment, matched the same case-insensitive way as
-`tg add`. A task matched by more than one fragment is listed once.
+The arguments are joined into a single task-name fragment, matched against the
+cached tasks the same case-insensitive way as `tg add` (exact name wins over
+substrings), so run `tg update` if the catalog is stale. Without a fragment
+every task with tracked time is listed, including tasks missing from the local
+catalog (shown as `task #<id>` when the API gives no title); those cannot be
+reached by a fragment.
 
 `status` (alias `current`) is the terse one-glance line: the last entry with its
 wall-clock range, the idle gap since it stopped, and today's tracked total.
@@ -194,7 +202,7 @@ commands:
   update-projects           sync all workspace projects       [--all] [--json]
   push                      send local changes to Toggl       [--json]
   pull [project]            fetch changes; all projects, or one [--since DATE] [--json]
-  total <task>...           total tracked hours per task; last 3 months [--since DATE] [--json]
+  total [task]              total tracked hours per task; last 3 months [--since DATE] [--json]
   completion zsh            print the zsh completion script
 
 timesign: absolute 9-:30, 10-11, 10:30-11:15 (today) or relative

@@ -352,11 +352,13 @@ func TestSummaryByTask(t *testing.T) {
 		raw, _ := io.ReadAll(r.Body)
 		json.Unmarshal(raw, &body)
 		// Two projects; the second repeats task 10, whose seconds must be summed
-		// across groups. A sub-group without a task id/title is dropped.
+		// across groups. A sub-group without a task id is dropped, but one that
+		// has an id and no title (what the endpoint usually sends) is kept.
 		w.Write([]byte(`{"groups":[
 		  {"id":1,"sub_groups":[
 		    {"id":10,"title":"Fix login bug","seconds":4500},
 		    {"id":12,"title":"Code review","seconds":2700},
+		    {"id":15,"seconds":1200},
 		    {"id":null,"title":"","seconds":600}]},
 		  {"id":2,"sub_groups":[
 		    {"id":10,"title":"Fix login bug","seconds":1800}]}]}`))
@@ -383,10 +385,10 @@ func TestSummaryByTask(t *testing.T) {
 		t.Errorf("grouping/sub_grouping = %v/%v, want projects/tasks", body["grouping"], body["sub_grouping"])
 	}
 
-	// Task 10 (summed across the two groups), task 12; the task-less sub-group
-	// is dropped.
-	if len(tasks) != 2 {
-		t.Fatalf("tasks = %d (%+v), want 2", len(tasks), tasks)
+	// Task 10 (summed across the two groups), task 12 and the titleless task
+	// 15; only the task-less sub-group is dropped.
+	if len(tasks) != 3 {
+		t.Fatalf("tasks = %d (%+v), want 3", len(tasks), tasks)
 	}
 	byID := map[int64]SummaryTask{}
 	for _, tk := range tasks {
@@ -397,6 +399,11 @@ func TestSummaryByTask(t *testing.T) {
 	}
 	if got := byID[12]; got.Seconds != 2700 || got.Name != "Code review" {
 		t.Errorf("task 12 = %+v, want Code review / 2700s", got)
+	}
+	// A titled-less sub-group is kept: its name is resolved from the local
+	// catalog by id (see cmdTotal), which is what `tg total` matches against.
+	if got, ok := byID[15]; !ok || got.Seconds != 1200 || got.Name != "" {
+		t.Errorf("task 15 = %+v (present %v), want an untitled 1200s row", got, ok)
 	}
 }
 

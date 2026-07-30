@@ -335,9 +335,18 @@ func runTotal(args []string) error {
 	if err != nil {
 		return err
 	}
-	// total queries the Reports API directly and never touches the local store,
-	// so no store is opened here (unlike the catalog-backed commands).
-	return cmdTotal(os.Stdout, api.New(cfg.APIToken), cfg.WorkspaceID, fs.Args(), since, now, time.Local, *jsonOut)
+	// The store is needed even though the totals come from the Reports API: it
+	// is what resolves the reported task ids to names and what fragments are
+	// matched against (see cmdTotal).
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	// All positionals form ONE fragment, exactly like `tg add` (so
+	// `tg total code review` searches for "code review").
+	fragment := strings.Join(fs.Args(), " ")
+	return cmdTotal(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, fragment, since, now, time.Local, *jsonOut)
 }
 
 func runAuth(args []string) error {
@@ -541,7 +550,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  update-projects           sync all workspace projects       [--all] [--json]")
 	fmt.Fprintln(w, "  push                      send local changes to Toggl       [--json]")
 	fmt.Fprintln(w, "  pull [project]            fetch changes; all projects, or one [--since DATE] [--json]")
-	fmt.Fprintln(w, "  total <task>...           total tracked hours per task; last 3 months [--since DATE] [--json]")
+	fmt.Fprintln(w, "  total [task]              total tracked hours per task; last 3 months [--since DATE] [--json]")
 	fmt.Fprintln(w, "  completion zsh            print the zsh completion script")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "timesign: absolute 9-:30, 10-11, 10:30-11:15 (today) or relative")
