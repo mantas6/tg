@@ -234,6 +234,13 @@ func cmdCurrent(w io.Writer, st *store.Store, now time.Time, loc *time.Location,
 // cmdToday lists entries for the current day (or the last `days` days). color
 // enables ANSI project-color blocks in the human output (never in JSON) and
 // should reflect whether w is a terminal.
+//
+// Listing also publishes the local entry numbers: the listed entries are
+// numbered 1..N in display order and that mapping is persisted (replacing the
+// previous one) so later commands can address an entry as `tg mod 2` /
+// `tg del 3`. The mapping is saved in both human and JSON mode, and an empty
+// listing clears it, so a number never resolves to something that was not on
+// screen.
 func cmdToday(w io.Writer, st *store.Store, now time.Time, loc *time.Location, days int, jsonOut, color bool) error {
 	if days < 1 {
 		days = 1
@@ -244,6 +251,13 @@ func cmdToday(w io.Writer, st *store.Store, now time.Time, loc *time.Location, d
 
 	entries, err := st.EntriesBetween(from, to)
 	if err != nil {
+		return err
+	}
+	ids := make([]int64, len(entries))
+	for i, e := range entries {
+		ids[i] = e.ID
+	}
+	if err := st.SaveEntryRefs(ids); err != nil {
 		return err
 	}
 	if jsonOut {

@@ -4,7 +4,9 @@ import "database/sql"
 
 // schemaVersion is the current logical schema version, recorded in meta.
 // v2 added the billable flag to entries and projects.
-const schemaVersion = "2"
+// v3 added entry_refs, the display-order numbering `tg ls` publishes so later
+// commands can address an entry as `tg mod 2` / `tg del 3`.
+const schemaVersion = "3"
 
 // schemaSQL creates every table and index. It is idempotent (IF NOT EXISTS),
 // so applying it repeatedly is safe and forms the basis of migration.
@@ -45,6 +47,14 @@ CREATE TABLE IF NOT EXISTS tasks (
   name         TEXT NOT NULL,
   active       INTEGER NOT NULL DEFAULT 1,
   at           TEXT
+);
+
+-- entry_refs maps the small local numbers shown by "tg ls" (1..N in display
+-- order) to entry ids. It is rewritten wholesale on every listing, so a number
+-- only ever refers to the most recent listing; rows are never synced.
+CREATE TABLE IF NOT EXISTS entry_refs (
+  num      INTEGER PRIMARY KEY,
+  entry_id INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);

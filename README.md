@@ -122,6 +122,29 @@ With `--json` the same facts come back as
 `{"running":false,"task":"Code review",...,"gap_seconds":1500,"day_total_seconds":23400}`,
 where `elapsed_seconds` is the last entry's length (live while running).
 
+`ls` (aliases `today`, `list`) is the day's table: one line per entry with its
+local number, wall-clock range, duration, task and project, filler rows for the
+time you did not track, and the day's total.
+
+```sh
+$ tg ls
+1  09:00-10:00 1h00m  Fix login bug     [Backend]
+2  10:00-11:00 1h00m  Code review       [Backend]
+               (gap 0h30m)
+3  11:30-12:00 0h30m  Payment fix       [Payments]
+               (gap 0h25m)
+----------------------------------------
+Total: 2h30m
+```
+
+The leading numbers are local references, renumbered 1..N on every `ls` and
+stored in the local database, so the listing you just looked at is what other
+commands address. Gap rows are not entries and carry no number: they show idle
+time between two entries, and the last one shows the idle time since the newest
+entry stopped (only within the same day, and never while an entry is running).
+`--days N` looks further back, `--json` emits the same data with `num` on each
+entry.
+
 ## Usage
 
 ```

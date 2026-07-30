@@ -7,6 +7,7 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -337,6 +338,52 @@ func (s *Store) DeleteRow(id int64) error {
 func (s *Store) DeleteByRemoteID(remoteID int64) error {
 	_, err := s.db.Exec("DELETE FROM entries WHERE remote_id = ?", remoteID)
 	return err
+}
+
+// --- entry refs --------------------------------------------------------------
+
+// ErrNoEntryRef reports that a local entry number does not resolve to an entry:
+// either no listing has been produced yet, or the numbering is stale (the entry
+// was deleted since). Callers should surface the wrapped message, which already
+// tells the user to re-run `tg ls`.
+var ErrNoEntryRef = errors.New("no such entry number")
+
+// SaveEntryRefs replaces the whole number->entry mapping with ids numbered
+// 1..len(ids) in the given (display) order. `tg ls` calls it on every run, so
+// the numbers always describe the most recent listing; passing no ids clears
+// the mapping, which makes every number stale rather than wrong.
+func (s *Store) SaveEntryRefs(ids []int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM entry_refs"); err != nil {
+		return err
+	}
+	for i, id := range ids {
+		if _, err := tx.Exec("INSERT INTO entry_refs (num, entry_id) VALUES (?, ?)", i+1, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// EntryByRef resolves a local entry number published by the last `tg ls` (see
+// SaveEntryRefs) to its entry. An unknown number, or one whose entry has since
+// been deleted, yields an error wrapping ErrNoEntryRef.
+func (s *Store) EntryByRef(num int) (Entry, error) {
+	row := s.db.QueryRow(entrySelect+`
+JOIN entry_refs r ON r.entry_id = e.id
+WHERE r.num = ? AND e.deleted = 0`, num)
+	e, err := scanEntry(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Entry{}, fmt.Errorf("%w %d; run `tg ls` to list entries", ErrNoEntryRef, num)
+	}
+	if err != nil {
+		return Entry{}, err
+	}
+	return e, nil
 }
 
 // --- catalog -----------------------------------------------------------------

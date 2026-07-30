@@ -2,7 +2,9 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -222,6 +224,178 @@ func TestLastEntry(t *testing.T) {
 	}
 	if got == nil || !got.Start.Equal(day.Add(9*time.Hour)) {
 		t.Fatalf("LastEntry (deleted) = %+v, want the 09:00 entry", got)
+	}
+}
+
+// TestEntryRefsRoundTrip covers the local numbering published by `tg ls`:
+// SaveEntryRefs numbers the ids 1..N in the given order, EntryByRef resolves
+// each number back to its entry (with the catalog joins intact), and unknown
+// numbers report ErrNoEntryRef.
+func TestEntryRefsRoundTrip(t *testing.T) {
+	s := openTest(t)
+	if err := s.ReplaceProjects([]Project{{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceTasks([]Task{{ID: 10, WorkspaceID: 1, ProjectID: 1, Name: "Fix login bug", Active: true}}); err != nil {
+		t.Fatal(err)
+	}
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	mk := func(h int) int64 {
+		start := day.Add(time.Duration(h) * time.Hour)
+		return mustCreate(t, s, Entry{
+			WorkspaceID: 1, ProjectID: ptrInt(1), TaskID: ptrInt(10), Start: start,
+			Stop: ptrTime(start.Add(time.Hour)), Duration: 3600, UpdatedAt: start,
+		})
+	}
+	first, second, third := mk(9), mk(11), mk(13)
+
+	if err := s.SaveEntryRefs([]int64{first, second, third}); err != nil {
+		t.Fatalf("SaveEntryRefs: %v", err)
+	}
+	for num, wantID := range map[int]int64{1: first, 2: second, 3: third} {
+		got, err := s.EntryByRef(num)
+		if err != nil {
+			t.Fatalf("EntryByRef(%d): %v", num, err)
+		}
+		if got.ID != wantID {
+			t.Errorf("EntryByRef(%d).ID = %d, want %d", num, got.ID, wantID)
+		}
+	}
+
+	// The joined display fields come along, as they do for every entry read.
+	got, err := s.EntryByRef(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TaskName != "Fix login bug" || got.ProjectName != "Backend" {
+		t.Errorf("EntryByRef(1) joins = %q/%q, want task and project names", got.TaskName, got.ProjectName)
+	}
+
+	for _, num := range []int{0, 4, -1} {
+		if _, err := s.EntryByRef(num); !errors.Is(err, ErrNoEntryRef) {
+			t.Errorf("EntryByRef(%d) error = %v, want ErrNoEntryRef", num, err)
+		}
+	}
+	if _, err := s.EntryByRef(4); err == nil || !strings.Contains(err.Error(), "tg ls") {
+		t.Errorf("EntryByRef error = %v, want it to point at `tg ls`", err)
+	}
+}
+
+// TestSaveEntryRefsReplaces pins that each listing rewrites the whole mapping:
+// a shorter listing drops the numbers it did not use, and an empty one clears
+// the mapping instead of leaving stale numbers resolvable.
+func TestSaveEntryRefsReplaces(t *testing.T) {
+	s := openTest(t)
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	mk := func(h int) int64 {
+		start := day.Add(time.Duration(h) * time.Hour)
+		return mustCreate(t, s, Entry{
+			WorkspaceID: 1, Start: start, Stop: ptrTime(start.Add(time.Hour)),
+			Duration: 3600, UpdatedAt: start,
+		})
+	}
+	a, b := mk(9), mk(11)
+
+	if err := s.SaveEntryRefs([]int64{a, b}); err != nil {
+		t.Fatal(err)
+	}
+	// A second, reversed and shorter listing renumbers from scratch.
+	if err := s.SaveEntryRefs([]int64{b}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.EntryByRef(1)
+	if err != nil {
+		t.Fatalf("EntryByRef(1): %v", err)
+	}
+	if got.ID != b {
+		t.Errorf("EntryByRef(1).ID = %d, want %d", got.ID, b)
+	}
+	if _, err := s.EntryByRef(2); !errors.Is(err, ErrNoEntryRef) {
+		t.Errorf("EntryByRef(2) error = %v, want ErrNoEntryRef after renumbering", err)
+	}
+
+	if err := s.SaveEntryRefs(nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EntryByRef(1); !errors.Is(err, ErrNoEntryRef) {
+		t.Errorf("EntryByRef(1) error = %v, want ErrNoEntryRef after clearing", err)
+	}
+}
+
+// TestEntryByRefStale covers a number left pointing at an entry that was
+// deleted since the listing: it must read as a stale number, not resolve.
+func TestEntryByRefStale(t *testing.T) {
+	s := openTest(t)
+	start := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
+	id := mustCreate(t, s, Entry{
+		WorkspaceID: 1, Start: start, Stop: ptrTime(start.Add(time.Hour)),
+		Duration: 3600, UpdatedAt: start,
+	})
+	if err := s.SaveEntryRefs([]int64{id}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Soft-deleted (pending a push) entries are not listed, so not addressable.
+	if _, err := s.db.Exec("UPDATE entries SET deleted = 1 WHERE id = ?", id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EntryByRef(1); !errors.Is(err, ErrNoEntryRef) {
+		t.Errorf("EntryByRef(1) error = %v, want ErrNoEntryRef for a deleted entry", err)
+	}
+
+	// Hard-deleted rows behave the same.
+	if err := s.DeleteRow(id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EntryByRef(1); !errors.Is(err, ErrNoEntryRef) {
+		t.Errorf("EntryByRef(1) error = %v, want ErrNoEntryRef for a removed entry", err)
+	}
+}
+
+// TestMigrateAddsEntryRefs covers the v3 upgrade of a pre-existing database:
+// the entry_refs table is created in place so numbering works without a reset.
+func TestMigrateAddsEntryRefs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tg.db")
+
+	// Seed a v2 database: entries + meta, but no entry_refs.
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if _, err := raw.Exec(`
+CREATE TABLE entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, remote_id INTEGER UNIQUE,
+  workspace_id INTEGER NOT NULL, project_id INTEGER, task_id INTEGER,
+  description TEXT NOT NULL DEFAULT '', start TEXT NOT NULL, stop TEXT,
+  duration INTEGER NOT NULL, billable INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL, synced_at TEXT,
+  dirty INTEGER NOT NULL DEFAULT 1, deleted INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+INSERT INTO meta (key, value) VALUES ('schema_version', '2');`); err != nil {
+		t.Fatalf("seed v2 schema: %v", err)
+	}
+	raw.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open (migrate): %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	if v, ok, _ := s.GetMeta(MetaSchemaVersion); !ok || v != schemaVersion {
+		t.Errorf("schema_version = %q ok=%v, want %q", v, ok, schemaVersion)
+	}
+	start := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
+	id := mustCreate(t, s, Entry{
+		WorkspaceID: 1, Start: start, Stop: ptrTime(start.Add(time.Hour)),
+		Duration: 3600, UpdatedAt: start,
+	})
+	if err := s.SaveEntryRefs([]int64{id}); err != nil {
+		t.Fatalf("SaveEntryRefs after migrate: %v", err)
+	}
+	got, err := s.EntryByRef(1)
+	if err != nil || got.ID != id {
+		t.Fatalf("EntryByRef(1) = %+v err=%v, want id %d", got, err, id)
 	}
 }
 

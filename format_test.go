@@ -90,11 +90,13 @@ func TestRenderTodayJSONGolden(t *testing.T) {
 	assertGolden(t, "today.json", buf.String())
 }
 
+// TestRenderTodayGaps covers the filler rows between entries. now is pinned to
+// the last entry's stop so the trailing gap (covered by
+// TestRenderTodayTrailingGap) never contributes a "(gap ...)" row of its own.
 func TestRenderTodayGaps(t *testing.T) {
 	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
 	at := func(d time.Duration) time.Time { return day.Add(d) }
 	pt := func(t time.Time) *time.Time { return &t }
-	now := at(23 * time.Hour)
 
 	cases := []struct {
 		name    string
@@ -108,7 +110,7 @@ func TestRenderTodayGaps(t *testing.T) {
 				{TaskName: "A", Start: at(9 * time.Hour), Stop: pt(at(10 * time.Hour)), Duration: 3600},
 				{TaskName: "B", Start: at(10*time.Hour + 25*time.Minute), Stop: pt(at(11 * time.Hour)), Duration: 2100},
 			},
-			want: "            (gap 0h25m)\n",
+			want: "               (gap 0h25m)\n",
 		},
 		{
 			name: "gap below threshold hidden",
@@ -149,6 +151,13 @@ func TestRenderTodayGaps(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			// now sits exactly on the last entry's stop (or its start when it
+			// is running), so only inter-entry gaps can show up.
+			last := c.entries[len(c.entries)-1]
+			now := last.Start
+			if last.Stop != nil {
+				now = *last.Stop
+			}
 			var buf bytes.Buffer
 			renderToday(&buf, c.entries, now, time.UTC, false)
 			got := buf.String()
@@ -160,6 +169,136 @@ func TestRenderTodayGaps(t *testing.T) {
 				t.Errorf("output missing %q:\n%s", c.want, got)
 			}
 		})
+	}
+}
+
+// TestRenderTodayTrailingGap covers the closing filler row: idle time between
+// the last entry's stop and now, shown with the same shape (and alignment) as
+// the gaps between entries and under the same rules — nothing while the last
+// entry runs, nothing below the threshold, nothing across midnight.
+func TestRenderTodayTrailingGap(t *testing.T) {
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) time.Time { return day.Add(d) }
+	pt := func(t time.Time) *time.Time { return &t }
+
+	finished := []store.Entry{
+		{TaskName: "A", Start: at(9 * time.Hour), Stop: pt(at(10 * time.Hour)), Duration: 3600},
+	}
+	running := []store.Entry{
+		{TaskName: "A", Start: at(9 * time.Hour), Duration: -1},
+	}
+	yesterday := []store.Entry{
+		{TaskName: "A", Start: at(-3 * time.Hour), Stop: pt(at(-2 * time.Hour)), Duration: 3600},
+	}
+
+	cases := []struct {
+		name    string
+		entries []store.Entry
+		now     time.Time
+		want    string
+		absent  bool
+	}{
+		{
+			name:    "trailing gap shown before divider",
+			entries: finished,
+			now:     at(10*time.Hour + 25*time.Minute),
+			// 3 columns of blank number pad + 12 of blank clock column.
+			want: strings.Repeat(" ", 15) + "(gap 0h25m)\n" + todayDivider,
+		},
+		{
+			name:    "no trailing gap at stop",
+			entries: finished,
+			now:     at(10 * time.Hour),
+			want:    "(gap",
+			absent:  true,
+		},
+		{
+			name:    "no trailing gap below threshold",
+			entries: finished,
+			now:     at(10*time.Hour + 30*time.Second),
+			want:    "(gap",
+			absent:  true,
+		},
+		{
+			name:    "no trailing gap while running",
+			entries: running,
+			now:     at(11 * time.Hour),
+			want:    "(gap",
+			absent:  true,
+		},
+		{
+			name:    "no trailing gap across midnight",
+			entries: yesterday,
+			now:     at(9 * time.Hour),
+			want:    "(gap",
+			absent:  true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			renderToday(&buf, c.entries, c.now, time.UTC, false)
+			got := buf.String()
+			if c.absent {
+				if strings.Contains(got, c.want) {
+					t.Errorf("output contains %q, want it absent:\n%s", c.want, got)
+				}
+			} else if !strings.Contains(got, c.want) {
+				t.Errorf("output missing %q:\n%s", c.want, got)
+			}
+		})
+	}
+}
+
+// TestRenderTodayRefNumbers pins the leading local reference numbers: entries
+// are numbered 1..N in display order, filler gap rows carry no number, and the
+// column widens (right-aligned) once the listing reaches ten entries.
+func TestRenderTodayRefNumbers(t *testing.T) {
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) time.Time { return day.Add(d) }
+	pt := func(t time.Time) *time.Time { return &t }
+
+	// Three entries, with a gap between the second and the third.
+	entries := []store.Entry{
+		{TaskName: "A", Start: at(9 * time.Hour), Stop: pt(at(10 * time.Hour)), Duration: 3600},
+		{TaskName: "B", Start: at(10 * time.Hour), Stop: pt(at(11 * time.Hour)), Duration: 3600},
+		{TaskName: "C", Start: at(11*time.Hour + 30*time.Minute), Stop: pt(at(12 * time.Hour)), Duration: 1800},
+	}
+	var buf bytes.Buffer
+	renderToday(&buf, entries, at(12*time.Hour), time.UTC, false)
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	want := []string{
+		"1  09:00-10:00 1h00m  A",
+		"2  10:00-11:00 1h00m  B",
+		"               (gap 0h30m)",
+		"3  11:30-12:00 0h30m  C",
+		todayDivider,
+		"Total: 2h30m",
+	}
+	if len(lines) != len(want) {
+		t.Fatalf("got %d lines, want %d:\n%s", len(lines), len(want), buf.String())
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Errorf("line %d = %q, want %q", i, lines[i], want[i])
+		}
+	}
+
+	// Ten entries: the number column is two wide and right-aligned, so the
+	// clock column stays aligned between #9 and #10.
+	var many []store.Entry
+	for i := 0; i < 10; i++ {
+		start := at(time.Duration(i) * time.Hour)
+		stop := start.Add(time.Hour)
+		many = append(many, store.Entry{TaskName: "T", Start: start, Stop: &stop, Duration: 3600})
+	}
+	buf.Reset()
+	renderToday(&buf, many, at(10*time.Hour), time.UTC, false)
+	got := buf.String()
+	for _, w := range []string{" 1  00:00-01:00", " 9  08:00-09:00", "10  09:00-10:00"} {
+		if !strings.Contains(got, w+" ") && !strings.Contains(got, w) {
+			t.Errorf("output missing %q:\n%s", w, got)
+		}
 	}
 }
 

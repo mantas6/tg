@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1204,6 +1205,94 @@ func TestTodayCommandGolden(t *testing.T) {
 		t.Fatalf("today: %v", err)
 	}
 	assertGolden(t, "today.txt", buf.String())
+}
+
+// TestTodayCommandSavesRefs pins the side effect behind `tg mod 2` / `tg del 3`:
+// listing numbers the entries in display order and persists that mapping, in
+// both human and JSON mode, replacing whatever the previous listing published.
+func TestTodayCommandSavesRefs(t *testing.T) {
+	s := newStore(t)
+	now, loc := seedSampleDay(t, s)
+
+	entries, err := s.EntriesBetween(startOfDay(now, loc), startOfDay(now, loc).Add(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("fixture has %d entries, want 2", len(entries))
+	}
+
+	var buf bytes.Buffer
+	if err := cmdToday(&buf, s, now, loc, 1, false, false); err != nil {
+		t.Fatalf("today: %v", err)
+	}
+	for i, e := range entries {
+		got, err := s.EntryByRef(i + 1)
+		if err != nil {
+			t.Fatalf("EntryByRef(%d): %v", i+1, err)
+		}
+		if got.ID != e.ID {
+			t.Errorf("EntryByRef(%d).ID = %d, want %d", i+1, got.ID, e.ID)
+		}
+	}
+	if _, err := s.EntryByRef(3); !errors.Is(err, store.ErrNoEntryRef) {
+		t.Errorf("EntryByRef(3) error = %v, want ErrNoEntryRef", err)
+	}
+
+	// The numbers are in the human output and in the JSON shape.
+	if !strings.Contains(buf.String(), "1  09:15-10:30") {
+		t.Errorf("listing missing leading entry numbers:\n%s", buf.String())
+	}
+	buf.Reset()
+	if err := cmdToday(&buf, s, now, loc, 1, true, false); err != nil {
+		t.Fatalf("today --json: %v", err)
+	}
+	if !strings.Contains(buf.String(), `"num":1`) || !strings.Contains(buf.String(), `"num":2`) {
+		t.Errorf("json listing missing entry numbers:\n%s", buf.String())
+	}
+	if got, err := s.EntryByRef(2); err != nil || got.ID != entries[1].ID {
+		t.Errorf("EntryByRef(2) after --json = %+v err=%v, want id %d", got, err, entries[1].ID)
+	}
+
+	// A day with nothing tracked clears the mapping rather than leaving the
+	// previous day's numbers addressable.
+	empty := now.AddDate(0, 0, 1)
+	buf.Reset()
+	if err := cmdToday(&buf, s, empty, loc, 1, false, false); err != nil {
+		t.Fatalf("today (empty day): %v", err)
+	}
+	if _, err := s.EntryByRef(1); !errors.Is(err, store.ErrNoEntryRef) {
+		t.Errorf("EntryByRef(1) error = %v, want ErrNoEntryRef after an empty listing", err)
+	}
+}
+
+// TestTodayCommandTrailingGap covers the closing filler row: with the last
+// entry finished and now past its stop, the listing reports the idle time
+// before the total footer.
+func TestTodayCommandTrailingGap(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	start := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
+	stop := time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)
+	if _, err := s.CreateEntry(store.Entry{
+		WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
+		Start: start, Stop: &stop, Duration: 3600, UpdatedAt: stop,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 1, 2, 10, 25, 0, 0, time.UTC)
+	var buf bytes.Buffer
+	if err := cmdToday(&buf, s, now, time.UTC, 1, false, false); err != nil {
+		t.Fatalf("today: %v", err)
+	}
+	want := "1  09:00-10:00 1h00m  Fix login bug     [Backend]\n" +
+		strings.Repeat(" ", 15) + "(gap 0h25m)\n" +
+		todayDivider + "\nTotal: 1h00m\n"
+	if buf.String() != want {
+		t.Errorf("listing = %q, want %q", buf.String(), want)
+	}
 }
 
 func TestCurrentCommandGolden(t *testing.T) {

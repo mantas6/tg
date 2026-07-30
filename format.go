@@ -140,8 +140,29 @@ func gapBetween(prev, next store.Entry, loc *time.Location) time.Duration {
 	return gap
 }
 
+// trailingGap returns the idle time between the last listed entry's stop and
+// now worth showing at the bottom of the daily table, or 0. It is deliberately
+// gapBetween against a zero-length entry starting at now, so the trailing gap
+// obeys exactly the same rules as the gaps between entries: nothing for a
+// running last entry, nothing below gapThreshold, and nothing across midnight
+// (the daily table is a today view; the cross-day case is `tg status`'s job).
+func trailingGap(last store.Entry, now time.Time, loc *time.Location) time.Duration {
+	return gapBetween(last, store.Entry{Start: now}, loc)
+}
+
+// refWidth is the width of the leading local-number column for a listing of n
+// entries: enough digits for n, so the numbers stay right-aligned.
+func refWidth(n int) int {
+	return len(strconv.Itoa(n))
+}
+
 // renderToday writes the human-readable daily table to w. color enables the
 // per-project ANSI color block and should only be set when w is a terminal.
+//
+// Every entry line leads with its local reference number (1..N in display
+// order, the same numbering `tg ls` persists via store.SaveEntryRefs) so it can
+// be addressed later as `tg mod 2` / `tg del 3`. Filler rows (the gaps between
+// entries and the trailing gap up to now) are not entries and carry no number.
 func renderToday(w io.Writer, entries []store.Entry, now time.Time, loc *time.Location, color bool) {
 	if len(entries) == 0 {
 		fmt.Fprintln(w, "No entries.")
@@ -157,12 +178,17 @@ func renderToday(w io.Writer, entries []store.Entry, now time.Time, loc *time.Lo
 		leadPad = "  "
 	}
 
+	// numWidth sizes the reference-number column; numPad blanks it out on the
+	// filler rows so their "(gap ...)" text stays aligned with the entries.
+	numWidth := refWidth(len(entries))
+	numPad := strings.Repeat(" ", numWidth+2)
+
 	total, anyRunning := totalDuration(entries, now)
 	for i, e := range entries {
 		if i > 0 {
 			if gap := gapBetween(entries[i-1], e, loc); gap > 0 {
 				// Indented to the duration column so it reads as a filler row.
-				fmt.Fprintf(w, "%s%-12s(gap %s)\n", leadPad, "", formatHM(gap))
+				fmt.Fprintf(w, "%s%s%-12s(gap %s)\n", numPad, leadPad, "", formatHM(gap))
 			}
 		}
 		startClk := formatClock(e.Start, loc)
@@ -185,9 +211,14 @@ func renderToday(w io.Writer, entries []store.Entry, now time.Time, loc *time.Lo
 				lead = block + " "
 			}
 		}
-		line := fmt.Sprintf("%s%-12s%-7s%-17s %s",
-			lead, startClk+"-"+stopClk, formatHM(dur), label, project)
+		line := fmt.Sprintf("%*d  %s%-12s%-7s%-17s %s",
+			numWidth, i+1, lead, startClk+"-"+stopClk, formatHM(dur), label, project)
 		fmt.Fprintln(w, strings.TrimRight(line, " "))
+	}
+
+	// Idle time since the last entry stopped, rendered as a closing filler row.
+	if gap := trailingGap(entries[len(entries)-1], now, loc); gap > 0 {
+		fmt.Fprintf(w, "%s%s%-12s(gap %s)\n", numPad, leadPad, "", formatHM(gap))
 	}
 
 	fmt.Fprintln(w, todayDivider)
@@ -279,8 +310,11 @@ func renderCurrent(w io.Writer, last *store.Entry, dayTotal time.Duration, now t
 	return nil
 }
 
-// todayEntryJSON / todayJSON are the stable --json shapes for `today`.
+// todayEntryJSON / todayJSON are the stable --json shapes for `today`. Num is
+// the local reference number (1..N in display order) that `tg ls` persists, so
+// scripted callers can address an entry the same way the human output does.
 type todayEntryJSON struct {
+	Num             int    `json:"num"`
 	ID              int64  `json:"id"`
 	Task            string `json:"task,omitempty"`
 	Project         string `json:"project,omitempty"`
@@ -299,9 +333,10 @@ type todayJSON struct {
 // renderTodayJSON writes the daily entries as the stable JSON shape.
 func renderTodayJSON(w io.Writer, entries []store.Entry, now time.Time) error {
 	out := todayJSON{Entries: []todayEntryJSON{}}
-	for _, e := range entries {
+	for i, e := range entries {
 		dur := displayDuration(e, now)
 		je := todayEntryJSON{
+			Num:             i + 1,
 			ID:              e.ID,
 			Task:            e.TaskName,
 			Project:         e.ProjectName,
