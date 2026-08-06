@@ -308,8 +308,8 @@ commands:
   grep <fragment>           list cached tasks matching it     [--all] [--json]
   projects                  list cached projects with ids     [--all] [--json]
   projects update           sync all workspace projects       [--all] [--json]
-  update <project>          refresh a project's tasks and pull its recent
-                            entries                 [--days N] [--all] [--json]
+  update [project]          refresh a project's tasks and pull its recent
+                            entries    [-p FRAGMENT] [--days N] [--all] [--json]
   push                      send local changes to Toggl       [--json]
   pull [project]            fetch today's changes; all projects, or one
                             [-a|--all this month] [--since DATE] [--json]
@@ -358,15 +358,35 @@ changed in the meantime is ever marked as reconciled.
 up in the Toggl web app immediately. If the network is unavailable, the entry
 stays local and dirty until the next `tg push`.
 
-`tg update <project>` is the per-project refresh: it fetches the project's task
+`tg update [project]` is the per-project refresh: it fetches the project's task
 list *and* pulls its recent time entries in one go. It does not sync the project
 catalog itself — use `tg projects update` for that.
 
 ```sh
 tg update backend            # tasks + entries touched since yesterday
+tg update -p backend         # same, naming the project with a flag
 tg update backend -n 7       # reach a week back instead
 tg update -n 0 backend       # today only
+tg update code review        # a multi-word fragment needs no quoting
 ```
+
+The project is named by **fragment**, the same case-insensitive substring match
+`add`, `grep` and `pull` use: `pay` finds `Payments`. Pass it either as the
+positional argument or with `--project`/`-p` — the two are equivalent, so pick
+whichever reads better; passing both at once is an error. An exact
+(case-insensitive) name always wins over mere substrings, and a fragment that
+still matches several projects fails with the candidates listed by name and id:
+
+```
+$ tg update back
+tg: multiple projects match "back":
+  Backend (1)
+  Backend API (3)
+```
+
+Refine the fragment (`tg update "backend api"`), or export
+`TOGGL_PROJECT_ID`, which takes precedence and also lets you update a project
+that is not cached yet.
 
 The entry window defaults to **one day back** and is set by `--days`/`-n`, a
 count of calendar days: the window starts at midnight that many days before
@@ -382,8 +402,9 @@ task count and pull counters.
 - `TOGGL_PROJECT_ID` scopes `add`, `tasks`, `grep`, and `update` to one project (and
   sets the project on entries created by `add`). `pull` ignores it and always
   reconciles every project; pass a `<project>` name to `pull` to scope it
-  explicitly. When unset, `update` requires a unique `<project>` name and
-  `add` accepts `<timesign> <project> <task>` to scope by project name.
+  explicitly. When unset, `update` requires a `<project>` fragment (positional
+  or `--project`/`-p`) that matches exactly one cached project, and `add`
+  accepts `<timesign> <project> <task>` to scope by project name.
 - `XDG_STATE_HOME` controls where state is stored (`$XDG_STATE_HOME/tg`,
   falling back to `~/.local/state/tg`). This holds `config.json` (mode 0600)
   and the SQLite database.

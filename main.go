@@ -313,9 +313,18 @@ func runUpdate(args []string) error {
 	var days int
 	fs.IntVar(&days, "days", updateDefaultDays, "pull entries from the last N days")
 	fs.IntVar(&days, "n", updateDefaultDays, "pull entries from the last N days (alias of --days)")
+	// --project and -p are aliases naming the project by fragment, exactly
+	// like the positional form (`tg update backend` == `tg update -p backend`).
+	var project string
+	fs.StringVar(&project, "project", "", "project name fragment to update")
+	fs.StringVar(&project, "p", "", "project name fragment to update (alias of --project)")
 	// Flags may follow the project fragment (`tg update backend -n 3`), so
 	// positionals are peeled off the same way `tg grep` does it.
 	rest, err := parseArgsAndFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	fragment, err := updateProjectFragment(project, rest)
 	if err != nil {
 		return err
 	}
@@ -330,7 +339,6 @@ func runUpdate(args []string) error {
 	defer st.Close()
 	now := time.Now()
 	since := resolveUpdateSince(days, now, time.Local)
-	fragment := strings.Join(rest, " ")
 	return cmdUpdate(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectIDFromEnv(), fragment, since, now, *all, *jsonOut)
 }
 
@@ -575,6 +583,30 @@ func resolvePullSince(sinceFlag string, all bool, now time.Time, loc *time.Locat
 // updateDefaultDays is `tg update`'s default entry window: one day back.
 const updateDefaultDays = 1
 
+// updateProjectFragment folds `tg update`'s two equivalent ways of naming a
+// project — the --project/-p flag and the positional arguments — into the one
+// fragment resolveUpdateProject matches against the cached catalog. Positionals
+// are joined with spaces so a multi-word name works unquoted, mirroring
+// `tg add`/`tg grep`.
+//
+// Supplying both spellings is a usage error rather than a silent precedence
+// rule: `tg update -p backend payments` almost certainly means the user
+// mistyped, and picking one of the two projects would be a surprising way to
+// resolve that. An empty result is left to resolveUpdateProject, which turns it
+// into the "requires a project" error (or accepts it when TOGGL_PROJECT_ID is
+// set).
+func updateProjectFragment(flagValue string, positional []string) (string, error) {
+	flagValue = strings.TrimSpace(flagValue)
+	pos := strings.TrimSpace(strings.Join(positional, " "))
+	if flagValue != "" && pos != "" {
+		return "", fmt.Errorf("project given twice: --project %q and %q; pass it once", flagValue, pos)
+	}
+	if flagValue != "" {
+		return flagValue, nil
+	}
+	return pos, nil
+}
+
 // resolveUpdateSince turns `tg update`'s --days/-n count into the start of the
 // entry pull window: midnight in loc, days calendar days before now. The window
 // is day-aligned rather than a rolling 24h cut so `-n 1` means "since yesterday
@@ -642,8 +674,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  grep <fragment>           list cached tasks matching it     [--all] [--json]")
 	fmt.Fprintln(w, "  projects                  list cached projects with ids     [--all] [--json]")
 	fmt.Fprintln(w, "  projects update           sync all workspace projects       [--all] [--json]")
-	fmt.Fprintln(w, "  update <project>          refresh a project's tasks and pull its recent")
-	fmt.Fprintln(w, "                            entries                 [--days N] [--all] [--json]")
+	fmt.Fprintln(w, "  update [project]          refresh a project's tasks and pull its recent")
+	fmt.Fprintln(w, "                            entries    [-p FRAGMENT] [--days N] [--all] [--json]")
 	fmt.Fprintln(w, "  push                      send local changes to Toggl       [--json]")
 	fmt.Fprintln(w, "  pull [project]            fetch today's changes; all projects, or one")
 	fmt.Fprintln(w, "                            [-a|--all this month] [--since DATE] [--json]")
@@ -665,6 +697,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "      (and sets the project on entries created by `add`). `pull`")
 	fmt.Fprintln(w, "      ignores it and always reconciles every project; pass a")
 	fmt.Fprintln(w, "      <project> name to `pull` to scope it explicitly. When unset,")
-	fmt.Fprintln(w, "      `update` requires a unique <project> name and `add` accepts")
+	fmt.Fprintln(w, "      `update` needs a <project> fragment (positional or -p) matching")
+	fmt.Fprintln(w, "      exactly one cached project, and `add` accepts")
 	fmt.Fprintln(w, "      `<timesign> <project> <task>` to scope by project name.")
 }

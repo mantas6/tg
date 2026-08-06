@@ -2558,6 +2558,178 @@ func TestUpdateDaysFlagAliases(t *testing.T) {
 	}
 }
 
+// TestUpdateProjectFragmentSources pins how the two equivalent ways of naming
+// `tg update`'s project fold into one fragment: the --project/-p flag, the
+// positionals (joined so a multi-word name works unquoted), neither (left empty
+// for resolveUpdateProject to reject or for TOGGL_PROJECT_ID to cover), and
+// both at once, which is a usage error rather than a silent precedence rule.
+func TestUpdateProjectFragmentSources(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		flagValue  string
+		positional []string
+		want       string
+		wantErr    bool
+	}{
+		{"positional", "", []string{"backend"}, "backend", false},
+		{"positional multiword", "", []string{"code", "review"}, "code review", false},
+		{"flag", "backend", nil, "backend", false},
+		{"flag multiword", "code review", nil, "code review", false},
+		{"neither", "", nil, "", false},
+		{"blank both", "  ", []string{" "}, "", false},
+		{"both", "backend", []string{"payments"}, "", true},
+	} {
+		got, err := updateProjectFragment(tc.flagValue, tc.positional)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("%s: err = nil, want a project-given-twice error", tc.name)
+			} else if !strings.Contains(err.Error(), "twice") {
+				t.Errorf("%s: err = %v, want it to say the project was given twice", tc.name, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: unexpected error %v", tc.name, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("%s: fragment = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestUpdateProjectFlagAliases pins runUpdate's flag wiring for --project/-p:
+// both spellings share one variable, they mix freely with --days/-n, and (via
+// parseArgsAndFlags) order does not matter.
+func TestUpdateProjectFlagAliases(t *testing.T) {
+	parse := func(args []string) (project string, days int, rest []string, err error) {
+		fs := flag.NewFlagSet("update", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		fs.IntVar(&days, "days", updateDefaultDays, "")
+		fs.IntVar(&days, "n", updateDefaultDays, "")
+		fs.StringVar(&project, "project", "", "")
+		fs.StringVar(&project, "p", "", "")
+		rest, err = parseArgsAndFlags(fs, args)
+		return project, days, rest, err
+	}
+
+	for _, tc := range []struct {
+		args     []string
+		wantFrag string
+		wantDays int
+	}{
+		{[]string{"-p", "backend"}, "backend", updateDefaultDays},
+		{[]string{"--project", "backend"}, "backend", updateDefaultDays},
+		{[]string{"--project=backend"}, "backend", updateDefaultDays},
+		{[]string{"-p", "backend", "-n", "3"}, "backend", 3},
+		{[]string{"-n", "3", "-p", "backend"}, "backend", 3},
+		// The positional form still works and reaches the same fragment.
+		{[]string{"backend", "-n", "3"}, "backend", 3},
+	} {
+		project, days, rest, err := parse(tc.args)
+		if err != nil {
+			t.Fatalf("parse %v: %v", tc.args, err)
+		}
+		frag, err := updateProjectFragment(project, rest)
+		if err != nil {
+			t.Fatalf("fragment %v: %v", tc.args, err)
+		}
+		if frag != tc.wantFrag {
+			t.Errorf("parse %v: fragment = %q, want %q", tc.args, frag, tc.wantFrag)
+		}
+		if days != tc.wantDays {
+			t.Errorf("parse %v: days = %d, want %d", tc.args, days, tc.wantDays)
+		}
+	}
+}
+
+// TestUpdateResolvesProjectByFragment verifies `tg update` picks its project by
+// a case-insensitive name fragment against the cached catalog (no env id, no
+// exact name): "pay" reaches Payments (id 2), so the tasks fetched and the
+// entries kept are that project's.
+func TestUpdateResolvesProjectByFragment(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/workspaces/1/projects/2/tasks":
+			w.Write([]byte(`[{"id":21,"workspace_id":1,"project_id":2,"name":"New payment task","active":true}]`))
+		case "/me/time_entries":
+			w.Write([]byte(updateEntriesJSON))
+		default:
+			t.Errorf("unexpected path %q (fragment should resolve to project 2)", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+
+	var buf bytes.Buffer
+	if err := cmdUpdate(&buf, s, c, 1, nil, "pay", updateSince, updateNow, false, false); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	for _, p := range paths {
+		if p != "/workspaces/1/projects/2/tasks" && p != "/me/time_entries" {
+			t.Errorf("unexpected request path %q", p)
+		}
+	}
+	p2 := int64(2)
+	scoped, _ := s.ListTasks(false, &p2)
+	if len(scoped) != 1 || scoped[0].ID != 21 {
+		t.Errorf("project 2 tasks = %+v, want only id 21", scoped)
+	}
+	// The entry pull was scoped to the resolved project too.
+	if got, _ := s.EntryByRemoteID(2); got == nil {
+		t.Error("payments entry should be inserted")
+	}
+	if got, _ := s.EntryByRemoteID(1); got != nil {
+		t.Error("backend entry should be ignored by a payments-scoped update")
+	}
+}
+
+// TestUpdateAmbiguousProjectFragment verifies a fragment matching more than one
+// cached project fails with the candidate list (name + id) instead of guessing,
+// and that nothing is fetched before the ambiguity is resolved.
+func TestUpdateAmbiguousProjectFragment(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	if err := s.PutProject(store.Project{
+		ID: 3, WorkspaceID: 1, Name: "Backend API", Active: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request %q: an ambiguous fragment must fail first", r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+
+	var buf bytes.Buffer
+	err := cmdUpdate(&buf, s, c, 1, nil, "back", updateSince, updateNow, false, false)
+	if err == nil {
+		t.Fatal("update: expected an ambiguous-fragment error")
+	}
+	for _, want := range []string{"multiple projects match", "Backend (1)", "Backend API (3)"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to contain %q", err, want)
+		}
+	}
+	// An exact (case-insensitive) name still wins over the substring matches,
+	// so the ambiguity is escapable without reaching for TOGGL_PROJECT_ID.
+	got, err := resolveUpdateProject(s, nil, "backend")
+	if err != nil {
+		t.Fatalf("resolve exact name: %v", err)
+	}
+	if got == nil || *got != 1 {
+		t.Errorf("resolved = %v, want 1 (exact name wins)", got)
+	}
+}
+
 // pullNow is a fixed mid-month, mid-day clock for the `tg pull` window tests.
 var pullNow = time.Date(2026, 3, 17, 15, 30, 0, 0, time.UTC)
 

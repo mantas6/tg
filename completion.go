@@ -41,6 +41,25 @@ __tg_tasks() {
   _wanted tasks expl 'task' compadd -a names
 }
 
+# Complete project names for the project fragment taken by ` + "`tg update`" + `
+# and ` + "`tg pull`" + `, from the same local catalog cache.
+__tg_project_names() {
+  local json name
+  local MATCH MBEGIN MEND
+  local -a match mbegin mend names
+  json="$(tg projects --json 2>/dev/null)" || return 1
+  while [[ $json =~ '"name":"((\\.|[^"\\])*)"' ]]; do
+    name=$match[1]
+    json=${json[MEND+1,-1]}
+    name=${name//'\"'/'"'}
+    name=${name//'\\'/'\'}
+    names+=("$name")
+  done
+  (( $#names )) || return 1
+  local expl
+  _wanted projects expl 'project' compadd -a names
+}
+
 # Complete the subcommands of ` + "`tg projects`" + `.
 __tg_projects_cmds() {
   local -a subcmds
@@ -136,16 +155,20 @@ _tg() {
           fi
           ;;
         update)
+          # The project is named either positionally or with --project/-p;
+          # both take the same case-insensitive name fragment.
           _arguments '--all[include inactive tasks]' '--json[emit JSON]' \
             '--days[pull entries from the last N days]:days:' \
             '-n[pull entries from the last N days (alias of --days)]:days:' \
-            '*:project fragment:'
+            '--project[project name fragment to update]:project fragment:__tg_project_names' \
+            '-p[project name fragment (alias of --project)]:project fragment:__tg_project_names' \
+            '*:project fragment:__tg_project_names'
           ;;
         pull)
           _arguments '--all[pull this month, not just today]' \
             '-a[pull this month, not just today (alias of --all)]' \
             '--since[pull entries modified since DATE]:date (YYYY-MM-DD):' \
-            '--json[emit JSON]' '*:project fragment:'
+            '--json[emit JSON]' '*:project fragment:__tg_project_names'
           ;;
         total)
           _arguments '--since[total entries since DATE (default 3 months ago)]:date (YYYY-MM-DD):' '--json[emit JSON]' '*:task fragment:__tg_tasks'
