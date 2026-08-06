@@ -2011,8 +2011,8 @@ const updateEntriesJSON = `[
    "duration":1800,"at":"2026-01-02T10:30:00Z"}]`
 
 // TestUpdateScopedToOneProject verifies update fetches only the selected
-// project's metadata and tasks (never the whole workspace) and upserts them
-// without wiping other projects' cached tasks.
+// project's tasks (never the whole workspace, and never the project catalog
+// itself) and upserts them without wiping other projects' cached tasks.
 func TestUpdateScopedToOneProject(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
@@ -2021,14 +2021,12 @@ func TestUpdateScopedToOneProject(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
 		switch r.URL.Path {
-		case "/workspaces/1/projects/2":
-			w.Write([]byte(`{"id":2,"workspace_id":1,"name":"Payments","billable":true,"active":true}`))
 		case "/workspaces/1/projects/2/tasks":
 			w.Write([]byte(`[{"id":21,"workspace_id":1,"project_id":2,"name":"New payment task","active":true}]`))
 		case "/me/time_entries":
 			w.Write([]byte(`[]`))
 		default:
-			t.Errorf("unexpected path %q (update must not sync all projects)", r.URL.Path)
+			t.Errorf("unexpected path %q (update must not sync projects)", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
@@ -2045,10 +2043,11 @@ func TestUpdateScopedToOneProject(t *testing.T) {
 		t.Errorf("output = %q, want no output", buf.String())
 	}
 
-	// Only the single-project endpoints (plus the entry pull) were hit.
+	// Only the scoped task fetch and the entry pull were hit: no project
+	// endpoint at all, since update no longer syncs projects.
 	for _, p := range paths {
 		switch p {
-		case "/workspaces/1/projects/2", "/workspaces/1/projects/2/tasks", "/me/time_entries":
+		case "/workspaces/1/projects/2/tasks", "/me/time_entries":
 		default:
 			t.Errorf("unexpected request path %q", p)
 		}
@@ -2079,8 +2078,6 @@ func TestUpdatePullsRecentEntries(t *testing.T) {
 	var gotSince string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/workspaces/1/projects/2":
-			w.Write([]byte(`{"id":2,"workspace_id":1,"name":"Payments","billable":true,"active":true}`))
 		case "/workspaces/1/projects/2/tasks":
 			w.Write([]byte(`[]`))
 		case "/me/time_entries":
@@ -2126,8 +2123,6 @@ func TestUpdateJSONStillReports(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/workspaces/1/projects/2":
-			w.Write([]byte(`{"id":2,"workspace_id":1,"name":"Payments","billable":true,"active":true}`))
 		case "/me/time_entries":
 			w.Write([]byte(updateEntriesJSON))
 		default:
@@ -2143,6 +2138,7 @@ func TestUpdateJSONStillReports(t *testing.T) {
 		t.Fatalf("update --json: %v", err)
 	}
 	out := buf.String()
+	// The project name comes from the local catalog, not from a fetch.
 	for _, want := range []string{`"project":"Payments"`, `"tasks":1`, `"inserted":1`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("json output = %q, want %s", out, want)

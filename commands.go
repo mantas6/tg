@@ -499,21 +499,22 @@ func cmdProjects(w io.Writer, st *store.Store, all, jsonOut bool) error {
 }
 
 // cmdUpdate refreshes the local state for a SINGLE project (never the whole
-// workspace): its metadata plus its tasks are fetched and upserted, and its
-// recent time entries are pulled. The project is chosen by projectID (from
-// TOGGL_PROJECT_ID) when set; otherwise fragment must uniquely match a cached
-// project name. Refreshing every project at once is intentionally disallowed
-// (see resolveUpdateProject).
+// workspace): its tasks are fetched and upserted, and its recent time entries
+// are pulled. The project is chosen by projectID (from TOGGL_PROJECT_ID) when
+// set; otherwise fragment must uniquely match a cached project name.
+// Refreshing every project at once is intentionally disallowed (see
+// resolveUpdateProject).
+//
+// The project catalog itself is NOT synced here: update never fetches project
+// metadata from Toggl. Refresh the catalog with `tg update-projects`. (The
+// entry pull may still self-heal catalog rows from each entry's meta payload;
+// see sync.healCatalog.)
 //
 // The entry pull reconciles everything modified in [since, now] and is scoped
 // to the same project, so it is partial and leaves the last_pull watermark
 // untouched (see sync.Pull): a later `tg pull` still sees every other
 // project's changes. runUpdate derives since from --days/-n, which defaults to
 // one day back (see resolveUpdateSince).
-//
-// The catalog is refreshed BEFORE the entries: pulling self-heals the catalog
-// from each entry's meta payload (see sync.healCatalog), and doing it in this
-// order keeps ReplaceProjectTasks from wiping what the pull just healed.
 //
 // The command is quiet: in human mode it prints nothing at all (no progress or
 // summary lines) and reports only errors. Machine-readable output is still
@@ -523,15 +524,8 @@ func cmdUpdate(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, p
 	if err != nil {
 		return err
 	}
-	project, err := c.Project(workspaceID, *pid)
-	if err != nil {
-		return err
-	}
 	tasks, err := c.ProjectTasks(workspaceID, *pid, all)
 	if err != nil {
-		return err
-	}
-	if err := st.PutProject(toStoreProject(project)); err != nil {
 		return err
 	}
 	if err := st.ReplaceProjectTasks(*pid, toStoreTasks(tasks)); err != nil {
@@ -543,8 +537,15 @@ func cmdUpdate(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, p
 	}
 
 	if jsonOut {
+		// The name comes from the local catalog (looked up after the pull so a
+		// row healed by it is visible) and is empty for a project that is not
+		// cached yet, e.g. an uncached TOGGL_PROJECT_ID.
+		name, err := projectName(st, *pid)
+		if err != nil {
+			return err
+		}
 		return writeJSON(w, map[string]any{
-			"project": project.Name,
+			"project": name,
 			"tasks":   len(tasks),
 			"entries": entries,
 		})
@@ -717,6 +718,19 @@ func cmdAuth(w io.Writer, tokenSource func() (string, error), newClient func(tok
 	}
 	fmt.Fprintf(w, "Authenticated as %s (workspace %d).\n", name, me.DefaultWorkspaceID)
 	return nil
+}
+
+// projectName returns the cached project's name, or "" when the project is not
+// in the local catalog yet (e.g. an id that has never been cached).
+func projectName(st *store.Store, projectID int64) (string, error) {
+	p, err := st.ProjectByID(projectID)
+	if err != nil {
+		return "", err
+	}
+	if p == nil {
+		return "", nil
+	}
+	return p.Name, nil
 }
 
 // projectBillable reports whether the cached project is billable, defaulting to

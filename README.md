@@ -254,8 +254,9 @@ tg push    # send local changes to Toggl
 up in the Toggl web app immediately. If the network is unavailable, the entry
 stays local and dirty until the next `tg push`.
 
-`tg update <project>` is the per-project refresh: it fetches the project's
-metadata and task list *and* pulls its recent time entries in one go.
+`tg update <project>` is the per-project refresh: it fetches the project's task
+list *and* pulls its recent time entries in one go. It does not sync the project
+catalog itself — use `tg update-projects` for that.
 
 ```sh
 tg update backend            # tasks + entries touched since yesterday

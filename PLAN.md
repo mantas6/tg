@@ -1,4 +1,3 @@
-- update command: should not sync projects
 - update-projects rename to "projects update"
 - status command: double the task length limit, remove "..."
 - ls command: numbering should be persistent, new sequence for each day, the number should be an order of items inserted basically, if i delete an item the numbers are not renumbered
