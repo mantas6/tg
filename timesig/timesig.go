@@ -1,8 +1,13 @@
 // Package timesig parses the time signatures ("timesigns") that tg commands
-// accept in place of full timestamps. Two forms exist:
+// accept in place of full timestamps. Three forms exist:
 //
 //	ABSOLUTE  START "-" STOP   an explicit same-day wall-clock range ("9-:30")
 //	RELATIVE  "+" DURATION     a span ending at the current 5-minute mark ("+:20")
+//	DURATION  DURATION         a bare length with no times of its own ("1:30")
+//
+// The first two resolve to a Span on their own; the bare duration form does
+// not, so ParseDuration returns just the length and the caller anchors it (see
+// `tg add`, which starts the entry at the last entry's end).
 //
 // The full grammar, rounding rules and error cases are documented in
 // docs/timesig.md; keep the two in sync.
@@ -16,7 +21,9 @@ import (
 	"time"
 )
 
-// Kind distinguishes the two timesign forms.
+// Kind distinguishes the two timesign forms that resolve to a Span. The bare
+// duration form has no times of its own, so it never yields a Span (see
+// ParseDuration).
 type Kind int
 
 const (
@@ -60,9 +67,23 @@ func IsRelative(s string) bool {
 	return strings.HasPrefix(strings.TrimSpace(s), RelativePrefix)
 }
 
-// Parse resolves a timesign — absolute or relative — into a Span. now is the
-// reference instant (the calendar day for absolute signs, the anchor for
-// relative ones) and loc is the location whose wall clock the sign refers to.
+// IsDuration reports whether s looks like a bare duration timesign ("1:30"):
+// non-empty, without the relative "+" prefix and without the "-" that
+// separates an absolute range. Like IsRelative it is a classifier, not a
+// validator, so IsDuration("bad") is true while ParseDuration("bad") errors.
+// Callers that accept the form (only `tg add`, which anchors it to the last
+// entry's end) use this to route the argument before parsing it.
+func IsDuration(s string) bool {
+	s = strings.TrimSpace(s)
+	return s != "" && !strings.HasPrefix(s, RelativePrefix) && !strings.Contains(s, "-")
+}
+
+// Parse resolves a self-contained timesign — absolute or relative — into a
+// Span. now is the reference instant (the calendar day for absolute signs, the
+// anchor for relative ones) and loc is the location whose wall clock the sign
+// refers to. A bare duration has no times to resolve, so it is not handled
+// here: it falls through to ParseAbsolute and is reported as a malformed range
+// (see ParseDuration for the form itself).
 func Parse(s string, now time.Time, loc *time.Location) (Span, error) {
 	if IsRelative(s) {
 		return ParseRelative(s, now, loc)
@@ -138,20 +159,57 @@ func ParseRelative(s string, now time.Time, loc *time.Location) (Span, error) {
 		return Span{}, fmt.Errorf("invalid timesign %q: expected +DURATION", raw)
 	}
 	body := strings.TrimSpace(strings.TrimPrefix(raw, RelativePrefix))
-	if body == "" {
-		return Span{}, fmt.Errorf("invalid timesign %q: empty duration", raw)
-	}
-	h, m, err := parseClockPart(body, true, 0)
+	dur, err := parseDurationBody(body, raw)
 	if err != nil {
-		return Span{}, fmt.Errorf("invalid duration %q: %w", body, err)
-	}
-	dur := time.Duration(h)*time.Hour + time.Duration(m)*time.Minute
-	if dur <= 0 {
-		return Span{}, fmt.Errorf("invalid timesign %q: duration must be greater than zero", raw)
+		return Span{}, err
 	}
 
 	stop := Floor5(now.In(loc))
 	return Span{Kind: Relative, Start: stop.Add(-dur), Stop: stop}, nil
+}
+
+// ParseDuration parses a bare duration timesign — a length of time with no
+// wall-clock times of its own — into a positive time.Duration. The grammar is
+// the DURATION of the relative form, without its "+":
+//
+//	timesign = DURATION
+//	DURATION = H | H ":" MM | ":" MM
+//	H        = hours   0-23
+//	MM       = minutes 0-59
+//
+// So "1:30" is 1h30m, ":45" is 45 minutes and "2" is two hours. Because the
+// form carries no anchor, neither now nor a location is needed: the caller
+// decides where the span starts (`tg add` starts it at the last entry's end).
+// The duration must be greater than zero, so "0", ":00" and "0:00" are errors,
+// as is a missing or malformed one.
+func ParseDuration(s string) (time.Duration, error) {
+	raw := strings.TrimSpace(s)
+	return parseDurationBody(raw, raw)
+}
+
+// parseDurationBody parses the shared DURATION production ("H", "H:MM" or
+// ":MM") into a positive length of time. body is the duration text itself and
+// raw the whole timesign as the user wrote it (with the "+" for the relative
+// form), which is what error messages quote.
+func parseDurationBody(body, raw string) (time.Duration, error) {
+	if body == "" {
+		return 0, fmt.Errorf("invalid timesign %q: empty duration", raw)
+	}
+	h, m, err := parseClockPart(body, true, 0)
+	if err != nil {
+		// A relative sign names both the whole timesign and the duration
+		// inside it; a bare duration IS the timesign, so quoting it twice
+		// would only repeat the same text.
+		if body != raw {
+			return 0, fmt.Errorf("invalid timesign %q: invalid duration %q: %w", raw, body, err)
+		}
+		return 0, fmt.Errorf("invalid timesign %q: %w", raw, err)
+	}
+	dur := time.Duration(h)*time.Hour + time.Duration(m)*time.Minute
+	if dur <= 0 {
+		return 0, fmt.Errorf("invalid timesign %q: duration must be greater than zero", raw)
+	}
+	return dur, nil
 }
 
 // Floor5 rounds t DOWN to the preceding wall-clock 5-minute mark: minutes land

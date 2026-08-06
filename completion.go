@@ -61,7 +61,7 @@ _tg() {
       local -a commands
       commands=(
         'auth:verify a Toggl API token and store config'
-        'add:add a finished entry from a timesign (9-:30, +:20)'
+        'add:add a finished entry from a timesign (9-:30, +:20, 1:30)'
         'mod:retime or rename an entry (default: the last one)'
         'del:delete an entry by its number from tg ls'
         "current:show the last entry, idle gap and today's total"
@@ -85,8 +85,9 @@ _tg() {
     args)
       case $words[1] in
         add)
-          # First positional is the timesign (absolute 9-:30 or relative
-          # +:20); later args are task names. --desc/--description set the
+          # First positional is the timesign (absolute 9-:30, relative
+          # +:20, or a bare duration 1:30 continuing the last entry);
+          # later args are task names. --desc/--description set the
           # entry description.
           _arguments \
             '--desc[entry description]:description:' \

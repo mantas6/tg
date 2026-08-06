@@ -49,8 +49,9 @@ tg status                   # last entry, idle gap, today's total
 ```
 
 There is no timer: time is always recorded as a finished block with `add` and a
-*timesign*, either an absolute `START-STOP` range on today's clock or a relative
-`+DURATION` span counted back from now.
+*timesign* — an absolute `START-STOP` range on today's clock, a relative
+`+DURATION` span counted back from now, or a bare `DURATION` that continues from
+the last entry.
 
 ```sh
 tg add 9-:30 <task>         # 09:00-09:30
@@ -58,6 +59,8 @@ tg add 10-11 <task>         # 10:00-11:00
 tg add 10:30-11 <task>      # 10:30-11:00
 tg add +:20 <task>          # the last 20 minutes
 tg add +1:20 <task>         # the last 1h20m
+tg add 1:30 <task>          # 1h30m starting when the last entry ended
+tg add :45 <task>           # 45m starting when the last entry ended
 ```
 
 For absolute ranges each side is `H` or `H:MM`; the stop side may also be `:MM`,
@@ -65,6 +68,14 @@ inheriting the start hour. Hours are 0-23, minutes 0-59, and the stop must be
 after the start. A relative timesign ends at now rounded *down* to the preceding
 5-minute mark (14:23 -> 14:20) and starts that duration earlier. The full
 grammar, rounding rules, and error cases are in [docs/timesig.md](docs/timesig.md).
+
+A **bare duration** (no `+`, no `-`) leaves the start out: the entry begins where
+the last one ended and runs that long, which is how you log a day of back-to-back
+blocks. The "last entry" is the one `tg status` reports — today's newest entry
+that has already started — so `tg add 1:30 <task>` after an entry ending at 10:00
+records 10:00-11:30. With nothing tracked yet today there is nothing to continue
+from, and a still-running entry has no end to start at; both are refused with an
+error pointing at the other two forms rather than guessing a start.
 
 `add` accepts `<project> <task>` to scope by project name (or set
 `TOGGL_PROJECT_ID`), stores the entry locally marked dirty, and best-effort
@@ -110,6 +121,9 @@ A timesign is read relative to the entry, not to today:
   to now the way `tg add` does, and it is not an absolute length — repeating it
   keeps adding time. A still-running entry has no end to extend, so `mod +`
   refuses it; retime it with an absolute range instead.
+
+`mod` does not take `add`'s bare duration form: it never moves an entry's start,
+and `+DURATION` already says "this ran longer".
 
 **Only today's entries can be modified.** Once an entry's calendar day is over
 it is history: `tg mod` refuses it outright ("refusing to update an entry older
@@ -302,9 +316,10 @@ commands:
   total [task]              total tracked hours per task; last 3 months [--since DATE] [--json]
   completion zsh            print the zsh completion script
 
-timesign: absolute 9-:30, 10-11, 10:30-11:15 (today) or relative
-      +:20, +1, +1:20 (that long, ending at the last 5m mark).
-      Full spec: docs/timesig.md
+timesign: absolute 9-:30, 10-11, 10:30-11:15 (today), relative +:20,
+      +1, +1:20 (that long, ending at the last 5m mark), or a bare
+      duration 1:30, :45 (that long, starting where the last entry
+      ended; `add` only). Full spec: docs/timesig.md
 mod:  numbers are the per-day ones shown by `tg ls`; without one the
       last entry is modified: today's newest already-started entry, the
       same one `tg status` shows. Only TODAY's entries can be modified.

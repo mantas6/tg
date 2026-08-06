@@ -18,13 +18,18 @@ import (
 // cmdAdd records a single, already-stopped time entry from a timesign (see the
 // timesig package and docs/timesig.md) and a task-title fragment. The created
 // entry is complete (has a stop and a positive duration); tg has no timer, so
-// this is the only way entries are created locally. The task fragment is
-// resolved with FindTasksByFragment scoped by projectID (from TOGGL_PROJECT_ID
-// or, for the 2-argument form `tg add <timesign> <project> <task>`, from the
-// resolved project-name argument; see runAdd / resolveAddProject): 1 match ->
-// create the entry; many -> error listing candidates; none -> error suggesting
-// `tg update`. The entry is stored dirty so a later `tg push` (or the
-// best-effort push below) sends it to Toggl.
+// this is the only way entries are created locally.
+//
+// All three timesign forms are accepted; a bare duration ("1:30") has no times
+// of its own and picks up where the last entry ended (see addSpan).
+//
+// The task fragment is resolved with FindTasksByFragment scoped by projectID
+// (from TOGGL_PROJECT_ID or, for the 2-argument form
+// `tg add <timesign> <project> <task>`, from the resolved project-name
+// argument; see runAdd / resolveAddProject): 1 match -> create the entry;
+// many -> error listing candidates; none -> error suggesting `tg update`. The
+// entry is stored dirty so a later `tg push` (or the best-effort push below)
+// sends it to Toggl.
 //
 // When c is non-nil the new entry is pushed to Toggl immediately; the push is
 // best-effort so a sync failure just leaves the entry dirty (a warning is
@@ -33,11 +38,10 @@ import (
 // desc is the entry's free-form description (from `--desc`/`--description`); an
 // empty desc leaves the description blank, matching the prior behavior.
 func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, projectID *int64, timesign, fragment, desc string, now time.Time, loc *time.Location) error {
-	span, err := timesig.Parse(timesign, now, loc)
+	start, stop, err := addSpan(st, timesign, now, loc)
 	if err != nil {
 		return err
 	}
-	start, stop := span.Start, span.Stop
 
 	fragment = strings.TrimSpace(fragment)
 	if fragment == "" {
@@ -107,6 +111,55 @@ func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, proj
 	default:
 		return fmt.Errorf("multiple tasks match %q:\n%s", fragment, candidateList(tasks))
 	}
+}
+
+// addSpan resolves `tg add`'s timesign into the new entry's [start, stop).
+//
+// The absolute (9-:30) and relative (+:20) forms carry their own times, so they
+// are handed to the timesig package unchanged. A bare duration (1:30) does not:
+// it means "that long, starting where I left off", so it is anchored to the END
+// of the last entry — store.LastEntry, the same subject `tg status` reports and
+// a bare `tg mod` edits: today's newest already-started entry. Typing only the
+// length is the common case of logging work back to back, and anchoring it to
+// the last stop (rather than to now) keeps the day gapless.
+//
+// The anchor can be missing in two ways, both refused with an error naming the
+// forms that do not need one rather than guessing a start:
+//
+//   - no entry today (a fresh day, so there is nothing to continue from);
+//   - the last entry is still running, so it has no end to start at (the same
+//     reason `tg mod +DURATION` refuses one).
+//
+// The resulting span is otherwise ordinary: the caller's overlap guard still
+// applies, which is what catches a duration long enough to run into an entry
+// already booked for later today (LastEntry skips those, so they are never the
+// anchor).
+func addSpan(st *store.Store, timesign string, now time.Time, loc *time.Location) (time.Time, time.Time, error) {
+	if !timesig.IsDuration(timesign) {
+		span, err := timesig.Parse(timesign, now, loc)
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		return span.Start, span.Stop, nil
+	}
+	dur, err := timesig.ParseDuration(timesign)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	last, err := st.LastEntry(now)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	if last == nil {
+		return time.Time{}, time.Time{}, errors.New(
+			"no entry tracked today to continue from: give an absolute timesign (e.g. 9-:30) or a relative one (e.g. +1:30) instead")
+	}
+	if last.Running() {
+		return time.Time{}, time.Time{}, errors.New(
+			"the last entry is still running: it has no end time to continue from, give an absolute timesign (e.g. 9-:30) or a relative one (e.g. +1:30) instead")
+	}
+	start := *last.Stop
+	return start, start.Add(dur), nil
 }
 
 // cmdMod edits a single existing entry in place: its times (from a timesign),

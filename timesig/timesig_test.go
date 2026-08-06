@@ -184,6 +184,106 @@ func TestParseRelativeErrors(t *testing.T) {
 	}
 }
 
+func TestParseDurationValid(t *testing.T) {
+	cases := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"1:30", 90 * time.Minute},               // the form the plan calls for
+		{":45", 45 * time.Minute},                // minutes only
+		{"2", 2 * time.Hour},                     // bare hour count
+		{":05", 5 * time.Minute},                 // zero-padded minutes
+		{"01:05", 65 * time.Minute},              // zero-padded hour
+		{"23:59", 23*time.Hour + 59*time.Minute}, // longest expressible span
+		{" 1:30 ", 90 * time.Minute},             // surrounding whitespace tolerated
+		{"0:01", time.Minute},                    // smallest span
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got, err := ParseDuration(tc.in)
+			if err != nil {
+				t.Fatalf("ParseDuration(%q): %v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Errorf("ParseDuration(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseDurationErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"zero minutes", ":00"},
+		{"zero hours", "0"},
+		{"zero hours and minutes", "0:00"},
+		{"empty", ""},
+		{"only whitespace", " "},
+		{"hours out of range", "24"},
+		{"minutes out of range", "1:60"},
+		{"non-numeric hours", "a"},
+		{"non-numeric minutes", ":ab"},
+		{"missing minutes", "1:"},
+		{"negative", "-1"},
+		{"relative prefix", "+1:30"},
+		{"range not allowed", "9-10"},
+		{"trailing garbage", "1:20x"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ParseDuration(tc.in); err == nil {
+				t.Errorf("ParseDuration(%q) = nil error, want an error", tc.in)
+			}
+		})
+	}
+}
+
+// TestParseDurationHasNoAnchor pins the point of the bare form: it resolves to
+// a length only, so neither now nor a location can influence it.
+func TestParseDurationHasNoAnchor(t *testing.T) {
+	got, err := ParseDuration("1:30")
+	if err != nil {
+		t.Fatalf("ParseDuration: %v", err)
+	}
+	if got != 90*time.Minute {
+		t.Errorf("ParseDuration(\"1:30\") = %v, want 1h30m", got)
+	}
+	// The same text as an absolute or relative sign is not a duration.
+	if _, err := ParseAbsolute("1:30", now, time.UTC); err == nil {
+		t.Error("ParseAbsolute(\"1:30\") = nil error, want an error")
+	}
+	if _, err := ParseRelative("1:30", now, time.UTC); err == nil {
+		t.Error("ParseRelative(\"1:30\") = nil error, want an error")
+	}
+}
+
+func TestIsDuration(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"1:30", true},
+		{":45", true},
+		{"2", true},
+		{" 1:30 ", true},
+		{"bad", true}, // classifier only; ParseDuration still rejects it
+		{"+1:30", false},
+		{" +1", false},
+		{"9-:30", false},
+		{"10-11", false},
+		{"-1", false}, // a dash makes it a (malformed) range, not a duration
+		{"", false},
+		{" ", false},
+	}
+	for _, tc := range cases {
+		if got := IsDuration(tc.in); got != tc.want {
+			t.Errorf("IsDuration(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestIsRelative(t *testing.T) {
 	cases := []struct {
 		in   string

@@ -192,6 +192,178 @@ func TestAddRejectsInvalidRelativeTimesign(t *testing.T) {
 	}
 }
 
+// TestAddDurationStartsAtLastEntryEnd covers the bare duration form: with no
+// start time given, the entry picks up where the last one ended and runs for
+// the duration typed, so `tg add 1:30 <task>` logs the block back to back.
+func TestAddDurationStartsAtLastEntryEnd(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	// The last entry today ends at 10:00, so "1:30" is 10:00-11:30 regardless
+	// of what time it is now (15:00).
+	var buf bytes.Buffer
+	if err := cmdAdd(&buf, s, nil, 1, nil, "9-10", "login", "", addNow, time.UTC); err != nil {
+		t.Fatalf("add first: %v", err)
+	}
+	buf.Reset()
+	if err := cmdAdd(&buf, s, nil, 1, nil, "1:30", "review", "", addNow, time.UTC); err != nil {
+		t.Fatalf("add duration: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "10:00-11:30") || !strings.Contains(out, "1h30m") {
+		t.Errorf("output = %q, want 10:00-11:30 (1h30m)", out)
+	}
+
+	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	if len(entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(entries))
+	}
+	e := entries[1]
+	wantStart := time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)
+	wantStop := time.Date(2026, 1, 2, 11, 30, 0, 0, time.UTC)
+	if !e.Start.Equal(wantStart) {
+		t.Errorf("start = %v, want %v (the last entry's end)", e.Start, wantStart)
+	}
+	if e.Stop == nil || !e.Stop.Equal(wantStop) {
+		t.Errorf("stop = %v, want %v", e.Stop, wantStop)
+	}
+	if e.Duration != 5400 {
+		t.Errorf("duration = %d, want 5400", e.Duration)
+	}
+	if e.TaskID == nil || *e.TaskID != 12 {
+		t.Errorf("task_id = %v, want 12 (Code review)", e.TaskID)
+	}
+
+	// A second bare duration chains off the one just added.
+	buf.Reset()
+	if err := cmdAdd(&buf, s, nil, 1, nil, ":30", "Fix", "", addNow, time.UTC); err != nil {
+		t.Fatalf("add chained duration: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "11:30-12:00") {
+		t.Errorf("output = %q, want 11:30-12:00", out)
+	}
+}
+
+// TestAddDurationWithoutLastEntry pins the missing-anchor case: a bare duration
+// has no start of its own, so on a day with nothing tracked yet it is refused
+// (pointing at the forms that need no anchor) rather than silently starting at
+// now or reaching back into yesterday.
+func TestAddDurationWithoutLastEntry(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	// Yesterday's entry is history: LastEntry is today-only, so it must not
+	// become the anchor.
+	if err := cmdAdd(&bytes.Buffer{}, s, nil, 1, nil, "9-10", "login", "",
+		addNow.AddDate(0, 0, -1), time.UTC); err != nil {
+		t.Fatalf("seed yesterday: %v", err)
+	}
+
+	var buf bytes.Buffer
+	err := cmdAdd(&buf, s, nil, 1, nil, "1:30", "review", "", addNow, time.UTC)
+	if err == nil {
+		t.Fatal("add 1:30 with no entry today = nil error, want an error")
+	}
+	for _, want := range []string{"no entry tracked today", "9-:30", "+1:30"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to mention %q", err, want)
+		}
+	}
+	if buf.Len() != 0 {
+		t.Errorf("output = %q, want nothing written", buf.String())
+	}
+	// Only yesterday's entry exists; nothing was created today.
+	entries, _ := s.EntriesBetween(addNow.AddDate(0, 0, -2), addNow.Add(24*time.Hour))
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1 (yesterday's only)", len(entries))
+	}
+}
+
+// TestAddDurationWithRunningLastEntry covers the other missing anchor: a
+// running entry has no end time to continue from, so the bare form is refused
+// exactly as `tg mod +DURATION` refuses one.
+func TestAddDurationWithRunningLastEntry(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	seedRunning(t, s, 12, testStart)
+
+	var buf bytes.Buffer
+	err := cmdAdd(&buf, s, nil, 1, nil, "1:30", "login", "", addNow, time.UTC)
+	if err == nil {
+		t.Fatal("add 1:30 after a running entry = nil error, want an error")
+	}
+	if !strings.Contains(err.Error(), "still running") {
+		t.Errorf("err = %v, want it to mention the running entry", err)
+	}
+	if entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1 (the running entry only)", len(entries))
+	}
+}
+
+// TestAddDurationRejectsOverlap keeps the bare form under the same overlap
+// guard as the rest: an entry booked for later today is skipped when resolving
+// the anchor (LastEntry ignores future starts), so only the guard can catch a
+// duration long enough to run into it.
+func TestAddDurationRejectsOverlap(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	// It is 10:30. Tracked so far today: 09:00-10:00. Booked for later:
+	// 11:00-12:00, which starts after now and so is never the anchor.
+	now := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	if err := cmdAdd(&bytes.Buffer{}, s, nil, 1, nil, "9-10", "login", "", now, time.UTC); err != nil {
+		t.Fatalf("add first: %v", err)
+	}
+	if err := cmdAdd(&bytes.Buffer{}, s, nil, 1, nil, "11-12", "Fix", "", now, time.UTC); err != nil {
+		t.Fatalf("add later: %v", err)
+	}
+
+	var buf bytes.Buffer
+	// 10:00 + 1h30m = 11:30, which straddles the 11:00-12:00 entry.
+	err := cmdAdd(&buf, s, nil, 1, nil, "1:30", "review", "", now, time.UTC)
+	if err == nil {
+		t.Fatal("overlapping duration add = nil error, want an error")
+	}
+	for _, want := range []string{"overlaps existing entry", "10:00-11:30", "11:00-12:00"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to mention %q", err, want)
+		}
+	}
+	if entries, _ := s.EntriesBetween(now.Add(-24*time.Hour), now.Add(24*time.Hour)); len(entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(entries))
+	}
+
+	// Exactly filling the gap up to the booked entry is fine (back to back).
+	buf.Reset()
+	if err := cmdAdd(&buf, s, nil, 1, nil, "1", "review", "", now, time.UTC); err != nil {
+		t.Fatalf("gap-filling add: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "10:00-11:00") {
+		t.Errorf("output = %q, want 10:00-11:00", out)
+	}
+}
+
+// TestAddRejectsInvalidDuration keeps a malformed or zero bare duration out of
+// the store, reported as a timesign error before any anchor lookup.
+func TestAddRejectsInvalidDuration(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	if err := cmdAdd(&bytes.Buffer{}, s, nil, 1, nil, "9-10", "login", "", addNow, time.UTC); err != nil {
+		t.Fatalf("add first: %v", err)
+	}
+	for _, ts := range []string{"0", ":00", "24", "1:60", "1:"} {
+		var buf bytes.Buffer
+		err := cmdAdd(&buf, s, nil, 1, nil, ts, "review", "", addNow, time.UTC)
+		if err == nil || !strings.Contains(err.Error(), "timesign") {
+			t.Errorf("add %q: err = %v, want a timesign parse error", ts, err)
+		}
+	}
+	if entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+}
+
 // TestAddWithDescription verifies --desc/--description sets the entry's
 // description on the stored entry.
 func TestAddWithDescription(t *testing.T) {
