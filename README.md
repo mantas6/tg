@@ -254,7 +254,8 @@ commands:
   update <project>          refresh a project's tasks and pull its recent
                             entries                 [--days N] [--all] [--json]
   push                      send local changes to Toggl       [--json]
-  pull [project]            fetch changes; all projects, or one [--since DATE] [--json]
+  pull [project]            fetch today's changes; all projects, or one
+                            [-a|--all this month] [--since DATE] [--json]
   total [task]              total tracked hours per task; last 3 months [--since DATE] [--json]
   completion zsh            print the zsh completion script
 
@@ -274,9 +275,26 @@ mod:  numbers are the per-day ones shown by `tg ls`; without one the
 Run `tg pull` then `tg push` for correct last-writer-wins behavior:
 
 ```sh
-tg pull    # fetch remote changes into the local store
+tg pull    # fetch today's remote changes into the local store
 tg push    # send local changes to Toggl
 ```
+
+`tg pull` reconciles a **time window**, which defaults to **today** (from
+midnight, local time). Widen it to the whole current calendar month — from the
+1st to the month's end — with `-a`/`--all`, or pick an explicit start with
+`--since DATE`, which wins over both:
+
+```sh
+tg pull                # today's changes, every project
+tg pull -a             # everything changed this month
+tg pull backend -a     # ...scoped to one project
+tg pull --since 2026-01-01
+```
+
+Only entries **modified** inside the window are fetched, so the usual
+today-sized pull stays cheap. A window that does not reach back to the
+`last_pull` watermark is partial and leaves it untouched, so nothing that
+changed in the meantime is ever marked as reconciled.
 
 `tg push` runs automatically (best-effort) when you `tg add`, so the entry shows
 up in the Toggl web app immediately. If the network is unavailable, the entry
@@ -297,9 +315,9 @@ count of calendar days: the window starts at midnight that many days before
 today (so `-n 1` means "since yesterday morning" whatever time you run it, and
 `-n 0` means today only). Flags may come before or after the project name.
 Because the pull is scoped to a single project, it is partial: it never advances
-the `last_pull` watermark, so a later full `tg pull` still reconciles every
-other project. The command stays quiet on success; use `--json` for the
-project name, task count and pull counters.
+the `last_pull` watermark, so a later `tg pull` still reconciles every other
+project. The command stays quiet on success; use `--json` for the project name,
+task count and pull counters.
 
 ### Environment
 

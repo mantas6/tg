@@ -445,6 +445,68 @@ func TestPullAdvancesLastPull(t *testing.T) {
 	}
 }
 
+// TestPullChainedWindowAdvancesLastPull verifies a bounded window still
+// advances the watermark when it reaches back to it: `tg pull` run twice in a
+// day pulls "today", whose start precedes the watermark left by the first run,
+// so the two windows chain and no change can slip through the seam.
+func TestPullChainedWindowAdvancesLastPull(t *testing.T) {
+	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[]`))
+	})
+	if err := st.SetMeta(store.MetaLastPull, "2026-01-02T06:00:00Z"); err != nil {
+		t.Fatalf("seed watermark: %v", err)
+	}
+	now := ts("2026-01-02T12:00:00Z")
+	if _, err := Pull(st, c, nil, ts("2026-01-02T00:00:00Z"), now); err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	v, _, _ := st.GetMeta(store.MetaLastPull)
+	if v != "2026-01-02T12:00:00Z" {
+		t.Errorf("last_pull = %q, want now (window reaches back past the watermark)", v)
+	}
+}
+
+// TestPullPartialWindowKeepsLastPull verifies a window that starts AFTER the
+// watermark is partial and leaves it alone: `tg pull` (today only) run for the
+// first time in days never looked at what changed in between, so claiming
+// coverage up to now would hide those changes from a later wider pull.
+func TestPullPartialWindowKeepsLastPull(t *testing.T) {
+	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[]`))
+	})
+	if err := st.SetMeta(store.MetaLastPull, "2025-12-28T09:00:00Z"); err != nil {
+		t.Fatalf("seed watermark: %v", err)
+	}
+	now := ts("2026-01-02T12:00:00Z")
+	if _, err := Pull(st, c, nil, ts("2026-01-02T00:00:00Z"), now); err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	v, _, _ := st.GetMeta(store.MetaLastPull)
+	if v != "2025-12-28T09:00:00Z" {
+		t.Errorf("last_pull = %q, want the untouched watermark", v)
+	}
+}
+
+// TestPullUnparsableWatermarkAdvances verifies a corrupt watermark does not
+// wedge the pull path: there is no coverage claim worth protecting, so it is
+// overwritten with a well-formed one.
+func TestPullUnparsableWatermarkAdvances(t *testing.T) {
+	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[]`))
+	})
+	if err := st.SetMeta(store.MetaLastPull, "not-a-timestamp"); err != nil {
+		t.Fatalf("seed watermark: %v", err)
+	}
+	now := ts("2026-01-02T12:00:00Z")
+	if _, err := Pull(st, c, nil, ts("2026-01-02T00:00:00Z"), now); err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	v, _, _ := st.GetMeta(store.MetaLastPull)
+	if v != "2026-01-02T12:00:00Z" {
+		t.Errorf("last_pull = %q, want now", v)
+	}
+}
+
 // TestRoundTrip pushes a fresh local entry, then pulls the server's view of it
 // back and asserts convergence (clean, single consistent row).
 func TestRoundTrip(t *testing.T) {

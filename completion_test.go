@@ -32,6 +32,8 @@ func TestCompletionZsh(t *testing.T) {
 		"        pull)", "        total)",
 		"        completion)",
 		"--desc[", "--description[", "--json[", "--all[", "--since[", "--days[",
+		// `pull` widens its default today-only window with -a/--all.
+		"--all[pull this month", "-a[pull this month",
 	} {
 		if !strings.Contains(out, marker) {
 			t.Errorf("completion script missing %q", marker)

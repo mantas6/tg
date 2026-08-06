@@ -2385,6 +2385,148 @@ func TestUpdateDaysFlagAliases(t *testing.T) {
 	}
 }
 
+// pullNow is a fixed mid-month, mid-day clock for the `tg pull` window tests.
+var pullNow = time.Date(2026, 3, 17, 15, 30, 0, 0, time.UTC)
+
+// TestResolvePullSinceDefault pins `tg pull`'s default window: today only,
+// aligned to midnight in the given location.
+func TestResolvePullSinceDefault(t *testing.T) {
+	got, err := resolvePullSince("", false, pullNow, time.UTC)
+	if err != nil {
+		t.Fatalf("resolvePullSince: %v", err)
+	}
+	want := time.Date(2026, 3, 17, 0, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("since = %v, want %v (start of today)", got, want)
+	}
+}
+
+// TestResolvePullSinceAll verifies -a/--all widens the window to the whole
+// current calendar month, starting at midnight on the 1st.
+func TestResolvePullSinceAll(t *testing.T) {
+	got, err := resolvePullSince("", true, pullNow, time.UTC)
+	if err != nil {
+		t.Fatalf("resolvePullSince: %v", err)
+	}
+	want := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("since = %v, want %v (start of this month)", got, want)
+	}
+}
+
+// TestResolvePullSinceLocation verifies both windows are day-aligned in the
+// caller's location, not in UTC.
+func TestResolvePullSinceLocation(t *testing.T) {
+	loc := time.FixedZone("UTC+3", 3*60*60)
+	// 2026-03-01T01:00+03:00 is still February in UTC.
+	now := time.Date(2026, 2, 28, 22, 0, 0, 0, time.UTC)
+	day, err := resolvePullSince("", false, now, loc)
+	if err != nil {
+		t.Fatalf("resolvePullSince: %v", err)
+	}
+	if want := time.Date(2026, 3, 1, 0, 0, 0, 0, loc); !day.Equal(want) {
+		t.Errorf("today window = %v, want %v", day, want)
+	}
+	month, err := resolvePullSince("", true, now, loc)
+	if err != nil {
+		t.Fatalf("resolvePullSince: %v", err)
+	}
+	if want := time.Date(2026, 3, 1, 0, 0, 0, 0, loc); !month.Equal(want) {
+		t.Errorf("month window = %v, want %v", month, want)
+	}
+}
+
+// TestResolvePullSinceOverride verifies an explicit --since date wins over both
+// defaults, including over --all.
+func TestResolvePullSinceOverride(t *testing.T) {
+	for _, all := range []bool{false, true} {
+		got, err := resolvePullSince("2025-11-04", all, pullNow, time.UTC)
+		if err != nil {
+			t.Fatalf("resolvePullSince(all=%v): %v", all, err)
+		}
+		want := time.Date(2025, 11, 4, 0, 0, 0, 0, time.UTC)
+		if !got.Equal(want) {
+			t.Errorf("since(all=%v) = %v, want %v", all, got, want)
+		}
+	}
+}
+
+// TestResolvePullSinceInvalid verifies a malformed --since date is rejected
+// with the shared "invalid --since" error style.
+func TestResolvePullSinceInvalid(t *testing.T) {
+	_, err := resolvePullSince("17-03-2026", false, pullNow, time.UTC)
+	if err == nil || !strings.Contains(err.Error(), "invalid --since") {
+		t.Errorf("err = %v, want an invalid --since error", err)
+	}
+}
+
+// TestPullAllFlagAliases pins how runPull wires --all/-a: both spellings share
+// one variable, default to false (today only), and (thanks to parseArgsAndFlags)
+// may follow the project fragment, as in `tg pull backend -a`.
+func TestPullAllFlagAliases(t *testing.T) {
+	newFS := func() (*flag.FlagSet, *bool) {
+		fs := flag.NewFlagSet("pull", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		all := new(bool)
+		fs.BoolVar(all, "all", false, "")
+		fs.BoolVar(all, "a", false, "")
+		return fs, all
+	}
+
+	for _, tc := range []struct {
+		args     []string
+		wantAll  bool
+		wantFrag string
+	}{
+		{[]string{}, false, ""},
+		{[]string{"backend"}, false, "backend"},
+		{[]string{"-a"}, true, ""},
+		{[]string{"--all"}, true, ""},
+		{[]string{"backend", "-a"}, true, "backend"},
+		{[]string{"--all", "backend"}, true, "backend"},
+	} {
+		fs, all := newFS()
+		rest, err := parseArgsAndFlags(fs, tc.args)
+		if err != nil {
+			t.Fatalf("parse %v: %v", tc.args, err)
+		}
+		if *all != tc.wantAll {
+			t.Errorf("parse %v: all = %v, want %v", tc.args, *all, tc.wantAll)
+		}
+		if frag := strings.Join(rest, " "); frag != tc.wantFrag {
+			t.Errorf("parse %v: fragment = %q, want %q", tc.args, frag, tc.wantFrag)
+		}
+	}
+}
+
+// TestPullTodayWindowKeepsStaleWatermark verifies the default today-only window
+// is treated as a partial pull at the command level: an older watermark is left
+// alone so a later wider pull still reconciles the days in between.
+func TestPullTodayWindowKeepsStaleWatermark(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	if err := s.SetMeta(store.MetaLastPull, "2026-01-01T09:00:00Z"); err != nil {
+		t.Fatalf("seed watermark: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+
+	now := time.Date(2026, 1, 5, 12, 0, 0, 0, time.UTC)
+	since := startOfDay(now, time.UTC)
+	var buf bytes.Buffer
+	if err := cmdPull(&buf, s, c, "", since, now, false); err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	v, _, _ := s.GetMeta(store.MetaLastPull)
+	if v != "2026-01-01T09:00:00Z" {
+		t.Errorf("last_pull = %q, want the untouched watermark", v)
+	}
+}
+
 // TestProjectsUpdateSyncsWholeWorkspace verifies `projects update` walks the
 // entire workspace project list and upserts it (without wiping other cached
 // projects) while never fetching tasks.

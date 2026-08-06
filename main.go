@@ -331,7 +331,16 @@ func runPull(args []string) error {
 	fs := newFlagSet("pull")
 	jsonOut := fs.Bool("json", false, "emit JSON")
 	sinceFlag := fs.String("since", "", "pull entries modified since DATE (YYYY-MM-DD)")
-	if err := fs.Parse(args); err != nil {
+	// --all and -a are aliases bound to the same variable: they widen the
+	// default today-only window to the whole current month (see
+	// resolvePullSince).
+	var all bool
+	fs.BoolVar(&all, "all", false, "pull this month's entries instead of only today's")
+	fs.BoolVar(&all, "a", false, "pull this month's entries (alias of --all)")
+	// Flags may follow the project fragment (`tg pull backend -a`), so
+	// positionals are peeled off the same way `tg update` does it.
+	rest, err := parseArgsAndFlags(fs, args)
+	if err != nil {
 		return err
 	}
 	cfg, err := config.Load()
@@ -345,11 +354,11 @@ func runPull(args []string) error {
 	defer st.Close()
 
 	now := time.Now()
-	since, err := resolveSince(st, *sinceFlag, now, time.Local)
+	since, err := resolvePullSince(*sinceFlag, all, now, time.Local)
 	if err != nil {
 		return err
 	}
-	fragment := strings.Join(fs.Args(), " ")
+	fragment := strings.Join(rest, " ")
 	// pull deliberately ignores TOGGL_PROJECT_ID (unlike add/tasks/update):
 	// it always reconciles every project. Scoping happens only via an explicit
 	// <project> argument, so the env project id is never passed through here.
@@ -514,9 +523,17 @@ func projectIDFromEnv() *int64 {
 	return &id
 }
 
-// resolveSince determines the pull window start: an explicit --since date, else
-// the recorded last_pull, else a 90-day default window.
-func resolveSince(st *store.Store, sinceFlag string, now time.Time, loc *time.Location) (time.Time, error) {
+// resolvePullSince determines `tg pull`'s window start. An explicit --since
+// date wins; otherwise --all/-a widens the window to the first day of the
+// current month and the default is the start of today. Both defaults are
+// day-aligned in loc (like resolveUpdateSince) so they mean "today" and "this
+// month" in calendar terms rather than a rolling cut.
+//
+// There is no explicit window END: sync.Pull asks Toggl for everything modified
+// at or after `since`, and nothing can be modified after `now`, so today's
+// window ends at now and the current month's window ends at the month's end as
+// it is reached.
+func resolvePullSince(sinceFlag string, all bool, now time.Time, loc *time.Location) (time.Time, error) {
 	if sinceFlag != "" {
 		t, err := time.ParseInLocation("2006-01-02", sinceFlag, loc)
 		if err != nil {
@@ -524,12 +541,10 @@ func resolveSince(st *store.Store, sinceFlag string, now time.Time, loc *time.Lo
 		}
 		return t, nil
 	}
-	if v, ok, err := st.GetMeta(store.MetaLastPull); err != nil {
-		return time.Time{}, err
-	} else if ok {
-		return time.Parse(time.RFC3339, v)
+	if all {
+		return startOfMonth(now, loc), nil
 	}
-	return now.AddDate(0, 0, -90), nil
+	return startOfDay(now, loc), nil
 }
 
 // updateDefaultDays is `tg update`'s default entry window: one day back.
@@ -603,7 +618,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  update <project>          refresh a project's tasks and pull its recent")
 	fmt.Fprintln(w, "                            entries                 [--days N] [--all] [--json]")
 	fmt.Fprintln(w, "  push                      send local changes to Toggl       [--json]")
-	fmt.Fprintln(w, "  pull [project]            fetch changes; all projects, or one [--since DATE] [--json]")
+	fmt.Fprintln(w, "  pull [project]            fetch today's changes; all projects, or one")
+	fmt.Fprintln(w, "                            [-a|--all this month] [--since DATE] [--json]")
 	fmt.Fprintln(w, "  total [task]              total tracked hours per task; last 3 months [--since DATE] [--json]")
 	fmt.Fprintln(w, "  completion zsh            print the zsh completion script")
 	fmt.Fprintln(w, "")

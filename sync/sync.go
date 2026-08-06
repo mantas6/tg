@@ -27,10 +27,16 @@ type PushResult struct {
 }
 
 // Pull fetches remote entries modified since `since`, applies LWW against local
-// state, and advances last_pull to `now`. A non-nil projectID scopes the pull
+// state, and may advance last_pull to `now`. A non-nil projectID scopes the pull
 // to a single project: entries belonging to other projects (or to none) are
 // ignored, and last_pull is left untouched so a later full pull still
 // reconciles those other projects. Callers pass nil to reconcile every project.
+//
+// The watermark is likewise left untouched when the WINDOW is partial, i.e.
+// when `since` starts after the recorded watermark (see canAdvanceWatermark):
+// `tg pull` defaults to today's window, and moving last_pull to `now` would
+// claim coverage of the gap between the old watermark and `since` that this
+// pull never looked at.
 func Pull(st *store.Store, c *api.Client, projectID *int64, since, now time.Time) (PullResult, error) {
 	var res PullResult
 	remotes, err := c.List(since)
@@ -89,15 +95,45 @@ func Pull(st *store.Store, c *api.Client, projectID *int64, since, now time.Time
 		}
 	}
 
-	// Only advance the watermark on a full (unscoped) pull; a project-scoped
-	// pull is partial and must not hide other projects' changes from a later
-	// full pull.
+	// Only advance the watermark on a full pull; a project-scoped pull is
+	// partial and must not hide other projects' changes from a later full
+	// pull, and a window that starts after the watermark must not hide the
+	// changes made in between.
 	if projectID == nil {
-		if err := st.SetMeta(store.MetaLastPull, now.UTC().Format(time.RFC3339)); err != nil {
+		ok, err := canAdvanceWatermark(st, since)
+		if err != nil {
 			return res, err
+		}
+		if ok {
+			if err := st.SetMeta(store.MetaLastPull, now.UTC().Format(time.RFC3339)); err != nil {
+				return res, err
+			}
 		}
 	}
 	return res, nil
+}
+
+// canAdvanceWatermark reports whether a pull whose window starts at `since` may
+// move last_pull forward without leaving an unreconciled gap behind it. That is
+// true only when the window reaches back to (at least) the recorded watermark,
+// so the two windows chain: "everything modified since last_pull is
+// reconciled" stays a true statement.
+//
+// An absent (or unparsable) watermark bootstraps to true: there is no coverage
+// claim yet that this pull could invalidate.
+func canAdvanceWatermark(st *store.Store, since time.Time) (bool, error) {
+	v, ok, err := st.GetMeta(store.MetaLastPull)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return true, nil
+	}
+	prev, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		return true, nil
+	}
+	return !since.After(prev), nil
 }
 
 // Push sends every dirty local entry to Toggl: deletions are DELETEd then

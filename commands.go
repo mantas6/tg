@@ -607,11 +607,16 @@ func cmdPush(w io.Writer, st *store.Store, c *api.Client, now time.Time, jsonOut
 }
 
 // cmdPull reconciles remote entries into the local store (LWW). With no project
-// argument it pulls EVERY project's entries in a single pass and advances the
-// last_pull watermark. Unlike start/tasks/update, `tg pull` deliberately
-// ignores TOGGL_PROJECT_ID: scoping happens only via an explicit project-name
-// fragment that uniquely matches a cached project, and such a scoped (partial)
-// pull leaves the watermark untouched.
+// argument it pulls EVERY project's entries in a single pass. Unlike
+// start/tasks/update, `tg pull` deliberately ignores TOGGL_PROJECT_ID: scoping
+// happens only via an explicit project-name fragment that uniquely matches a
+// cached project, and such a scoped (partial) pull leaves the last_pull
+// watermark untouched.
+//
+// The time window is the caller's: runPull defaults it to today and widens it
+// to the current month under --all/-a (see resolvePullSince). A window that
+// does not reach back to the watermark is partial too and leaves it untouched
+// (see sync.Pull).
 func cmdPull(w io.Writer, st *store.Store, c *api.Client, fragment string, since, now time.Time, jsonOut bool) error {
 	pid, err := resolvePullScope(st, fragment)
 	if err != nil {
@@ -764,6 +769,12 @@ func projectBillable(st *store.Store, projectID int64) (bool, error) {
 func startOfDay(t time.Time, loc *time.Location) time.Time {
 	t = t.In(loc)
 	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, loc)
+}
+
+// startOfMonth returns midnight of the first day of t's calendar month in loc.
+func startOfMonth(t time.Time, loc *time.Location) time.Time {
+	t = t.In(loc)
+	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, loc)
 }
 
 func toStoreProject(p api.Project) store.Project {

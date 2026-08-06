@@ -74,7 +74,7 @@ _tg() {
         'projects:list cached projects with ids (projects update syncs them)'
         "update:refresh one project's tasks and pull its recent entries"
         'push:send local changes to Toggl'
-        "pull:fetch remote changes (all projects, or one)"
+        "pull:fetch today's remote changes (-a for this month)"
         'total:total tracked hours per task (Reports API)'
         'completion:print a shell completion script'
         'help:show usage'
@@ -135,7 +135,10 @@ _tg() {
             '*:project fragment:'
           ;;
         pull)
-          _arguments '--since[pull entries modified since DATE]:date (YYYY-MM-DD):' '--json[emit JSON]' '*:project fragment:'
+          _arguments '--all[pull this month, not just today]' \
+            '-a[pull this month, not just today (alias of --all)]' \
+            '--since[pull entries modified since DATE]:date (YYYY-MM-DD):' \
+            '--json[emit JSON]' '*:project fragment:'
           ;;
         total)
           _arguments '--since[total entries since DATE (default 3 months ago)]:date (YYYY-MM-DD):' '--json[emit JSON]' '*:task fragment:__tg_tasks'
