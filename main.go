@@ -52,8 +52,6 @@ func run(cmd string, args []string) error {
 		return runProjects(args)
 	case "update":
 		return runUpdate(args)
-	case "update-projects":
-		return runUpdateProjects(args)
 	case "push":
 		return runPush(args)
 	case "pull":
@@ -241,6 +239,12 @@ func runGrep(args []string) error {
 }
 
 func runProjects(args []string) error {
+	// `projects` owns one subcommand: `tg projects update` syncs the catalog
+	// from Toggl, while a bare `tg projects` lists what is already cached. The
+	// subcommand word must come first (flags after it belong to it).
+	if len(args) > 0 && args[0] == "update" {
+		return runProjectsUpdate(args[1:])
+	}
 	fs := newFlagSet("projects")
 	all := fs.Bool("all", false, "include inactive projects")
 	jsonOut := fs.Bool("json", false, "emit JSON")
@@ -253,6 +257,25 @@ func runProjects(args []string) error {
 	}
 	defer st.Close()
 	return cmdProjects(os.Stdout, st, *all, *jsonOut)
+}
+
+func runProjectsUpdate(args []string) error {
+	fs := newFlagSet("projects update")
+	all := fs.Bool("all", false, "include inactive projects")
+	jsonOut := fs.Bool("json", false, "emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	return cmdUpdateProjects(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, *all, *jsonOut)
 }
 
 func runUpdate(args []string) error {
@@ -284,25 +307,6 @@ func runUpdate(args []string) error {
 	since := resolveUpdateSince(days, now, time.Local)
 	fragment := strings.Join(rest, " ")
 	return cmdUpdate(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectIDFromEnv(), fragment, since, now, *all, *jsonOut)
-}
-
-func runUpdateProjects(args []string) error {
-	fs := newFlagSet("update-projects")
-	all := fs.Bool("all", false, "include inactive projects")
-	jsonOut := fs.Bool("json", false, "emit JSON")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	return cmdUpdateProjects(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, *all, *jsonOut)
 }
 
 func runPush(args []string) error {
@@ -595,9 +599,9 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  tasks                     list cached tasks                 [--all] [--json]")
 	fmt.Fprintln(w, "  grep <fragment>           list cached tasks matching it     [--all] [--json]")
 	fmt.Fprintln(w, "  projects                  list cached projects with ids     [--all] [--json]")
+	fmt.Fprintln(w, "  projects update           sync all workspace projects       [--all] [--json]")
 	fmt.Fprintln(w, "  update <project>          refresh a project's tasks and pull its recent")
 	fmt.Fprintln(w, "                            entries                 [--days N] [--all] [--json]")
-	fmt.Fprintln(w, "  update-projects           sync all workspace projects       [--all] [--json]")
 	fmt.Fprintln(w, "  push                      send local changes to Toggl       [--json]")
 	fmt.Fprintln(w, "  pull [project]            fetch changes; all projects, or one [--since DATE] [--json]")
 	fmt.Fprintln(w, "  total [task]              total tracked hours per task; last 3 months [--since DATE] [--json]")

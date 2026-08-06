@@ -2212,10 +2212,10 @@ func TestUpdateDaysFlagAliases(t *testing.T) {
 	}
 }
 
-// TestUpdateProjectsSyncsWholeWorkspace verifies update-projects walks the
+// TestProjectsUpdateSyncsWholeWorkspace verifies `projects update` walks the
 // entire workspace project list and upserts it (without wiping other cached
 // projects) while never fetching tasks.
-func TestUpdateProjectsSyncsWholeWorkspace(t *testing.T) {
+func TestProjectsUpdateSyncsWholeWorkspace(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -2223,7 +2223,7 @@ func TestUpdateProjectsSyncsWholeWorkspace(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
 		if r.URL.Path != "/workspaces/1/projects" {
-			t.Errorf("unexpected path %q (update-projects must not fetch tasks)", r.URL.Path)
+			t.Errorf("unexpected path %q (projects update must not fetch tasks)", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -2234,7 +2234,7 @@ func TestUpdateProjectsSyncsWholeWorkspace(t *testing.T) {
 
 	var buf bytes.Buffer
 	if err := cmdUpdateProjects(&buf, s, c, 1, false, false); err != nil {
-		t.Fatalf("update-projects: %v", err)
+		t.Fatalf("projects update: %v", err)
 	}
 	if !strings.Contains(buf.String(), "2 projects") {
 		t.Errorf("output = %q, want project count", buf.String())
@@ -2260,15 +2260,15 @@ func TestUpdateProjectsSyncsWholeWorkspace(t *testing.T) {
 		}
 	}
 
-	// Cached tasks are untouched: update-projects never syncs tasks.
+	// Cached tasks are untouched: projects update never syncs tasks.
 	p1 := int64(1)
 	backend, _ := s.ListTasks(false, &p1)
 	if len(backend) == 0 {
-		t.Error("project 1 tasks should be untouched by update-projects")
+		t.Error("project 1 tasks should be untouched by projects update")
 	}
 }
 
-func TestUpdateProjectsJSON(t *testing.T) {
+func TestProjectsUpdateJSON(t *testing.T) {
 	s := newStore(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2279,7 +2279,7 @@ func TestUpdateProjectsJSON(t *testing.T) {
 
 	var buf bytes.Buffer
 	if err := cmdUpdateProjects(&buf, s, c, 1, false, true); err != nil {
-		t.Fatalf("update-projects --json: %v", err)
+		t.Fatalf("projects update --json: %v", err)
 	}
 	if !strings.Contains(buf.String(), `"projects":1`) {
 		t.Errorf("json output = %q, want projects count", buf.String())

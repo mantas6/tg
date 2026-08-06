@@ -506,7 +506,7 @@ func cmdProjects(w io.Writer, st *store.Store, all, jsonOut bool) error {
 // resolveUpdateProject).
 //
 // The project catalog itself is NOT synced here: update never fetches project
-// metadata from Toggl. Refresh the catalog with `tg update-projects`. (The
+// metadata from Toggl. Refresh the catalog with `tg projects update`. (The
 // entry pull may still self-heal catalog rows from each entry's meta payload;
 // see sync.healCatalog.)
 //
@@ -553,7 +553,8 @@ func cmdUpdate(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, p
 	return nil
 }
 
-// cmdUpdateProjects syncs the WHOLE workspace project catalog: every available
+// cmdUpdateProjects backs `tg projects update`. It syncs the WHOLE workspace
+// project catalog: every available
 // project is fetched from Toggl and upserted into the local store. Unlike
 // cmdUpdate (which is deliberately scoped to a single project), this walks the
 // entire workspace, but it never fetches tasks — refresh a project's tasks with

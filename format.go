@@ -429,7 +429,7 @@ type projectRow struct {
 // column (right-aligned) so it can be exported as TOGGL_PROJECT_ID.
 func renderProjects(w io.Writer, projects []store.Project) {
 	if len(projects) == 0 {
-		fmt.Fprintln(w, "No projects. Run `tg update` to refresh the catalog.")
+		fmt.Fprintln(w, "No projects. Run `tg projects update` to refresh the catalog.")
 		return
 	}
 	width := 0

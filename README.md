@@ -42,7 +42,7 @@ tg auth
 Refresh the local catalog, then record time:
 
 ```sh
-tg update-projects          # sync all workspace projects
+tg projects update          # sync all workspace projects
 tg update <project>         # fetch one project's tasks + its recent entries
 tg add +:20 <task>          # record the last 20 minutes against the task
 tg status                   # last entry, idle gap, today's total
@@ -223,9 +223,9 @@ commands:
   tasks                     list cached tasks                 [--all] [--json]
   grep <fragment>           list cached tasks matching it     [--all] [--json]
   projects                  list cached projects with ids     [--all] [--json]
+  projects update           sync all workspace projects       [--all] [--json]
   update <project>          refresh a project's tasks and pull its recent
                             entries                 [--days N] [--all] [--json]
-  update-projects           sync all workspace projects       [--all] [--json]
   push                      send local changes to Toggl       [--json]
   pull [project]            fetch changes; all projects, or one [--since DATE] [--json]
   total [task]              total tracked hours per task; last 3 months [--since DATE] [--json]
@@ -256,7 +256,7 @@ stays local and dirty until the next `tg push`.
 
 `tg update <project>` is the per-project refresh: it fetches the project's task
 list *and* pulls its recent time entries in one go. It does not sync the project
-catalog itself — use `tg update-projects` for that.
+catalog itself — use `tg projects update` for that.
 
 ```sh
 tg update backend            # tasks + entries touched since yesterday

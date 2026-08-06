@@ -587,8 +587,8 @@ func TestRenderProjectsJSONGolden(t *testing.T) {
 func TestRenderProjectsEmpty(t *testing.T) {
 	var buf bytes.Buffer
 	renderProjects(&buf, nil)
-	if !strings.Contains(buf.String(), "tg update") {
-		t.Errorf("empty projects = %q, want hint to run `tg update`", buf.String())
+	if !strings.Contains(buf.String(), "tg projects update") {
+		t.Errorf("empty projects = %q, want hint to run `tg projects update`", buf.String())
 	}
 }
 

@@ -41,6 +41,13 @@ __tg_tasks() {
   _wanted tasks expl 'task' compadd -a names
 }
 
+# Complete the subcommands of ` + "`tg projects`" + `.
+__tg_projects_cmds() {
+  local -a subcmds
+  subcmds=('update:sync all workspace projects')
+  _describe -t commands 'tg projects command' subcmds
+}
+
 _tg() {
   local curcontext="$curcontext" state line
   typeset -A opt_args
@@ -64,9 +71,8 @@ _tg() {
         "ls:show today's entries"
         'tasks:list cached tasks'
         'grep:list cached tasks matching a fragment'
-        'projects:list cached projects with ids'
+        'projects:list cached projects with ids (projects update syncs them)'
         "update:refresh one project's tasks and pull its recent entries"
-        'update-projects:sync all workspace projects'
         'push:send local changes to Toggl'
         "pull:fetch remote changes (all projects, or one)"
         'total:total tracked hours per task (Reports API)'
@@ -113,16 +119,20 @@ _tg() {
           _arguments '--all[include inactive tasks]' '--json[emit JSON]' '*:task fragment:__tg_tasks'
           ;;
         projects)
-          _arguments '--all[include inactive projects]' '--json[emit JSON]'
+          # Bare ` + "`tg projects`" + ` lists the cache; the lone subcommand
+          # ` + "`tg projects update`" + ` syncs it and takes the same flags.
+          if [[ $words[2] == update ]]; then
+            _arguments '--all[include inactive projects]' '--json[emit JSON]'
+          else
+            _arguments '--all[include inactive projects]' '--json[emit JSON]' \
+              '1:subcommand:__tg_projects_cmds'
+          fi
           ;;
         update)
           _arguments '--all[include inactive tasks]' '--json[emit JSON]' \
             '--days[pull entries from the last N days]:days:' \
             '-n[pull entries from the last N days (alias of --days)]:days:' \
             '*:project fragment:'
-          ;;
-        update-projects)
-          _arguments '--all[include inactive projects]' '--json[emit JSON]'
           ;;
         pull)
           _arguments '--since[pull entries modified since DATE]:date (YYYY-MM-DD):' '--json[emit JSON]' '*:project fragment:'
