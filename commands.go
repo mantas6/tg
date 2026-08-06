@@ -276,7 +276,14 @@ func modTarget(st *store.Store, ref int, now time.Time) (store.Entry, error) {
 // one is refused; it can still be retimed with an absolute sign.
 func modSpan(e store.Entry, timesign string, now time.Time, loc *time.Location) (time.Time, time.Time, error) {
 	if timesig.IsRelative(timesign) {
-		span, err := timesig.ParseRelative(timesign, now, loc)
+		relative := timesign
+		raw := strings.TrimSpace(timesign)
+		body := strings.TrimSpace(strings.TrimPrefix(raw, timesig.RelativePrefix))
+		// mod's unitless shorthand is minutes; the shared parser uses hours.
+		if isDigits(body) {
+			relative = timesig.RelativePrefix + ":" + body
+		}
+		span, err := timesig.ParseRelative(relative, now, loc)
 		if err != nil {
 			return time.Time{}, time.Time{}, err
 		}

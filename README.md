@@ -103,7 +103,7 @@ the same one `tg status` reports, resolved the same way: today's newest entry
 that has already started (see below).
 
 ```sh
-tg mod +:30                      # the last entry ran 30 minutes longer
+tg mod +30                       # the last entry ran 30 minutes longer
 tg mod 2 +1:15                   # push entry 2's end 1h15m later
 tg mod 2 9-10:30                 # set entry 2's range explicitly
 tg mod --desc "reset password"   # only change the last entry's description
@@ -115,10 +115,12 @@ A timesign is read relative to the entry, not to today:
 
 - an **absolute** range (`9-10:30`) sets start and stop on the entry's *own*
   calendar day, so an edit never drags an entry onto another day;
-- a **relative** timesign (`+:30`) *extends* the entry by that duration: the
+- a **relative** timesign (`+30`) *extends* the entry by that duration: the
   start is kept and the stop moves to stop + duration, so an entry ending at
-  14:00 ends at 14:30 after `tg mod +:30`. It does **not** re-anchor the entry
-  to now the way `tg add` does, and it is not an absolute length — repeating it
+  14:00 ends at 14:30 after `tg mod +30`. An all-digit duration without `:` is
+  minutes for `mod`, so `+20` adds 20 minutes; `+1:20` still adds 1h20m. It does
+  **not** re-anchor the entry to now the way `tg add` does, and it is not an
+  absolute length — repeating it
   keeps adding time. A still-running entry has no end to extend, so `mod +`
   refuses it; retime it with an absolute range instead.
 
@@ -324,8 +326,8 @@ mod:  numbers are the per-day ones shown by `tg ls`; without one the
       last entry is modified: today's newest already-started entry, the
       same one `tg status` shows. Only TODAY's entries can be modified.
       An absolute timesign sets the range on the entry's own day; a
-      relative one EXTENDS the entry, keeping the start (`tg mod +:30`
-      pushes the end 30m later).
+      relative one EXTENDS the entry, keeping the start (`tg mod +30`
+      pushes the end 30m later); a number without `:` is minutes for `mod`.
 ```
 
 ### Syncing

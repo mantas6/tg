@@ -787,6 +787,24 @@ func TestModLastEntryRelativeTimesign(t *testing.T) {
 	}
 }
 
+func TestModUnitlessRelativeUsesMinutes(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+	last := entries[1] // 10:00-11:00 Code review
+
+	var buf bytes.Buffer
+	if err := cmdMod(&buf, s, nil, 0, "+20", "", false, modNow, time.UTC); err != nil {
+		t.Fatalf("mod: %v", err)
+	}
+
+	got := entryByID(t, s, last.ID)
+	wantStop := last.Stop.Add(20 * time.Minute)
+	if got.Stop == nil || !got.Stop.Equal(wantStop) {
+		t.Errorf("stop = %v, want %v", got.Stop, wantStop)
+	}
+}
+
 // TestModRelativeAddsToTheEnd pins the arithmetic a relative timesign does: the
 // duration is added to the entry's CURRENT end, not to its start and not to
 // now, so repeating the edit keeps pushing the end out. The 1h entry ending at

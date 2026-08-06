@@ -167,13 +167,13 @@ against that entry instead of against today/now:
 | Form                | Effect on the entry                                        |
 | ------------------- | ---------------------------------------------------------- |
 | absolute `9-10:30`  | start and stop are set on the **entry's own calendar day** |
-| relative `+:20`     | the entry **keeps its start**; stop becomes stop + `DURATION` |
+| relative `+20`      | the entry **keeps its start**; stop becomes stop + 20 minutes |
 
 So a relative timesign **extends** the entry, it does not re-anchor it to now
-and it is not an absolute length: `tg mod +:30` means "that entry ran 30 minutes
+and it is not an absolute length: `tg mod +30` means "that entry ran 30 minutes
 longer than recorded", so an entry ending at 14:00 ends at 14:30. Topping up the
 entry you just finished is the common correction; re-anchoring would silently
-move an entry recorded hours ago, and running `mod +:30` twice adds an hour
+move an entry recorded hours ago, and running `mod +30` twice adds an hour
 rather than being a no-op.
 
 A **running** entry has no stop to add to, so `mod +DURATION` refuses it (use an
@@ -183,8 +183,10 @@ absolute range to give it a finished span instead).
 earlier calendar day is refused before the timesign is even applied, so the
 "entry's own calendar day" is in practice today's.
 
-The duration rules are otherwise unchanged: `+0` and friends are still errors,
-and the 5-minute flooring is irrelevant here because only `DURATION` is used.
+Unlike other uses of relative timesigns, an all-digit duration without `:` is
+minutes for `mod`: `mod +20` adds 20 minutes, while `mod +1:20` adds 1h20m.
+`+0` and friends are still errors, and the 5-minute flooring is irrelevant here
+because only `DURATION` is used.
 Absolute ranges still cannot cross midnight, and the resulting span must not
 overlap another entry.
 
