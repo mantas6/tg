@@ -1994,6 +1994,22 @@ func TestResolveUpdateProjectRequiresScope(t *testing.T) {
 	}
 }
 
+// updateSince/updateNow are the entry-pull window used by the update tests.
+var (
+	updateSince = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	updateNow   = time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+)
+
+// updateEntriesJSON is the /me/time_entries payload served to the update tests:
+// one entry in project 1 (Backend) and one in project 2 (Payments).
+const updateEntriesJSON = `[
+  {"id":1,"workspace_id":1,"project_id":1,"description":"backend",
+   "start":"2026-01-02T09:00:00Z","stop":"2026-01-02T09:30:00Z",
+   "duration":1800,"at":"2026-01-02T09:30:00Z"},
+  {"id":2,"workspace_id":1,"project_id":2,"description":"payments",
+   "start":"2026-01-02T10:00:00Z","stop":"2026-01-02T10:30:00Z",
+   "duration":1800,"at":"2026-01-02T10:30:00Z"}]`
+
 // TestUpdateScopedToOneProject verifies update fetches only the selected
 // project's metadata and tasks (never the whole workspace) and upserts them
 // without wiping other projects' cached tasks.
@@ -2009,6 +2025,8 @@ func TestUpdateScopedToOneProject(t *testing.T) {
 			w.Write([]byte(`{"id":2,"workspace_id":1,"name":"Payments","billable":true,"active":true}`))
 		case "/workspaces/1/projects/2/tasks":
 			w.Write([]byte(`[{"id":21,"workspace_id":1,"project_id":2,"name":"New payment task","active":true}]`))
+		case "/me/time_entries":
+			w.Write([]byte(`[]`))
 		default:
 			t.Errorf("unexpected path %q (update must not sync all projects)", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -2019,7 +2037,7 @@ func TestUpdateScopedToOneProject(t *testing.T) {
 
 	pid := int64(2)
 	var buf bytes.Buffer
-	if err := cmdUpdate(&buf, s, c, 1, &pid, "", false, false); err != nil {
+	if err := cmdUpdate(&buf, s, c, 1, &pid, "", updateSince, updateNow, false, false); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	// update is quiet: no progress or summary lines in human mode.
@@ -2027,9 +2045,11 @@ func TestUpdateScopedToOneProject(t *testing.T) {
 		t.Errorf("output = %q, want no output", buf.String())
 	}
 
-	// Only the single-project endpoints were hit.
+	// Only the single-project endpoints (plus the entry pull) were hit.
 	for _, p := range paths {
-		if p != "/workspaces/1/projects/2" && p != "/workspaces/1/projects/2/tasks" {
+		switch p {
+		case "/workspaces/1/projects/2", "/workspaces/1/projects/2/tasks", "/me/time_entries":
+		default:
 			t.Errorf("unexpected request path %q", p)
 		}
 	}
@@ -2048,8 +2068,58 @@ func TestUpdateScopedToOneProject(t *testing.T) {
 	}
 }
 
+// TestUpdatePullsRecentEntries verifies update also reconciles time entries: it
+// asks Toggl for everything modified since the window start and, being scoped
+// to one project, keeps other projects' entries out and the last_pull watermark
+// untouched so a later full `tg pull` still sees them.
+func TestUpdatePullsRecentEntries(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var gotSince string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/workspaces/1/projects/2":
+			w.Write([]byte(`{"id":2,"workspace_id":1,"name":"Payments","billable":true,"active":true}`))
+		case "/workspaces/1/projects/2/tasks":
+			w.Write([]byte(`[]`))
+		case "/me/time_entries":
+			gotSince = r.URL.Query().Get("since")
+			w.Write([]byte(updateEntriesJSON))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+
+	pid := int64(2)
+	var buf bytes.Buffer
+	if err := cmdUpdate(&buf, s, c, 1, &pid, "", updateSince, updateNow, false, false); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	// The window start is passed through to the API as a unix timestamp.
+	if want := "1767225600"; gotSince != want { // 2026-01-01T00:00:00Z
+		t.Errorf("since = %q, want %q", gotSince, want)
+	}
+	// Only the scoped project's entry landed locally.
+	if got, _ := s.EntryByRemoteID(2); got == nil {
+		t.Error("payments entry should be inserted by a project-2 update")
+	}
+	if got, _ := s.EntryByRemoteID(1); got != nil {
+		t.Error("backend entry should be ignored by a project-2 update")
+	}
+	// A scoped pull is partial: the watermark must stay untouched.
+	if _, ok, _ := s.GetMeta(store.MetaLastPull); ok {
+		t.Error("update should not advance last_pull (it is a scoped pull)")
+	}
+}
+
 // TestUpdateJSONStillReports pins that making `tg update` quiet only silenced
-// human mode: --json keeps emitting the machine-readable summary.
+// human mode: --json keeps emitting the machine-readable summary, now including
+// the entry-pull counts.
 func TestUpdateJSONStillReports(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
@@ -2058,6 +2128,8 @@ func TestUpdateJSONStillReports(t *testing.T) {
 		switch r.URL.Path {
 		case "/workspaces/1/projects/2":
 			w.Write([]byte(`{"id":2,"workspace_id":1,"name":"Payments","billable":true,"active":true}`))
+		case "/me/time_entries":
+			w.Write([]byte(updateEntriesJSON))
 		default:
 			w.Write([]byte(`[{"id":21,"workspace_id":1,"project_id":2,"name":"New payment task","active":true}]`))
 		}
@@ -2067,13 +2139,79 @@ func TestUpdateJSONStillReports(t *testing.T) {
 
 	pid := int64(2)
 	var buf bytes.Buffer
-	if err := cmdUpdate(&buf, s, c, 1, &pid, "", false, true); err != nil {
+	if err := cmdUpdate(&buf, s, c, 1, &pid, "", updateSince, updateNow, false, true); err != nil {
 		t.Fatalf("update --json: %v", err)
 	}
 	out := buf.String()
-	for _, want := range []string{`"project":"Payments"`, `"tasks":1`} {
+	for _, want := range []string{`"project":"Payments"`, `"tasks":1`, `"inserted":1`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("json output = %q, want %s", out, want)
+		}
+	}
+}
+
+// TestResolveUpdateSinceDefault pins `tg update`'s default window: one calendar
+// day back, aligned to midnight rather than a rolling 24h cut.
+func TestResolveUpdateSinceDefault(t *testing.T) {
+	now := time.Date(2026, 1, 2, 15, 30, 0, 0, time.UTC)
+	got := resolveUpdateSince(updateDefaultDays, now, time.UTC)
+	want := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("since = %v, want %v", got, want)
+	}
+}
+
+// TestResolveUpdateSinceDays verifies --days/-n walks the window start back a
+// whole number of calendar days, with 0 meaning today only.
+func TestResolveUpdateSinceDays(t *testing.T) {
+	now := time.Date(2026, 1, 2, 15, 30, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		days int
+		want time.Time
+	}{
+		{0, time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)},
+		{3, time.Date(2025, 12, 30, 0, 0, 0, 0, time.UTC)},
+		{-5, time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)}, // clamped to today
+	} {
+		if got := resolveUpdateSince(tc.days, now, time.UTC); !got.Equal(tc.want) {
+			t.Errorf("resolveUpdateSince(%d) = %v, want %v", tc.days, got, tc.want)
+		}
+	}
+}
+
+// TestUpdateDaysFlagAliases pins how runUpdate wires --days/-n: both spellings
+// share one variable and one default, and (thanks to parseArgsAndFlags) may
+// follow the project fragment, as in `tg update backend -n 3`.
+func TestUpdateDaysFlagAliases(t *testing.T) {
+	newFS := func() (*flag.FlagSet, *int) {
+		fs := flag.NewFlagSet("update", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		days := new(int)
+		fs.IntVar(days, "days", updateDefaultDays, "")
+		fs.IntVar(days, "n", updateDefaultDays, "")
+		return fs, days
+	}
+
+	for _, tc := range []struct {
+		args     []string
+		wantDays int
+		wantFrag string
+	}{
+		{[]string{"backend"}, updateDefaultDays, "backend"},
+		{[]string{"backend", "-n", "3"}, 3, "backend"},
+		{[]string{"--days", "7", "backend"}, 7, "backend"},
+		{[]string{"backend", "--days=2"}, 2, "backend"},
+	} {
+		fs, days := newFS()
+		rest, err := parseArgsAndFlags(fs, tc.args)
+		if err != nil {
+			t.Fatalf("parse %v: %v", tc.args, err)
+		}
+		if *days != tc.wantDays {
+			t.Errorf("parse %v: days = %d, want %d", tc.args, *days, tc.wantDays)
+		}
+		if frag := strings.Join(rest, " "); frag != tc.wantFrag {
+			t.Errorf("parse %v: fragment = %q, want %q", tc.args, frag, tc.wantFrag)
 		}
 	}
 }

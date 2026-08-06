@@ -498,16 +498,27 @@ func cmdProjects(w io.Writer, st *store.Store, all, jsonOut bool) error {
 	return nil
 }
 
-// cmdUpdate refreshes the cached catalog for a SINGLE project (never the whole
-// workspace): its metadata plus its tasks are fetched and upserted. The project
-// is chosen by projectID (from TOGGL_PROJECT_ID) when set; otherwise fragment
-// must uniquely match a cached project name. Refreshing every project at once
-// is intentionally disallowed (see resolveUpdateProject).
+// cmdUpdate refreshes the local state for a SINGLE project (never the whole
+// workspace): its metadata plus its tasks are fetched and upserted, and its
+// recent time entries are pulled. The project is chosen by projectID (from
+// TOGGL_PROJECT_ID) when set; otherwise fragment must uniquely match a cached
+// project name. Refreshing every project at once is intentionally disallowed
+// (see resolveUpdateProject).
+//
+// The entry pull reconciles everything modified in [since, now] and is scoped
+// to the same project, so it is partial and leaves the last_pull watermark
+// untouched (see sync.Pull): a later `tg pull` still sees every other
+// project's changes. runUpdate derives since from --days/-n, which defaults to
+// one day back (see resolveUpdateSince).
+//
+// The catalog is refreshed BEFORE the entries: pulling self-heals the catalog
+// from each entry's meta payload (see sync.healCatalog), and doing it in this
+// order keeps ReplaceProjectTasks from wiping what the pull just healed.
 //
 // The command is quiet: in human mode it prints nothing at all (no progress or
 // summary lines) and reports only errors. Machine-readable output is still
 // available via --json.
-func cmdUpdate(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, projectID *int64, fragment string, all, jsonOut bool) error {
+func cmdUpdate(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, projectID *int64, fragment string, since, now time.Time, all, jsonOut bool) error {
 	pid, err := resolveUpdateProject(st, projectID, fragment)
 	if err != nil {
 		return err
@@ -526,9 +537,17 @@ func cmdUpdate(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, p
 	if err := st.ReplaceProjectTasks(*pid, toStoreTasks(tasks)); err != nil {
 		return err
 	}
+	entries, err := sync.Pull(st, c, pid, since, now)
+	if err != nil {
+		return err
+	}
 
 	if jsonOut {
-		return writeJSON(w, map[string]any{"project": project.Name, "tasks": len(tasks)})
+		return writeJSON(w, map[string]any{
+			"project": project.Name,
+			"tasks":   len(tasks),
+			"entries": entries,
+		})
 	}
 	return nil
 }

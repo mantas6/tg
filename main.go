@@ -259,7 +259,16 @@ func runUpdate(args []string) error {
 	fs := newFlagSet("update")
 	all := fs.Bool("all", false, "include inactive tasks")
 	jsonOut := fs.Bool("json", false, "emit JSON")
-	if err := fs.Parse(args); err != nil {
+	// --days and -n are aliases bound to the same variable: how many days back
+	// the time-entry pull reaches. The default is one day (see
+	// resolveUpdateSince).
+	var days int
+	fs.IntVar(&days, "days", updateDefaultDays, "pull entries from the last N days")
+	fs.IntVar(&days, "n", updateDefaultDays, "pull entries from the last N days (alias of --days)")
+	// Flags may follow the project fragment (`tg update backend -n 3`), so
+	// positionals are peeled off the same way `tg grep` does it.
+	rest, err := parseArgsAndFlags(fs, args)
+	if err != nil {
 		return err
 	}
 	cfg, err := config.Load()
@@ -271,8 +280,10 @@ func runUpdate(args []string) error {
 		return err
 	}
 	defer st.Close()
-	fragment := strings.Join(fs.Args(), " ")
-	return cmdUpdate(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectIDFromEnv(), fragment, *all, *jsonOut)
+	now := time.Now()
+	since := resolveUpdateSince(days, now, time.Local)
+	fragment := strings.Join(rest, " ")
+	return cmdUpdate(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectIDFromEnv(), fragment, since, now, *all, *jsonOut)
 }
 
 func runUpdateProjects(args []string) error {
@@ -517,6 +528,21 @@ func resolveSince(st *store.Store, sinceFlag string, now time.Time, loc *time.Lo
 	return now.AddDate(0, 0, -90), nil
 }
 
+// updateDefaultDays is `tg update`'s default entry window: one day back.
+const updateDefaultDays = 1
+
+// resolveUpdateSince turns `tg update`'s --days/-n count into the start of the
+// entry pull window: midnight in loc, days calendar days before now. The window
+// is day-aligned rather than a rolling 24h cut so `-n 1` means "since yesterday
+// morning" no matter what time it is run. A negative count is clamped to 0
+// (today only) instead of erroring, mirroring how cmdToday clamps --days.
+func resolveUpdateSince(days int, now time.Time, loc *time.Location) time.Time {
+	if days < 0 {
+		days = 0
+	}
+	return startOfDay(now, loc).AddDate(0, 0, -days)
+}
+
 // resolveTotalSince determines the `tg total` window start: an explicit --since
 // date (parsed in loc, mirroring resolveSince's format and error style), else
 // the default three calendar months before now.
@@ -569,7 +595,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  tasks                     list cached tasks                 [--all] [--json]")
 	fmt.Fprintln(w, "  grep <fragment>           list cached tasks matching it     [--all] [--json]")
 	fmt.Fprintln(w, "  projects                  list cached projects with ids     [--all] [--json]")
-	fmt.Fprintln(w, "  update <project>          refresh one project's tasks       [--all] [--json]")
+	fmt.Fprintln(w, "  update <project>          refresh a project's tasks and pull its recent")
+	fmt.Fprintln(w, "                            entries                 [--days N] [--all] [--json]")
 	fmt.Fprintln(w, "  update-projects           sync all workspace projects       [--all] [--json]")
 	fmt.Fprintln(w, "  push                      send local changes to Toggl       [--json]")
 	fmt.Fprintln(w, "  pull [project]            fetch changes; all projects, or one [--since DATE] [--json]")

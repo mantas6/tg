@@ -1,4 +1,3 @@
-- update command: should by default pull entries of 1 day old, add parameter --days/-n to specific count of days back
 - update command: should not sync projects
 - update-projects rename to "projects update"
 - status command: double the task length limit, remove "..."

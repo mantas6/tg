@@ -65,7 +65,7 @@ _tg() {
         'tasks:list cached tasks'
         'grep:list cached tasks matching a fragment'
         'projects:list cached projects with ids'
-        "update:refresh one project's tasks"
+        "update:refresh one project's tasks and pull its recent entries"
         'update-projects:sync all workspace projects'
         'push:send local changes to Toggl'
         "pull:fetch remote changes (all projects, or one)"
@@ -116,7 +116,10 @@ _tg() {
           _arguments '--all[include inactive projects]' '--json[emit JSON]'
           ;;
         update)
-          _arguments '--all[include inactive tasks]' '--json[emit JSON]' '*:project fragment:'
+          _arguments '--all[include inactive tasks]' '--json[emit JSON]' \
+            '--days[pull entries from the last N days]:days:' \
+            '-n[pull entries from the last N days (alias of --days)]:days:' \
+            '*:project fragment:'
           ;;
         update-projects)
           _arguments '--all[include inactive projects]' '--json[emit JSON]'

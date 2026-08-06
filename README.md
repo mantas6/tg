@@ -43,7 +43,7 @@ Refresh the local catalog, then record time:
 
 ```sh
 tg update-projects          # sync all workspace projects
-tg update <project>         # fetch tasks for one project
+tg update <project>         # fetch one project's tasks + its recent entries
 tg add +:20 <task>          # record the last 20 minutes against the task
 tg status                   # last entry, idle gap, today's total
 ```
@@ -223,7 +223,8 @@ commands:
   tasks                     list cached tasks                 [--all] [--json]
   grep <fragment>           list cached tasks matching it     [--all] [--json]
   projects                  list cached projects with ids     [--all] [--json]
-  update <project>          refresh one project's tasks       [--all] [--json]
+  update <project>          refresh a project's tasks and pull its recent
+                            entries                 [--days N] [--all] [--json]
   update-projects           sync all workspace projects       [--all] [--json]
   push                      send local changes to Toggl       [--json]
   pull [project]            fetch changes; all projects, or one [--since DATE] [--json]
@@ -252,6 +253,24 @@ tg push    # send local changes to Toggl
 `tg push` runs automatically (best-effort) when you `tg add`, so the entry shows
 up in the Toggl web app immediately. If the network is unavailable, the entry
 stays local and dirty until the next `tg push`.
+
+`tg update <project>` is the per-project refresh: it fetches the project's
+metadata and task list *and* pulls its recent time entries in one go.
+
+```sh
+tg update backend            # tasks + entries touched since yesterday
+tg update backend -n 7       # reach a week back instead
+tg update -n 0 backend       # today only
+```
+
+The entry window defaults to **one day back** and is set by `--days`/`-n`, a
+count of calendar days: the window starts at midnight that many days before
+today (so `-n 1` means "since yesterday morning" whatever time you run it, and
+`-n 0` means today only). Flags may come before or after the project name.
+Because the pull is scoped to a single project, it is partial: it never advances
+the `last_pull` watermark, so a later full `tg pull` still reconciles every
+other project. The command stays quiet on success; use `--json` for the
+project name, task count and pull counters.
 
 ### Environment
 
