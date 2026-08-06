@@ -184,13 +184,16 @@ func TestEntriesBetweenOrdering(t *testing.T) {
 	}
 }
 
-// TestLastEntry covers the query behind `tg status`: the newest entry by start
-// wins regardless of the day it falls on, deleted entries are skipped, and an
-// empty store yields nil.
+// TestLastEntry covers the shared resolution behind `tg status` and a bare
+// `tg mod`: the newest already-started entry of now's day wins, deleted entries
+// are skipped, and an empty store yields nil.
 func TestLastEntry(t *testing.T) {
 	s := openTest(t)
 
-	got, err := s.LastEntry()
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	now := day.Add(16 * time.Hour)
+
+	got, err := s.LastEntry(now)
 	if err != nil {
 		t.Fatalf("LastEntry (empty): %v", err)
 	}
@@ -198,7 +201,6 @@ func TestLastEntry(t *testing.T) {
 		t.Fatalf("LastEntry (empty) = %+v, want nil", got)
 	}
 
-	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
 	mk := func(start time.Time) int64 {
 		return mustCreate(t, s, Entry{
 			WorkspaceID: 1, Start: start, Stop: ptrTime(start.Add(time.Hour)),
@@ -209,7 +211,7 @@ func TestLastEntry(t *testing.T) {
 	mk(day.AddDate(0, 0, -3).Add(9 * time.Hour)) // an older day
 	newest := mk(day.Add(14 * time.Hour))
 
-	got, err = s.LastEntry()
+	got, err = s.LastEntry(now)
 	if err != nil {
 		t.Fatalf("LastEntry: %v", err)
 	}
@@ -221,12 +223,98 @@ func TestLastEntry(t *testing.T) {
 	if _, err := s.db.Exec("UPDATE entries SET deleted = 1 WHERE id = ?", newest); err != nil {
 		t.Fatal(err)
 	}
-	got, err = s.LastEntry()
+	got, err = s.LastEntry(now)
 	if err != nil {
 		t.Fatalf("LastEntry (deleted): %v", err)
 	}
 	if got == nil || !got.Start.Equal(day.Add(9*time.Hour)) {
 		t.Fatalf("LastEntry (deleted) = %+v, want the 09:00 entry", got)
+	}
+}
+
+// TestLastEntryIsTodayOnly pins the day scope: yesterday's entry is never the
+// last entry, however recent it is, so a day that has tracked nothing yet has
+// no last entry at all (rather than reaching back into history, which `tg mod`
+// may not edit anyway).
+func TestLastEntryIsTodayOnly(t *testing.T) {
+	s := openTest(t)
+
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	yesterdayEvening := day.Add(-2 * time.Hour) // 2026-01-01 22:00
+	mustCreate(t, s, Entry{
+		WorkspaceID: 1, Start: yesterdayEvening, Stop: ptrTime(yesterdayEvening.Add(time.Hour)),
+		Duration: 3600, UpdatedAt: yesterdayEvening,
+	})
+
+	// Just after midnight, yesterday's entry is already out of reach.
+	got, err := s.LastEntry(day.Add(30 * time.Minute))
+	if err != nil {
+		t.Fatalf("LastEntry: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("LastEntry = %+v, want nil (yesterday is history)", got)
+	}
+
+	// Anything tracked today becomes the last entry immediately, and the
+	// boundary is midnight itself.
+	midnight := mustCreate(t, s, Entry{
+		WorkspaceID: 1, Start: day, Stop: ptrTime(day.Add(time.Hour)),
+		Duration: 3600, UpdatedAt: day,
+	})
+	got, err = s.LastEntry(day.Add(30 * time.Minute))
+	if err != nil {
+		t.Fatalf("LastEntry: %v", err)
+	}
+	if got == nil || got.ID != midnight {
+		t.Fatalf("LastEntry = %+v, want id %d (today's 00:00 entry)", got, midnight)
+	}
+
+	// The same store, asked on the following day, is empty again.
+	got, err = s.LastEntry(day.AddDate(0, 0, 1).Add(9 * time.Hour))
+	if err != nil {
+		t.Fatalf("LastEntry (next day): %v", err)
+	}
+	if got != nil {
+		t.Fatalf("LastEntry (next day) = %+v, want nil", got)
+	}
+}
+
+// TestLastEntryIgnoresFutureStarts pins the other filter: an entry booked for
+// later today has not happened yet, so it is skipped by its START datetime and
+// the entry before it is still the last one. An entry starting exactly at now
+// has begun and counts.
+func TestLastEntryIgnoresFutureStarts(t *testing.T) {
+	s := openTest(t)
+
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	now := day.Add(12 * time.Hour)
+
+	earlier := mustCreate(t, s, Entry{
+		WorkspaceID: 1, Start: day.Add(9 * time.Hour),
+		Stop: ptrTime(day.Add(10 * time.Hour)), Duration: 3600, UpdatedAt: now,
+	})
+	// Three hours from now, same day: still in the future.
+	future := day.Add(15 * time.Hour)
+	mustCreate(t, s, Entry{
+		WorkspaceID: 1, Start: future, Stop: ptrTime(future.Add(time.Hour)),
+		Duration: 3600, UpdatedAt: now,
+	})
+
+	got, err := s.LastEntry(now)
+	if err != nil {
+		t.Fatalf("LastEntry: %v", err)
+	}
+	if got == nil || got.ID != earlier {
+		t.Fatalf("LastEntry = %+v, want id %d (the future entry must be filtered out)", got, earlier)
+	}
+
+	// Once now reaches its start, the later entry takes over.
+	got, err = s.LastEntry(future)
+	if err != nil {
+		t.Fatalf("LastEntry (at its start): %v", err)
+	}
+	if got == nil || !got.Start.Equal(future) {
+		t.Fatalf("LastEntry (at its start) = %+v, want the 15:00 entry", got)
 	}
 }
 
@@ -863,7 +951,7 @@ func TestSoftDeleteEntry(t *testing.T) {
 	if got, err := s.EntriesBetween(at.Add(-time.Hour), at.Add(2*time.Hour)); err != nil || len(got) != 0 {
 		t.Errorf("EntriesBetween = %v err=%v, want no entries", got, err)
 	}
-	if got, err := s.LastEntry(); err != nil || got != nil {
+	if got, err := s.LastEntry(delAt); err != nil || got != nil {
 		t.Errorf("LastEntry = %v err=%v, want nil", got, err)
 	}
 	if _, err := s.EntryByNum(1, at); !errors.Is(err, ErrNoEntryNum) {

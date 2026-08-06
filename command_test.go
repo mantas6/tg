@@ -613,6 +613,40 @@ func TestModLastEntryRelativeTimesign(t *testing.T) {
 	}
 }
 
+// TestModLastEntrySkipsFutureEntry covers the second half of the shared
+// resolution from mod's side: an entry booked for later today (here three hours
+// ahead of modNow) is not the last entry, so a bare `tg mod` still edits the
+// last thing actually tracked and leaves the future one alone.
+func TestModLastEntrySkipsFutureEntry(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s) // 09:00-10:00 and 10:00-11:00 on 2026-01-02
+
+	future := modNow.Add(3 * time.Hour) // 18:07, same day
+	futureStop := future.Add(time.Hour)
+	futureID, err := s.CreateEntry(store.Entry{
+		WorkspaceID: 1, ProjectID: p(1), TaskID: p(13),
+		Start: future, Stop: &futureStop, Duration: 3600, UpdatedAt: modNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if err := cmdMod(&buf, s, nil, 0, "+:30", "", false, modNow, time.UTC); err != nil {
+		t.Fatalf("mod: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "Modified: Code review") {
+		t.Errorf("output = %q, want the 10:00 entry, not the one starting later today", out)
+	}
+	if got := entryByID(t, s, entries[1].ID); got.Duration != 1800 {
+		t.Errorf("last entry duration = %d, want 1800", got.Duration)
+	}
+	if got := entryByID(t, s, futureID); got.Dirty || got.Duration != 3600 {
+		t.Errorf("future entry = %+v, want it untouched", got)
+	}
+}
+
 // TestModEntryByNumber verifies an explicit local number addresses that entry
 // (not the last one) and that an absolute timesign sets the range on the
 // ENTRY's own calendar day. Editing is restricted to today, so the entry's day
@@ -648,13 +682,14 @@ func TestModEntryByNumber(t *testing.T) {
 	}
 }
 
-// TestModRefusesEntryOlderThanToday covers the failsafe: once an entry's day is
-// over it is history, so `tg mod` refuses to touch it as the implicit last
-// entry, whether the edit is a retime or just a description. Nothing is
-// written, nothing is printed, and no request is made to Toggl. Addressing
-// yesterday's entry BY NUMBER cannot even reach the failsafe (numbers are
-// per-day, so today's numbering holds nothing); that is covered by
-// TestModNumberIsScopedToToday.
+// TestModRefusesEntryOlderThanToday covers where history becomes unreachable:
+// once an entry's day is over it is no longer the last entry (store.LastEntry
+// is today-only), so a bare `tg mod` has nothing to act on, whether the edit is
+// a retime or just a description. Nothing is written, nothing is printed, and
+// no request is made to Toggl. Addressing yesterday's entry BY NUMBER is just
+// as unreachable (numbers are per-day, so today's numbering holds nothing); see
+// TestModNumberIsScopedToToday. The store-level failsafe that backs both up
+// (store.ErrEntryTooOld) is covered in the store's own tests.
 func TestModRefusesEntryOlderThanToday(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
@@ -685,11 +720,10 @@ func TestModRefusesEntryOlderThanToday(t *testing.T) {
 	for _, tc := range cases {
 		var buf bytes.Buffer
 		err := cmdMod(&buf, s, c, tc.ref, tc.timesign, tc.desc, tc.setDesc, nextDay, time.UTC)
-		if !errors.Is(err, store.ErrEntryTooOld) {
-			t.Errorf("%s: err = %v, want store.ErrEntryTooOld", tc.name, err)
-		}
-		if err != nil && !strings.Contains(err.Error(), "2026-01-02") {
-			t.Errorf("%s: err = %v, want it to name the entry's day", tc.name, err)
+		if err == nil {
+			t.Errorf("%s: err = nil, want a refusal", tc.name)
+		} else if !strings.Contains(err.Error(), "today") {
+			t.Errorf("%s: err = %v, want it to say nothing was tracked today", tc.name, err)
 		}
 		if buf.Len() != 0 {
 			t.Errorf("%s: output = %q, want nothing written", tc.name, buf.String())
@@ -2583,6 +2617,64 @@ func TestCurrentCommandLastEntryAndGap(t *testing.T) {
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("json = %s, want it to contain %s", buf.String(), want)
 		}
+	}
+}
+
+// TestCurrentCommandIgnoresFutureEntry covers the shared last-entry resolution
+// from status's side: an entry that starts later today has not happened yet, so
+// the line still reports the last thing actually tracked (and the gap since it
+// stopped). The day total is the whole day's tracked time and does include it.
+func TestCurrentCommandIgnoresFutureEntry(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	start := time.Date(2026, 1, 2, 9, 15, 0, 0, time.UTC)
+	stop := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	future := time.Date(2026, 1, 2, 18, 0, 0, 0, time.UTC)
+	futureStop := time.Date(2026, 1, 2, 19, 0, 0, 0, time.UTC)
+	for _, e := range []store.Entry{
+		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(10), Start: start, Stop: &stop, Duration: 4500, UpdatedAt: stop},
+		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(12), Start: future, Stop: &futureStop, Duration: 3600, UpdatedAt: stop},
+	} {
+		if _, err := s.CreateEntry(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	now := time.Date(2026, 1, 2, 11, 25, 0, 0, time.UTC)
+	var buf bytes.Buffer
+	if err := cmdCurrent(&buf, s, now, time.UTC, false); err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	want := "Fix login bug [Backend] 09:15-10:30 (gap 0h55m) Today: 2h15m\n"
+	if buf.String() != want {
+		t.Errorf("status = %q, want %q", buf.String(), want)
+	}
+}
+
+// TestCurrentCommandIgnoresYesterday pins the day scope: a new day starts with
+// no last entry rather than reporting yesterday's, so status says so instead of
+// showing a stale line with an overnight gap.
+func TestCurrentCommandIgnoresYesterday(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	start := time.Date(2026, 1, 1, 16, 0, 0, 0, time.UTC)
+	stop := time.Date(2026, 1, 1, 17, 0, 0, 0, time.UTC)
+	if _, err := s.CreateEntry(store.Entry{
+		WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
+		Start: start, Stop: &stop, Duration: 3600, UpdatedAt: stop,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 1, 2, 9, 30, 0, 0, time.UTC)
+	var buf bytes.Buffer
+	if err := cmdCurrent(&buf, s, now, time.UTC, false); err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	if want := "No entries. Today: 0h00m\n"; buf.String() != want {
+		t.Errorf("status = %q, want %q", buf.String(), want)
 	}
 }
 

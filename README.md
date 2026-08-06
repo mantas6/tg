@@ -87,8 +87,9 @@ tg add 9-:30 --desc "reset password flow" <task>
 
 `mod` edits an entry that already exists and `del` removes one. Both address
 entries by the small per-day numbers printed by `tg ls` (see below), resolved on
-today's day; `mod` also defaults to the most recent entry when no number is
-given.
+today's day; `mod` also defaults to *the last entry* when no number is given —
+the same one `tg status` reports, resolved the same way: today's newest entry
+that has already started (see below).
 
 ```sh
 tg mod +:30                      # the last entry was 30 minutes long
@@ -174,11 +175,23 @@ Code review [Backend] 10:30-11:00 (gap 0h25m) Today: 6h30m
 ```
 
 The task name is cut to 60 characters (no ellipsis marker) so the line fits a
-status bar. The
-gap only appears once now has moved past the entry's stop, and it deliberately
-spans days, so a stale `gap 20h00m` tells you nothing has been tracked since
-yesterday. An entry that is still running in Toggl (pulled by `tg pull`) is
-reported as running with its live elapsed time instead:
+status bar. The gap only appears once now has moved past the entry's stop.
+
+**The last entry is always today's**, and it is the single notion of "last
+entry" in tg: `tg status` and a bare `tg mod` resolve it through the same
+function, so they can never disagree about what they are talking about. Two
+things are filtered out:
+
+- **earlier days.** A new day starts with no last entry (`No entries. Today:
+  0h00m`) rather than showing yesterday's — which `tg mod` could not edit
+  anyway, since only today's entries can be modified.
+- **entries that start later today.** Something booked three hours from now has
+  not happened yet, so it is skipped by its *start* time; the last entry is
+  still the one before it. (It does count towards the day's total, which is the
+  whole day's tracked time.)
+
+An entry that is still running in Toggl (pulled by `tg pull`) is reported as
+running with its live elapsed time instead, whatever day it began on:
 
 ```sh
 $ tg status
@@ -246,10 +259,11 @@ timesign: absolute 9-:30, 10-11, 10:30-11:15 (today) or relative
       +:20, +1, +1:20 (that long, ending at the last 5m mark).
       Full spec: docs/timesig.md
 mod:  numbers are the per-day ones shown by `tg ls`; without one the
-      last entry is modified. Only TODAY's entries can be modified. An absolute
-      timesign sets the range on the entry's own day; a relative one
-      only sets its LENGTH, keeping the start (`tg mod +:30` makes the
-      entry 30m long).
+      last entry is modified: today's newest already-started entry, the
+      same one `tg status` shows. Only TODAY's entries can be modified.
+      An absolute timesign sets the range on the entry's own day; a
+      relative one only sets its LENGTH, keeping the start (`tg mod
+      +:30` makes the entry 30m long).
 ```
 
 ### Syncing

@@ -224,12 +224,31 @@ func (s *Store) Running() (*Entry, error) {
 	return &e, nil
 }
 
-// LastEntry returns the most recently started non-deleted entry, or nil when
-// the store holds none. It is not restricted to a day, so `tg status` can report
-// the last thing tracked even when nothing was tracked today.
-func (s *Store) LastEntry() (*Entry, error) {
-	row := s.db.QueryRow(entrySelect +
-		" WHERE e.deleted = 0 ORDER BY e.start DESC, e.id DESC LIMIT 1")
+// LastEntry is the one place tg resolves what "the last entry" means: both
+// `tg status` and a bare `tg mod` (no entry number) take their subject from
+// here. It returns the most recently started non-deleted entry that has already
+// begun on now's calendar day — reckoned in the store's location, see OpenIn —
+// or nil when that day holds none.
+//
+// Two filters are what make it the last thing actually tracked rather than the
+// newest row in the table:
+//
+//   - Today only. An entry from an earlier day is never returned, so a new day
+//     starts without a last entry instead of reaching back into history. That
+//     also keeps the implicit target of `tg mod` inside the only day an edit may
+//     touch (see CheckEditableDay), so the two can never disagree.
+//   - No future starts. An entry booked for later today has not happened yet, so
+//     it is skipped by its START datetime: with something starting three hours
+//     from now, the last entry is still the one before it. Its stop is
+//     irrelevant, only where it begins.
+//
+// A running entry is an ordinary candidate here (it started in the past);
+// `tg status` separately prefers one over a newer finished entry (see Running).
+func (s *Store) LastEntry(now time.Time) (*Entry, error) {
+	from := dayStart(now, s.Location())
+	row := s.db.QueryRow(entrySelect+`
+WHERE e.deleted = 0 AND e.start >= ? AND e.start <= ?
+ORDER BY e.start DESC, e.id DESC LIMIT 1`, fmtTime(from), fmtTime(now))
 	e, err := scanEntry(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil

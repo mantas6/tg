@@ -113,8 +113,9 @@ func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, proj
 // its description, or both. At least one change must be requested.
 //
 // ref selects the entry: its number on today's listing (see store.EntryByNum;
-// the numbering is per-day and persistent), or 0 meaning "the most recent
-// entry" (store.LastEntry).
+// the numbering is per-day and persistent), or 0 meaning "the last entry",
+// resolved by store.LastEntry exactly as `tg status` resolves it — today only
+// and never something that starts later today.
 //
 // The timesign is interpreted by form (see docs/timesig.md):
 //
@@ -194,20 +195,22 @@ func cmdMod(w io.Writer, st *store.Store, c *api.Client, ref int, timesign, desc
 	return nil
 }
 
-// modTarget resolves the entry `tg mod` acts on: the local number ref when it is
-// positive, otherwise the most recent entry. Numbers are per-day (see
-// store.EntryByNum), so a number is looked up on now's calendar day — which is
-// also the only day mod may write to.
+// modTarget resolves the entry `tg mod` acts on: the local number ref when it
+// is positive, otherwise the last entry (store.LastEntry, the shared
+// resolution `tg status` also reports). Both are scoped to now's calendar day —
+// numbers are per-day (see store.EntryByNum) and the last entry is today's —
+// which is also the only day mod may write to, so an unaddressable entry is
+// reported as missing rather than as a refused edit.
 func modTarget(st *store.Store, ref int, now time.Time) (store.Entry, error) {
 	if ref > 0 {
 		return st.EntryByNum(ref, now)
 	}
-	last, err := st.LastEntry()
+	last, err := st.LastEntry(now)
 	if err != nil {
 		return store.Entry{}, err
 	}
 	if last == nil {
-		return store.Entry{}, errors.New("no entries to modify")
+		return store.Entry{}, errors.New("no entry tracked today to modify")
 	}
 	return *last, nil
 }
@@ -366,16 +369,18 @@ func cmdTotal(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, fr
 // A running entry wins over a newer finished one. tg itself never starts a
 // timer, so a running entry can only arrive from a `tg pull` of remote data;
 // when one exists it is still what the user is tracking and is reported as
-// running. Otherwise the newest entry by start time is used, regardless of the
-// day it falls on (see store.LastEntry), so the status line is never empty just
-// because nothing was tracked today. The total always covers today only.
+// running, whatever day it began on. Otherwise the entry comes from the shared
+// resolution `tg mod` also uses (store.LastEntry): today's newest entry that has
+// already started, so a fresh day reports no entry rather than yesterday's, and
+// something booked for later today is not mistaken for the last thing tracked.
+// The total always covers today only.
 func cmdCurrent(w io.Writer, st *store.Store, now time.Time, loc *time.Location, jsonOut bool) error {
 	last, err := st.Running()
 	if err != nil {
 		return err
 	}
 	if last == nil {
-		if last, err = st.LastEntry(); err != nil {
+		if last, err = st.LastEntry(now); err != nil {
 			return err
 		}
 	}
