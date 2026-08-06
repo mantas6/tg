@@ -494,8 +494,8 @@ func TestTruncName(t *testing.T) {
 	}{
 		{"short unchanged", "Code review", 30, "Code review", 11},
 		{"exact fits", "123456789012345678901234567890", 30, "123456789012345678901234567890", 30},
-		{"overflow truncated", "This task name is definitely way too long", 30, "This task name is definitely …", 30},
-		{"multibyte counted by rune", strings.Repeat("é", 40), 30, strings.Repeat("é", 29) + "…", 30},
+		{"overflow truncated", "This task name is definitely way too long", 30, "This task name is definitely w", 30},
+		{"multibyte counted by rune", strings.Repeat("é", 40), 30, strings.Repeat("é", 30), 30},
 	}
 	for _, c := range cases {
 		got := truncName(c.in, c.max)
@@ -512,7 +512,7 @@ func TestRenderCurrentTruncatesName(t *testing.T) {
 	start := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
 	now := time.Date(2026, 1, 2, 11, 15, 0, 0, time.UTC)
 	e := store.Entry{
-		ID: 12, TaskName: "This task name is definitely way too long",
+		ID: 12, TaskName: "This task name is definitely way too long to fit on one short line",
 		ProjectName: "Backend", Start: start, Duration: -1,
 	}
 	var buf bytes.Buffer
@@ -523,8 +523,30 @@ func TestRenderCurrentTruncatesName(t *testing.T) {
 	if strings.Contains(got, "since") {
 		t.Errorf("status line still shows wall-clock start: %q", got)
 	}
-	want := "run This task name is definitely … [Backend] (0h45m) Today: 0h45m\n"
+	if strings.Contains(got, "…") || strings.Contains(got, "...") {
+		t.Errorf("status line still shows an ellipsis marker: %q", got)
+	}
+	want := "run This task name is definitely way too long to fit on one shor [Backend] (0h45m) Today: 0h45m\n"
 	if got != want {
+		t.Errorf("status line = %q, want %q", got, want)
+	}
+}
+
+// A name at or under the (doubled) status cap must pass through untouched.
+func TestRenderCurrentKeepsNameUnderNewLimit(t *testing.T) {
+	start := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	now := time.Date(2026, 1, 2, 11, 15, 0, 0, time.UTC)
+	name := "This task name is definitely way too long" // 41 runes: fit under 60
+	e := store.Entry{
+		ID: 12, TaskName: name,
+		ProjectName: "Backend", Start: start, Duration: -1,
+	}
+	var buf bytes.Buffer
+	if err := renderCurrent(&buf, &e, 45*time.Minute, now, time.UTC, false); err != nil {
+		t.Fatal(err)
+	}
+	want := "run " + name + " [Backend] (0h45m) Today: 0h45m\n"
+	if got := buf.String(); got != want {
 		t.Errorf("status line = %q, want %q", got, want)
 	}
 }

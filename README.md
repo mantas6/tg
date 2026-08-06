@@ -170,7 +170,8 @@ $ tg status
 Code review [Backend] 10:30-11:00 (gap 0h25m) Today: 6h30m
 ```
 
-The task name is truncated to 30 characters so the line fits a status bar. The
+The task name is cut to 60 characters (no ellipsis marker) so the line fits a
+status bar. The
 gap only appears once now has moved past the entry's stop, and it deliberately
 spans days, so a stale `gap 20h00m` tells you nothing has been tracked since
 yesterday. An entry that is still running in Toggl (pulled by `tg pull`) is

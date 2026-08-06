@@ -74,16 +74,16 @@ func renderEntryChange(w io.Writer, verb string, e store.Entry, loc *time.Locati
 
 // statusNameMax caps the task name shown by `status`/`current` so the terse
 // status line stays short enough for a status bar.
-const statusNameMax = 30
+const statusNameMax = 60
 
-// truncName shortens s to at most max runes, appending an ellipsis when it
-// overflows. The returned string (ellipsis included) never exceeds max runes.
+// truncName hard-cuts s to at most max runes. No ellipsis marker is appended,
+// so the result is a plain prefix of s and never exceeds max runes.
 func truncName(s string, max int) string {
 	r := []rune(s)
 	if len(r) <= max {
 		return s
 	}
-	return string(r[:max-1]) + "…"
+	return string(r[:max])
 }
 
 // displayDuration is the duration shown for an entry: live (un-rounded) elapsed

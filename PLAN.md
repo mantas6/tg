@@ -1,4 +1,3 @@
-- status command: double the task length limit, remove "..."
 - ls command: numbering should be persistent, new sequence for each day, the number should be an order of items inserted basically, if i delete an item the numbers are not renumbered
 - global last entry resolution function for `status` and `mod` (relative) methods. New last entry needs to always start from today. And the filter end date needs to filter out entries that start later today. If i have an entry later this day 3hrs let's say from now, it should be filtered out (by start datetime)
 - `mod` command: when used with "+" should work like this: the time specified after "+" needs to be not the task end time which is now, but rather an amount of time that needs to be added to the "last" entry from it's end time.
