@@ -1828,8 +1828,9 @@ func TestUpdateScopedToOneProject(t *testing.T) {
 	if err := cmdUpdate(&buf, s, c, 1, &pid, "", false, false); err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	if !strings.Contains(buf.String(), "Payments") {
-		t.Errorf("output = %q, want project name", buf.String())
+	// update is quiet: no progress or summary lines in human mode.
+	if buf.Len() != 0 {
+		t.Errorf("output = %q, want no output", buf.String())
 	}
 
 	// Only the single-project endpoints were hit.
@@ -1850,6 +1851,36 @@ func TestUpdateScopedToOneProject(t *testing.T) {
 	backend, _ := s.ListTasks(false, &p1)
 	if len(backend) == 0 {
 		t.Error("project 1 tasks should be untouched by a project-2 update")
+	}
+}
+
+// TestUpdateJSONStillReports pins that making `tg update` quiet only silenced
+// human mode: --json keeps emitting the machine-readable summary.
+func TestUpdateJSONStillReports(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/workspaces/1/projects/2":
+			w.Write([]byte(`{"id":2,"workspace_id":1,"name":"Payments","billable":true,"active":true}`))
+		default:
+			w.Write([]byte(`[{"id":21,"workspace_id":1,"project_id":2,"name":"New payment task","active":true}]`))
+		}
+	}))
+	defer srv.Close()
+	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+
+	pid := int64(2)
+	var buf bytes.Buffer
+	if err := cmdUpdate(&buf, s, c, 1, &pid, "", false, true); err != nil {
+		t.Fatalf("update --json: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{`"project":"Payments"`, `"tasks":1`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("json output = %q, want %s", out, want)
+		}
 	}
 }
 

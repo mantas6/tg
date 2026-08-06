@@ -453,22 +453,18 @@ func cmdProjects(w io.Writer, st *store.Store, all, jsonOut bool) error {
 // is chosen by projectID (from TOGGL_PROJECT_ID) when set; otherwise fragment
 // must uniquely match a cached project name. Refreshing every project at once
 // is intentionally disallowed (see resolveUpdateProject).
+//
+// The command is quiet: in human mode it prints nothing at all (no progress or
+// summary lines) and reports only errors. Machine-readable output is still
+// available via --json.
 func cmdUpdate(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, projectID *int64, fragment string, all, jsonOut bool) error {
 	pid, err := resolveUpdateProject(st, projectID, fragment)
 	if err != nil {
 		return err
 	}
-	// Progress lines go to the same writer as the summary, but only in human
-	// mode: suppressing them under --json keeps the JSON output clean.
-	if !jsonOut {
-		fmt.Fprintln(w, "Fetching project...")
-	}
 	project, err := c.Project(workspaceID, *pid)
 	if err != nil {
 		return err
-	}
-	if !jsonOut {
-		fmt.Fprintln(w, "Fetching tasks...")
 	}
 	tasks, err := c.ProjectTasks(workspaceID, *pid, all)
 	if err != nil {
@@ -484,7 +480,6 @@ func cmdUpdate(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, p
 	if jsonOut {
 		return writeJSON(w, map[string]any{"project": project.Name, "tasks": len(tasks)})
 	}
-	fmt.Fprintf(w, "Updated catalog for %s: %d tasks.\n", project.Name, len(tasks))
 	return nil
 }
 
