@@ -46,6 +46,8 @@ func run(cmd string, args []string) error {
 		return runToday(args)
 	case "tasks":
 		return runTasks(args)
+	case "grep":
+		return runGrep(args)
 	case "projects":
 		return runProjects(args)
 	case "update":
@@ -216,6 +218,26 @@ func runTasks(args []string) error {
 	}
 	defer st.Close()
 	return cmdTasks(os.Stdout, st, *all, projectIDFromEnv(), *jsonOut)
+}
+
+func runGrep(args []string) error {
+	fs := newFlagSet("grep")
+	all := fs.Bool("all", false, "include inactive tasks")
+	jsonOut := fs.Bool("json", false, "emit JSON")
+	// Flags may follow the fragment (`tg grep login --json`), so positionals
+	// are peeled off the same way `tg mod` does it.
+	rest, err := parseArgsAndFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	// All positionals form ONE fragment, exactly like `tg add`/`tg total`.
+	fragment := strings.Join(rest, " ")
+	return cmdGrep(os.Stdout, st, *all, projectIDFromEnv(), fragment, *jsonOut)
 }
 
 func runProjects(args []string) error {
@@ -545,6 +567,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  current | status          last entry, gap, day total        [--json]")
 	fmt.Fprintln(w, "  today   | list | ls       show today's entries     [--days N] [--json]")
 	fmt.Fprintln(w, "  tasks                     list cached tasks                 [--all] [--json]")
+	fmt.Fprintln(w, "  grep <fragment>           list cached tasks matching it     [--all] [--json]")
 	fmt.Fprintln(w, "  projects                  list cached projects with ids     [--all] [--json]")
 	fmt.Fprintln(w, "  update <project>          refresh one project's tasks       [--all] [--json]")
 	fmt.Fprintln(w, "  update-projects           sync all workspace projects       [--all] [--json]")
@@ -561,7 +584,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "      own day; a relative one only sets its LENGTH, keeping the start")
 	fmt.Fprintln(w, "      (`tg mod +:30` makes the entry 30m long).")
 	fmt.Fprintln(w, "sync: run `tg pull` then `tg push` for correct last-writer-wins.")
-	fmt.Fprintln(w, "env:  TOGGL_PROJECT_ID scopes `add`/`tasks`/`update` to one project")
+	fmt.Fprintln(w, "env:  TOGGL_PROJECT_ID scopes `add`/`tasks`/`grep`/`update` to one project")
 	fmt.Fprintln(w, "      (and sets the project on entries created by `add`). `pull`")
 	fmt.Fprintln(w, "      ignores it and always reconciles every project; pass a")
 	fmt.Fprintln(w, "      <project> name to `pull` to scope it explicitly. When unset,")

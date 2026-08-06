@@ -1238,6 +1238,200 @@ func TestTasksCommandProjectScope(t *testing.T) {
 	}
 }
 
+func TestGrepListsMatches(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdGrep(&buf, s, false, nil, "write", false); err != nil {
+		t.Fatalf("grep: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"Write docs", "Write tests", "[Backend]"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("grep output missing %q:\n%s", want, out)
+		}
+	}
+	for _, hidden := range []string{"Code review", "Payment fix"} {
+		if strings.Contains(out, hidden) {
+			t.Errorf("grep output should not list %q:\n%s", hidden, out)
+		}
+	}
+}
+
+func TestGrepCaseInsensitive(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdGrep(&buf, s, false, nil, "CODE REVIEW", false); err != nil {
+		t.Fatalf("grep: %v", err)
+	}
+	if !strings.Contains(buf.String(), "Code review") {
+		t.Errorf("grep should match case-insensitively:\n%s", buf.String())
+	}
+}
+
+// TestGrepExactDoesNotWin pins grep's key difference from `add`/`total`
+// matching: an exact name match must not suppress the other substring matches,
+// since grep exists to show every candidate.
+func TestGrepExactDoesNotWin(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	// "Fix" is an exact task name in the catalog; "Fix login bug" and
+	// "Payment fix" merely contain it, and all three must be listed.
+	if err := cmdGrep(&buf, s, false, nil, "fix", false); err != nil {
+		t.Fatalf("grep: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"Fix login bug", "Payment fix", "[Payments]"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("grep output missing %q:\n%s", want, out)
+		}
+	}
+	if lines := strings.Count(strings.TrimSpace(out), "\n") + 1; lines != 3 {
+		t.Errorf("grep listed %d lines, want 3:\n%s", lines, out)
+	}
+}
+
+func TestGrepJoinsFragment(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdGrep(&buf, s, false, nil, "code review", false); err != nil {
+		t.Fatalf("grep: %v", err)
+	}
+	if !strings.Contains(buf.String(), "Code review") {
+		t.Errorf("grep should match a multi-word fragment:\n%s", buf.String())
+	}
+}
+
+func TestGrepProjectScope(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	pid := int64(2) // Payments
+	var buf bytes.Buffer
+	if err := cmdGrep(&buf, s, false, &pid, "fix", false); err != nil {
+		t.Fatalf("grep: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Payment fix") {
+		t.Errorf("scoped grep should list Payment fix:\n%s", out)
+	}
+	if strings.Contains(out, "Fix login bug") {
+		t.Errorf("scoped grep should hide other projects' tasks:\n%s", out)
+	}
+}
+
+func TestGrepAllIncludesInactive(t *testing.T) {
+	s := newStore(t)
+	if err := s.ReplaceProjects([]store.Project{{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceTasks([]store.Task{
+		{ID: 10, WorkspaceID: 1, ProjectID: 1, Name: "Active task", Active: true},
+		{ID: 11, WorkspaceID: 1, ProjectID: 1, Name: "Retired task", Active: false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var active bytes.Buffer
+	if err := cmdGrep(&active, s, false, nil, "task", false); err != nil {
+		t.Fatalf("grep: %v", err)
+	}
+	if strings.Contains(active.String(), "Retired task") {
+		t.Errorf("active-only grep should hide inactive tasks:\n%s", active.String())
+	}
+
+	var all bytes.Buffer
+	if err := cmdGrep(&all, s, true, nil, "task", false); err != nil {
+		t.Fatalf("grep --all: %v", err)
+	}
+	if !strings.Contains(all.String(), "Retired task") {
+		t.Errorf("--all grep should include inactive tasks:\n%s", all.String())
+	}
+}
+
+func TestGrepNoMatch(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	err := cmdGrep(&buf, s, false, nil, "nothing here", false)
+	if err == nil {
+		t.Fatal("expected an error when nothing matches")
+	}
+	if !strings.Contains(err.Error(), "no task matches") || !strings.Contains(err.Error(), "tg update") {
+		t.Errorf("err = %v, want a no-match error suggesting `tg update`", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("grep should print nothing when it fails:\n%s", buf.String())
+	}
+}
+
+func TestGrepRequiresFragment(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	// An empty fragment is a usage error, not "list everything": that is
+	// `tg tasks`.
+	for _, frag := range []string{"", "   "} {
+		var buf bytes.Buffer
+		err := cmdGrep(&buf, s, false, nil, frag, false)
+		if err == nil || !strings.Contains(err.Error(), "usage: tg grep") {
+			t.Errorf("grep %q: err = %v, want a usage error", frag, err)
+		}
+	}
+}
+
+func TestGrepJSON(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdGrep(&buf, s, false, nil, "write", true); err != nil {
+		t.Fatalf("grep --json: %v", err)
+	}
+	var got []struct {
+		ID      int64  `json:"id"`
+		Name    string `json:"name"`
+		Project string `json:"project"`
+		Active  bool   `json:"active"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("json: %v (%s)", err, buf.String())
+	}
+	if len(got) != 2 {
+		t.Fatalf("matches = %d, want 2 (%s)", len(got), buf.String())
+	}
+	// Catalog order: project then task name, so Write docs precedes Write tests.
+	if got[0].Name != "Write docs" || got[0].Project != "Backend" || got[0].ID != 14 || !got[0].Active {
+		t.Errorf("matches[0] = %+v, want Write docs / Backend / 14 / active", got[0])
+	}
+	if got[1].Name != "Write tests" {
+		t.Errorf("matches[1] = %+v, want Write tests", got[1])
+	}
+}
+
+func TestGrepTasksPreservesOrder(t *testing.T) {
+	in := []store.Task{
+		{ID: 1, Name: "Fix login bug"},
+		{ID: 2, Name: "Code review"},
+		{ID: 3, Name: "Fix"},
+	}
+	got := grepTasks(in, "FIX")
+	if len(got) != 2 || got[0].ID != 1 || got[1].ID != 3 {
+		t.Errorf("grepTasks = %+v, want tasks 1 and 3 in input order", got)
+	}
+	if grepTasks(in, "  ") != nil {
+		t.Error("grepTasks with a blank fragment should match nothing")
+	}
+}
+
 func TestResolvePullProjectRequiresFragment(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)

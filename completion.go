@@ -63,6 +63,7 @@ _tg() {
         "list:show today's entries"
         "ls:show today's entries"
         'tasks:list cached tasks'
+        'grep:list cached tasks matching a fragment'
         'projects:list cached projects with ids'
         "update:refresh one project's tasks"
         'update-projects:sync all workspace projects'
@@ -107,6 +108,9 @@ _tg() {
           ;;
         tasks)
           _arguments '--all[include inactive tasks]' '--json[emit JSON]'
+          ;;
+        grep)
+          _arguments '--all[include inactive tasks]' '--json[emit JSON]' '*:task fragment:__tg_tasks'
           ;;
         projects)
           _arguments '--all[include inactive projects]' '--json[emit JSON]'

@@ -433,6 +433,56 @@ func cmdTasks(w io.Writer, st *store.Store, all bool, projectID *int64, jsonOut 
 	return nil
 }
 
+// cmdGrep lists every cached task whose name contains fragment
+// (case-insensitive), in the same shape as `tg tasks`. `--all` includes
+// inactive tasks and a non-nil projectID (from TOGGL_PROJECT_ID) scopes the
+// search to one project, exactly like cmdTasks.
+//
+// Unlike the fragment matching used by `add`/`total`
+// (store.FindTasksByFragment), grep never lets an exact name win over the
+// substring matches: the point of the command is to SEE every candidate, so a
+// task named "Fix" must not hide "Fix login bug". Ordering is the catalog's
+// (project, then task name).
+//
+// An empty fragment is a usage error rather than "list everything" (that is
+// what `tg tasks` is for), and finding nothing is an error too, so grep exits
+// non-zero when there is no match.
+func cmdGrep(w io.Writer, st *store.Store, all bool, projectID *int64, fragment string, jsonOut bool) error {
+	fragment = strings.TrimSpace(fragment)
+	if fragment == "" {
+		return errors.New("usage: tg grep <fragment>")
+	}
+	tasks, err := st.ListTasks(all, projectID)
+	if err != nil {
+		return err
+	}
+	matches := grepTasks(tasks, fragment)
+	if len(matches) == 0 {
+		return fmt.Errorf("no task matches %q; run `tg update` to refresh the catalog", fragment)
+	}
+	if jsonOut {
+		return renderTasksJSON(w, matches)
+	}
+	renderTasks(w, matches)
+	return nil
+}
+
+// grepTasks filters tasks down to those whose name contains fragment,
+// case-insensitively, preserving the input order (see cmdGrep).
+func grepTasks(tasks []store.Task, fragment string) []store.Task {
+	frag := strings.ToLower(strings.TrimSpace(fragment))
+	if frag == "" {
+		return nil
+	}
+	var out []store.Task
+	for _, t := range tasks {
+		if strings.Contains(strings.ToLower(t.Name), frag) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 // cmdProjects lists the locally cached project catalog with ids so the id can
 // be exported as TOGGL_PROJECT_ID to scope other commands. `--all` includes
 // inactive projects; refresh the cache with `tg update`.

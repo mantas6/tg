@@ -1,4 +1,3 @@
-- new command: 'tg grep' each for tasks by a fragment and list matches
 - update command: should by default pull entries of 1 day old, add parameter --days/-n to specific count of days back
 - update command: should not sync projects
 - update-projects rename to "projects update"

@@ -20,13 +20,13 @@ func TestCompletionZsh(t *testing.T) {
 		"tg tasks --json",
 		// Every command and alias accepted by run() must be offered.
 		"'auth:", "'add:", "'mod:", "'del:", "\"current:", "\"status:",
-		"\"today:", "\"list:", "\"ls:", "'tasks:", "'projects:",
+		"\"today:", "\"list:", "\"ls:", "'tasks:", "'grep:", "'projects:",
 		"\"update:", "'update-projects:", "'push:", "\"pull:", "'total:",
 		"'completion:", "'help:",
 		// Per-command argument handling for the commands with flags.
 		"        add)", "        mod)", "        del)",
 		"        current|status|push)", "        today|list|ls)",
-		"        tasks)", "        projects)", "        update)",
+		"        tasks)", "        grep)", "        projects)", "        update)",
 		"        update-projects)", "        pull)", "        total)",
 		"        completion)",
 		"--desc[", "--description[", "--json[", "--all[", "--since[", "--days[",
@@ -53,7 +53,7 @@ func TestCompletionCoversDispatch(t *testing.T) {
 	out := buf.String()
 	for _, cmd := range []string{
 		"auth", "add", "mod", "del", "current", "status", "today", "list",
-		"ls", "tasks", "projects", "update", "update-projects", "push",
+		"ls", "tasks", "grep", "projects", "update", "update-projects", "push",
 		"pull", "total", "completion", "help",
 	} {
 		if !strings.Contains(out, "'"+cmd+":") && !strings.Contains(out, `"`+cmd+":") {

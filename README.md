@@ -120,6 +120,26 @@ push, just like `add`, so a failed or skipped sync just leaves the change for th
 next `tg push`. A number that no longer resolves (the listing is stale, or the
 entry is gone) is an error telling you to re-run `tg ls`.
 
+`grep` searches the cached task catalog and lists every task whose name
+contains the fragment, case-insensitively. It is the way to find the exact
+wording of a task before recording against it (`tg tasks` lists everything;
+`grep` narrows it down):
+
+```sh
+tg grep login              # every task containing "login"
+tg grep code review        # one fragment: "code review"
+tg grep --all fix          # include inactive (archived) tasks
+tg grep login --json       # machine-readable, same shape as `tg tasks --json`
+```
+
+The arguments are joined into a single fragment and the output is the `tasks`
+listing restricted to the matches, name plus `[Project]`. Unlike the matching
+used by `add` and `total`, an exact name does **not** win over substrings: a
+task named `Fix` never hides `Fix login bug`, since the point is to see every
+candidate. `TOGGL_PROJECT_ID` scopes the search to one project. A fragment is
+required, and grep exits non-zero when nothing matches (run `tg update` if the
+catalog is stale).
+
 To see how much time you have tracked against particular tasks, use `total`.
 The hours come from the Toggl Reports API, while the task names come from the
 local catalog: report rows are joined to cached tasks by task id, because the
@@ -201,6 +221,7 @@ commands:
   current | status          last entry, gap, day total        [--json]
   today   | list | ls       show today's entries     [--days N] [--json]
   tasks                     list cached tasks                 [--all] [--json]
+  grep <fragment>           list cached tasks matching it     [--all] [--json]
   projects                  list cached projects with ids     [--all] [--json]
   update <project>          refresh one project's tasks       [--all] [--json]
   update-projects           sync all workspace projects       [--all] [--json]
@@ -234,7 +255,7 @@ stays local and dirty until the next `tg push`.
 
 ### Environment
 
-- `TOGGL_PROJECT_ID` scopes `add`, `tasks`, and `update` to one project (and
+- `TOGGL_PROJECT_ID` scopes `add`, `tasks`, `grep`, and `update` to one project (and
   sets the project on entries created by `add`). `pull` ignores it and always
   reconciles every project; pass a `<project>` name to `pull` to scope it
   explicitly. When unset, `update` requires a unique `<project>` name and
