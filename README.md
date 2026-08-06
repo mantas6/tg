@@ -86,8 +86,9 @@ tg add 9-:30 --desc "reset password flow" <task>
 ### Fixing and removing entries
 
 `mod` edits an entry that already exists and `del` removes one. Both address
-entries by the small local numbers printed by `tg ls` (see below); `mod` also
-defaults to the most recent entry when no number is given.
+entries by the small per-day numbers printed by `tg ls` (see below), resolved on
+today's day; `mod` also defaults to the most recent entry when no number is
+given.
 
 ```sh
 tg mod +:30                      # the last entry was 30 minutes long
@@ -117,8 +118,10 @@ range that would overlap a *different* entry, and `--desc ""` clears the
 description. `del` is a soft delete: the entry disappears from listings at once
 and the removal is pushed to Toggl. Both mark the entry dirty and best-effort
 push, just like `add`, so a failed or skipped sync just leaves the change for the
-next `tg push`. A number that no longer resolves (the listing is stale, or the
-entry is gone) is an error telling you to re-run `tg ls`.
+next `tg push`. Deleting an entry retires its number rather than renumbering the
+rest, so the numbers you just read stay valid. A number that does not resolve
+(nothing was numbered that high today, or that entry is gone) is an error
+telling you to re-run `tg ls`.
 
 `grep` searches the cached task catalog and lists every task whose name
 contains the fragment, case-insensitively. It is the way to find the exact
@@ -195,19 +198,26 @@ $ tg ls
 1  09:00-10:00 1h00m  Fix login bug     [Backend]
 2  10:00-11:00 1h00m  Code review       [Backend]
                (gap 0h30m)
-3  11:30-12:00 0h30m  Payment fix       [Payments]
+4  11:30-12:00 0h30m  Payment fix       [Payments]
                (gap 0h25m)
 ----------------------------------------
 Total: 2h30m
 ```
 
-The leading numbers are local references, renumbered 1..N on every `ls` and
-stored in the local database, so the listing you just looked at is what other
-commands address. Gap rows are not entries and carry no number: they show idle
-time between two entries, and the last one shows the idle time since the newest
-entry stopped (only within the same day, and never while an entry is running).
-`--days N` looks further back, `--json` emits the same data with `num` on each
-entry.
+The leading numbers are **persistent**. Each entry is given its number when it
+is recorded — including entries that arrive from a `tg pull` — so the numbers
+are the order things were added, they restart at 1 on every calendar day, and
+they never change. A deleted entry takes its number with it, which is why the
+listing above jumps from 2 to 4: numbers are never reused or shifted, so
+`tg del 4` keeps meaning the same entry no matter what else you removed first.
+
+Gap rows are not entries and carry no number: they show idle time between two
+entries, and the last one shows the idle time since the newest entry stopped
+(only within the same day, and never while an entry is running).
+
+`--days N` looks further back. Since every day has its own 1..N, a multi-day
+listing groups the entries under a date header; `mod`/`del` address today's
+numbers. `--json` emits the same data with `num` on each entry.
 
 ## Usage
 
@@ -235,8 +245,8 @@ commands:
 timesign: absolute 9-:30, 10-11, 10:30-11:15 (today) or relative
       +:20, +1, +1:20 (that long, ending at the last 5m mark).
       Full spec: docs/timesig.md
-mod:  numbers come from the last `tg ls`; without one the last entry
-      is modified. Only TODAY's entries can be modified. An absolute
+mod:  numbers are the per-day ones shown by `tg ls`; without one the
+      last entry is modified. Only TODAY's entries can be modified. An absolute
       timesign sets the range on the entry's own day; a relative one
       only sets its LENGTH, keeping the start (`tg mod +:30` makes the
       entry 30m long).

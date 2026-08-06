@@ -11,9 +11,12 @@ import (
 
 func ptrInt(v int64) *int64 { return &v }
 
+// openTest opens a throwaway store pinned to UTC, so the calendar the store
+// reckons entry days (and therefore the per-day numbering) in matches the UTC
+// timestamps the fixtures below use, whatever the test machine's zone is.
 func openTest(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "tg.db"))
+	s, err := OpenIn(filepath.Join(t.TempDir(), "tg.db"), time.UTC)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -65,7 +68,7 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);`); err != nil {
 	raw.Close()
 
 	// Open runs migrate, which must add the billable columns in place.
-	s, err := Open(path)
+	s, err := OpenIn(path, time.UTC)
 	if err != nil {
 		t.Fatalf("open (migrate): %v", err)
 	}
@@ -227,11 +230,11 @@ func TestLastEntry(t *testing.T) {
 	}
 }
 
-// TestEntryRefsRoundTrip covers the local numbering published by `tg ls`:
-// SaveEntryRefs numbers the ids 1..N in the given order, EntryByRef resolves
-// each number back to its entry (with the catalog joins intact), and unknown
-// numbers report ErrNoEntryRef.
-func TestEntryRefsRoundTrip(t *testing.T) {
+// TestEntrySeqPerDay covers the numbering handed out at insert time: entries
+// are numbered in insertion order, the sequence restarts at 1 on every calendar
+// day, and EntryByNum resolves a number back to its entry (with the catalog
+// joins intact) on the day it was given out on.
+func TestEntrySeqPerDay(t *testing.T) {
 	s := openTest(t)
 	if err := s.ReplaceProjects([]Project{{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true}}); err != nil {
 		t.Fatal(err)
@@ -240,51 +243,66 @@ func TestEntryRefsRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
-	mk := func(h int) int64 {
-		start := day.Add(time.Duration(h) * time.Hour)
+	next := day.AddDate(0, 0, 1)
+	mk := func(base time.Time, h int) int64 {
+		start := base.Add(time.Duration(h) * time.Hour)
 		return mustCreate(t, s, Entry{
 			WorkspaceID: 1, ProjectID: ptrInt(1), TaskID: ptrInt(10), Start: start,
 			Stop: ptrTime(start.Add(time.Hour)), Duration: 3600, UpdatedAt: start,
 		})
 	}
-	first, second, third := mk(9), mk(11), mk(13)
+	first, second, third := mk(day, 9), mk(day, 11), mk(day, 13)
+	tomorrow := mk(next, 9)
 
-	if err := s.SaveEntryRefs([]int64{first, second, third}); err != nil {
-		t.Fatalf("SaveEntryRefs: %v", err)
-	}
 	for num, wantID := range map[int]int64{1: first, 2: second, 3: third} {
-		got, err := s.EntryByRef(num)
+		got, err := s.EntryByNum(num, day)
 		if err != nil {
-			t.Fatalf("EntryByRef(%d): %v", num, err)
+			t.Fatalf("EntryByNum(%d): %v", num, err)
 		}
 		if got.ID != wantID {
-			t.Errorf("EntryByRef(%d).ID = %d, want %d", num, got.ID, wantID)
+			t.Errorf("EntryByNum(%d).ID = %d, want %d", num, got.ID, wantID)
 		}
+		if got.Seq != num {
+			t.Errorf("EntryByNum(%d).Seq = %d, want %d", num, got.Seq, num)
+		}
+	}
+
+	// The next day starts its own sequence at 1 rather than continuing.
+	got, err := s.EntryByNum(1, next)
+	if err != nil {
+		t.Fatalf("EntryByNum(1) on the next day: %v", err)
+	}
+	if got.ID != tomorrow {
+		t.Errorf("EntryByNum(1, next day).ID = %d, want %d", got.ID, tomorrow)
 	}
 
 	// The joined display fields come along, as they do for every entry read.
-	got, err := s.EntryByRef(1)
+	got, err = s.EntryByNum(1, day)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.TaskName != "Fix login bug" || got.ProjectName != "Backend" {
-		t.Errorf("EntryByRef(1) joins = %q/%q, want task and project names", got.TaskName, got.ProjectName)
+		t.Errorf("EntryByNum(1) joins = %q/%q, want task and project names", got.TaskName, got.ProjectName)
 	}
 
 	for _, num := range []int{0, 4, -1} {
-		if _, err := s.EntryByRef(num); !errors.Is(err, ErrNoEntryRef) {
-			t.Errorf("EntryByRef(%d) error = %v, want ErrNoEntryRef", num, err)
+		if _, err := s.EntryByNum(num, day); !errors.Is(err, ErrNoEntryNum) {
+			t.Errorf("EntryByNum(%d) error = %v, want ErrNoEntryNum", num, err)
 		}
 	}
-	if _, err := s.EntryByRef(4); err == nil || !strings.Contains(err.Error(), "tg ls") {
-		t.Errorf("EntryByRef error = %v, want it to point at `tg ls`", err)
+	if _, err := s.EntryByNum(4, day); err == nil || !strings.Contains(err.Error(), "tg ls") {
+		t.Errorf("EntryByNum error = %v, want it to point at `tg ls`", err)
+	}
+	// A day that has never held an entry resolves nothing either.
+	if _, err := s.EntryByNum(1, day.AddDate(0, 0, -1)); !errors.Is(err, ErrNoEntryNum) {
+		t.Errorf("EntryByNum(1) on an empty day = %v, want ErrNoEntryNum", err)
 	}
 }
 
-// TestSaveEntryRefsReplaces pins that each listing rewrites the whole mapping:
-// a shorter listing drops the numbers it did not use, and an empty one clears
-// the mapping instead of leaving stale numbers resolvable.
-func TestSaveEntryRefsReplaces(t *testing.T) {
+// TestEntrySeqSurvivesDeletion is the heart of the persistent numbering:
+// deleting an entry retires its number instead of sliding the later entries
+// down, and the number is not hand out again to the next insert.
+func TestEntrySeqSurvivesDeletion(t *testing.T) {
 	s := openTest(t)
 	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
 	mk := func(h int) int64 {
@@ -294,70 +312,136 @@ func TestSaveEntryRefsReplaces(t *testing.T) {
 			Duration: 3600, UpdatedAt: start,
 		})
 	}
-	a, b := mk(9), mk(11)
+	first, second, third := mk(9), mk(11), mk(13)
 
-	if err := s.SaveEntryRefs([]int64{a, b}); err != nil {
-		t.Fatal(err)
-	}
-	// A second, reversed and shorter listing renumbers from scratch.
-	if err := s.SaveEntryRefs([]int64{b}); err != nil {
-		t.Fatal(err)
-	}
-	got, err := s.EntryByRef(1)
-	if err != nil {
-		t.Fatalf("EntryByRef(1): %v", err)
-	}
-	if got.ID != b {
-		t.Errorf("EntryByRef(1).ID = %d, want %d", got.ID, b)
-	}
-	if _, err := s.EntryByRef(2); !errors.Is(err, ErrNoEntryRef) {
-		t.Errorf("EntryByRef(2) error = %v, want ErrNoEntryRef after renumbering", err)
+	if err := s.SoftDeleteEntry(second, day.Add(20*time.Hour)); err != nil {
+		t.Fatalf("SoftDeleteEntry: %v", err)
 	}
 
-	if err := s.SaveEntryRefs(nil); err != nil {
+	// The survivors keep the numbers they were listed under...
+	for num, wantID := range map[int]int64{1: first, 3: third} {
+		got, err := s.EntryByNum(num, day)
+		if err != nil {
+			t.Fatalf("EntryByNum(%d) after delete: %v", num, err)
+		}
+		if got.ID != wantID {
+			t.Errorf("EntryByNum(%d).ID = %d, want %d (numbers must not shift)", num, got.ID, wantID)
+		}
+	}
+	// ...and the freed number stays vacant rather than resolving to a
+	// neighbour.
+	if _, err := s.EntryByNum(2, day); !errors.Is(err, ErrNoEntryNum) {
+		t.Errorf("EntryByNum(2) after delete = %v, want ErrNoEntryNum", err)
+	}
+
+	// A hard delete (what a pushed deletion leaves behind) behaves the same,
+	// and the next insert continues past the highest number ever used.
+	if err := s.DeleteRow(second); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.EntryByRef(1); !errors.Is(err, ErrNoEntryRef) {
-		t.Errorf("EntryByRef(1) error = %v, want ErrNoEntryRef after clearing", err)
+	if _, err := s.EntryByNum(2, day); !errors.Is(err, ErrNoEntryNum) {
+		t.Errorf("EntryByNum(2) after row removal = %v, want ErrNoEntryNum", err)
+	}
+	fourth := mk(15)
+	got, err := s.EntryByNum(4, day)
+	if err != nil || got.ID != fourth {
+		t.Fatalf("EntryByNum(4) = %+v err=%v, want the new entry %d", got, err, fourth)
 	}
 }
 
-// TestEntryByRefStale covers a number left pointing at an entry that was
-// deleted since the listing: it must read as a stale number, not resolve.
-func TestEntryByRefStale(t *testing.T) {
+// TestEntryByNumIgnoresOtherDays keeps a number from reaching across days: the
+// same number exists on both days and each resolves to its own entry.
+func TestEntryByNumIgnoresOtherDays(t *testing.T) {
 	s := openTest(t)
-	start := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
-	id := mustCreate(t, s, Entry{
-		WorkspaceID: 1, Start: start, Stop: ptrTime(start.Add(time.Hour)),
-		Duration: 3600, UpdatedAt: start,
+	day := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
+	older := day.AddDate(0, 0, -1)
+	oldID := mustCreate(t, s, Entry{
+		WorkspaceID: 1, Start: older, Stop: ptrTime(older.Add(time.Hour)),
+		Duration: 3600, UpdatedAt: older,
 	})
-	if err := s.SaveEntryRefs([]int64{id}); err != nil {
-		t.Fatal(err)
-	}
+	newID := mustCreate(t, s, Entry{
+		WorkspaceID: 1, Start: day, Stop: ptrTime(day.Add(time.Hour)),
+		Duration: 3600, UpdatedAt: day,
+	})
 
-	// Soft-deleted (pending a push) entries are not listed, so not addressable.
-	if _, err := s.db.Exec("UPDATE entries SET deleted = 1 WHERE id = ?", id); err != nil {
-		t.Fatal(err)
+	for _, tc := range []struct {
+		when time.Time
+		want int64
+	}{{older, oldID}, {day, newID}} {
+		got, err := s.EntryByNum(1, tc.when)
+		if err != nil {
+			t.Fatalf("EntryByNum(1, %s): %v", tc.when.Format("2006-01-02"), err)
+		}
+		if got.ID != tc.want {
+			t.Errorf("EntryByNum(1, %s).ID = %d, want %d",
+				tc.when.Format("2006-01-02"), got.ID, tc.want)
+		}
 	}
-	if _, err := s.EntryByRef(1); !errors.Is(err, ErrNoEntryRef) {
-		t.Errorf("EntryByRef(1) error = %v, want ErrNoEntryRef for a deleted entry", err)
-	}
-
-	// Hard-deleted rows behave the same.
-	if err := s.DeleteRow(id); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.EntryByRef(1); !errors.Is(err, ErrNoEntryRef) {
-		t.Errorf("EntryByRef(1) error = %v, want ErrNoEntryRef for a removed entry", err)
+	// The error names the day that was searched, so a number that only exists
+	// on another day does not read as a mystery.
+	_, err := s.EntryByNum(2, day)
+	if !errors.Is(err, ErrNoEntryNum) || !strings.Contains(err.Error(), "2026-01-02") {
+		t.Errorf("EntryByNum(2) = %v, want ErrNoEntryNum naming 2026-01-02", err)
 	}
 }
 
-// TestMigrateAddsEntryRefs covers the v3 upgrade of a pre-existing database:
-// the entry_refs table is created in place so numbering works without a reset.
-func TestMigrateAddsEntryRefs(t *testing.T) {
+// TestUpdateFromRemoteRenumbersOnDayChange covers the one edit that can move an
+// entry to another calendar day: it must join the new day's numbering instead
+// of keeping a number that day never handed out.
+func TestUpdateFromRemoteRenumbersOnDayChange(t *testing.T) {
+	s := openTest(t)
+	day := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
+	next := day.AddDate(0, 0, 1)
+
+	// Two entries on the target day, so the moved one must land on 3.
+	mustCreate(t, s, Entry{WorkspaceID: 1, Start: next, Stop: ptrTime(next.Add(time.Hour)), Duration: 3600, UpdatedAt: next})
+	mustCreate(t, s, Entry{WorkspaceID: 1, Start: next.Add(2 * time.Hour), Stop: ptrTime(next.Add(3 * time.Hour)), Duration: 3600, UpdatedAt: next})
+	moved := mustCreate(t, s, Entry{
+		RemoteID: ptrInt(77), WorkspaceID: 1, Start: day, Stop: ptrTime(day.Add(time.Hour)),
+		Duration: 3600, UpdatedAt: day,
+	})
+
+	newStart := next.Add(5 * time.Hour)
+	if err := s.UpdateFromRemote(Entry{
+		RemoteID: ptrInt(77), WorkspaceID: 1, Start: newStart,
+		Stop: ptrTime(newStart.Add(time.Hour)), Duration: 3600,
+		UpdatedAt: newStart, SyncedAt: ptrTime(newStart),
+	}); err != nil {
+		t.Fatalf("UpdateFromRemote: %v", err)
+	}
+
+	got, err := s.EntryByNum(3, next)
+	if err != nil || got.ID != moved {
+		t.Fatalf("EntryByNum(3, next day) = %+v err=%v, want the moved entry %d", got, err, moved)
+	}
+	if _, err := s.EntryByNum(1, day); !errors.Is(err, ErrNoEntryNum) {
+		t.Errorf("EntryByNum(1) on the vacated day = %v, want ErrNoEntryNum", err)
+	}
+
+	// An update that leaves the entry on its day keeps its number.
+	sameDayStart := next.Add(6 * time.Hour)
+	if err := s.UpdateFromRemote(Entry{
+		RemoteID: ptrInt(77), WorkspaceID: 1, Start: sameDayStart,
+		Stop: ptrTime(sameDayStart.Add(time.Hour)), Duration: 3600,
+		UpdatedAt: sameDayStart, SyncedAt: ptrTime(sameDayStart),
+	}); err != nil {
+		t.Fatalf("UpdateFromRemote (same day): %v", err)
+	}
+	if got, err := s.EntryByNum(3, next); err != nil || got.ID != moved {
+		t.Errorf("EntryByNum(3) = %+v err=%v, want the number kept", got, err)
+	}
+}
+
+// TestMigrateBackfillsSeq covers the v4 upgrade of a pre-existing database: the
+// seq column is added in place and every existing row is numbered in insertion
+// (id) order, restarting per calendar day, so numbering works without a reset.
+// The retired entry_refs table is dropped.
+func TestMigrateBackfillsSeq(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tg.db")
 
-	// Seed a v2 database: entries + meta, but no entry_refs.
+	// Seed a v3 database: entries + entry_refs + meta, but no seq column. Two
+	// entries on 2026-01-02 and one on 2026-01-03, inserted out of start order
+	// so the back-fill has to follow ids rather than clocks.
 	raw, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatalf("open raw: %v", err)
@@ -370,13 +454,19 @@ CREATE TABLE entries (
   duration INTEGER NOT NULL, billable INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL, synced_at TEXT,
   dirty INTEGER NOT NULL DEFAULT 1, deleted INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE entry_refs (num INTEGER PRIMARY KEY, entry_id INTEGER NOT NULL);
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
-INSERT INTO meta (key, value) VALUES ('schema_version', '2');`); err != nil {
-		t.Fatalf("seed v2 schema: %v", err)
+INSERT INTO entries (id, workspace_id, description, start, duration, updated_at)
+VALUES (1, 1, 'late',  '2026-01-02T13:00:00Z', 3600, '2026-01-02T13:00:00Z'),
+       (2, 1, 'early', '2026-01-02T09:00:00Z', 3600, '2026-01-02T09:00:00Z'),
+       (3, 1, 'next',  '2026-01-03T09:00:00Z', 3600, '2026-01-03T09:00:00Z');
+INSERT INTO entry_refs (num, entry_id) VALUES (1, 2), (2, 1);
+INSERT INTO meta (key, value) VALUES ('schema_version', '3');`); err != nil {
+		t.Fatalf("seed v3 schema: %v", err)
 	}
 	raw.Close()
 
-	s, err := Open(path)
+	s, err := OpenIn(path, time.UTC)
 	if err != nil {
 		t.Fatalf("open (migrate): %v", err)
 	}
@@ -385,17 +475,47 @@ INSERT INTO meta (key, value) VALUES ('schema_version', '2');`); err != nil {
 	if v, ok, _ := s.GetMeta(MetaSchemaVersion); !ok || v != schemaVersion {
 		t.Errorf("schema_version = %q ok=%v, want %q", v, ok, schemaVersion)
 	}
-	start := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
+	has, err := s.hasColumn("entries", "seq")
+	if err != nil || !has {
+		t.Fatalf("entries.seq missing after migrate (err=%v)", err)
+	}
+	// The dead mapping table is gone.
+	if _, err := s.db.Exec("SELECT 1 FROM entry_refs"); err == nil {
+		t.Error("entry_refs still exists after migrate, want it dropped")
+	}
+
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	for num, wantID := range map[int]int64{1: 1, 2: 2} {
+		got, err := s.EntryByNum(num, day)
+		if err != nil {
+			t.Fatalf("EntryByNum(%d): %v", num, err)
+		}
+		if got.ID != wantID {
+			t.Errorf("EntryByNum(%d).ID = %d, want %d (id order, not start order)", num, got.ID, wantID)
+		}
+	}
+	// The second day restarts at 1.
+	got, err := s.EntryByNum(1, day.AddDate(0, 0, 1))
+	if err != nil || got.ID != 3 {
+		t.Fatalf("EntryByNum(1) on 2026-01-03 = %+v err=%v, want id 3", got, err)
+	}
+
+	// A fresh insert continues the back-filled day rather than colliding.
+	start := time.Date(2026, 1, 2, 17, 0, 0, 0, time.UTC)
 	id := mustCreate(t, s, Entry{
 		WorkspaceID: 1, Start: start, Stop: ptrTime(start.Add(time.Hour)),
 		Duration: 3600, UpdatedAt: start,
 	})
-	if err := s.SaveEntryRefs([]int64{id}); err != nil {
-		t.Fatalf("SaveEntryRefs after migrate: %v", err)
+	if got, err := s.EntryByNum(3, day); err != nil || got.ID != id {
+		t.Fatalf("EntryByNum(3) = %+v err=%v, want the new entry %d", got, err, id)
 	}
-	got, err := s.EntryByRef(1)
-	if err != nil || got.ID != id {
-		t.Fatalf("EntryByRef(1) = %+v err=%v, want id %d", got, err, id)
+
+	// Re-running migrate must not renumber anything.
+	if err := s.migrate(); err != nil {
+		t.Fatalf("second migrate: %v", err)
+	}
+	if got, err := s.EntryByNum(1, day); err != nil || got.ID != 1 {
+		t.Errorf("EntryByNum(1) after a second migrate = %+v err=%v, want id 1", got, err)
 	}
 }
 
@@ -716,9 +836,6 @@ func TestSoftDeleteEntry(t *testing.T) {
 		RemoteID: ptrInt(4242), WorkspaceID: 1, Start: at, Stop: ptrTime(stop),
 		Duration: 3600, UpdatedAt: at, SyncedAt: ptrTime(at),
 	})
-	if err := s.SaveEntryRefs([]int64{id}); err != nil {
-		t.Fatal(err)
-	}
 
 	delAt := time.Date(2026, 1, 2, 15, 0, 0, 0, time.UTC)
 	if err := s.SoftDeleteEntry(id, delAt); err != nil {
@@ -749,8 +866,8 @@ func TestSoftDeleteEntry(t *testing.T) {
 	if got, err := s.LastEntry(); err != nil || got != nil {
 		t.Errorf("LastEntry = %v err=%v, want nil", got, err)
 	}
-	if _, err := s.EntryByRef(1); !errors.Is(err, ErrNoEntryRef) {
-		t.Errorf("EntryByRef(1) = %v, want ErrNoEntryRef", err)
+	if _, err := s.EntryByNum(1, at); !errors.Is(err, ErrNoEntryNum) {
+		t.Errorf("EntryByNum(1) = %v, want ErrNoEntryNum", err)
 	}
 }
 

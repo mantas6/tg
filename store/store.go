@@ -21,9 +21,13 @@ const (
 	MetaLastPull      = "last_pull"
 )
 
-// Store is a handle to the SQLite database.
+// Store is a handle to the SQLite database. loc is the calendar the store
+// reckons days in: it decides which day an entry's start belongs to, and hence
+// which per-day numbering (see Entry.Seq) it takes part in. It is time.Local
+// for the CLI and pinned explicitly by tests.
 type Store struct {
-	db *sql.DB
+	db  *sql.DB
+	loc *time.Location
 }
 
 // Entry is a tracked time entry. RemoteID/ProjectID/TaskID/Stop/SyncedAt are
@@ -40,6 +44,7 @@ type Entry struct {
 	Stop        *time.Time
 	Duration    int64 // seconds; -1 while running
 	Billable    bool
+	Seq         int // per-day entry number shown by `tg ls`; see CreateEntry
 	UpdatedAt   time.Time
 	SyncedAt    *time.Time
 	Dirty       bool
@@ -81,14 +86,24 @@ type Task struct {
 }
 
 // Open opens (creating if needed) the SQLite database at path and applies the
-// schema. WAL + a busy timeout keep concurrent CLI invocations well behaved.
-func Open(path string) (*Store, error) {
+// schema, reckoning calendar days in time.Local. WAL + a busy timeout keep
+// concurrent CLI invocations well behaved.
+func Open(path string) (*Store, error) { return OpenIn(path, time.Local) }
+
+// OpenIn is Open with an explicit calendar (see Store.loc): entry days — and
+// therefore the per-day numbering `tg ls` shows — are computed in loc. A nil
+// loc means time.Local. Callers must pass the same location they render with,
+// or a listing's numbers will not match the ones `mod`/`del` resolve.
+func OpenIn(path string, loc *time.Location) (*Store, error) {
+	if loc == nil {
+		loc = time.Local
+	}
 	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{db: db}
+	s := &Store{db: db, loc: loc}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -98,6 +113,14 @@ func Open(path string) (*Store, error) {
 
 // Close releases the underlying database handle.
 func (s *Store) Close() error { return s.db.Close() }
+
+// Location returns the calendar the store reckons entry days in (see OpenIn).
+func (s *Store) Location() *time.Location {
+	if s.loc == nil {
+		return time.Local
+	}
+	return s.loc
+}
 
 // --- time helpers -----------------------------------------------------------
 
@@ -125,8 +148,8 @@ func nullInt(p *int64) any {
 // fields (task name, project name and color).
 const entrySelect = `
 SELECT e.id, e.remote_id, e.workspace_id, e.project_id, e.task_id,
-       e.description, e.start, e.stop, e.duration, e.billable, e.updated_at,
-       e.synced_at, e.dirty, e.deleted, t.name, p.name, p.color
+       e.description, e.start, e.stop, e.duration, e.billable, e.seq,
+       e.updated_at, e.synced_at, e.dirty, e.deleted, t.name, p.name, p.color
 FROM entries e
 LEFT JOIN tasks t ON t.id = e.task_id
 LEFT JOIN projects p ON p.id = e.project_id
@@ -147,8 +170,8 @@ func scanEntry(sc interface{ Scan(...any) error }) (Entry, error) {
 		projColor sql.NullString
 	)
 	if err := sc.Scan(&e.ID, &remoteID, &e.WorkspaceID, &projectID, &taskID,
-		&e.Description, &start, &stop, &e.Duration, &e.Billable, &updatedAt, &syncedAt,
-		&e.Dirty, &e.Deleted, &taskName, &projName, &projColor); err != nil {
+		&e.Description, &start, &stop, &e.Duration, &e.Billable, &e.Seq, &updatedAt,
+		&syncedAt, &e.Dirty, &e.Deleted, &taskName, &projName, &projColor); err != nil {
 		return Entry{}, err
 	}
 	if remoteID.Valid {
@@ -298,16 +321,52 @@ func collectEntries(rows *sql.Rows) ([]Entry, error) {
 
 // --- entry writes ------------------------------------------------------------
 
+// nextSeqExpr is the scalar subquery that hands out the next per-day entry
+// number: one past the highest number already used on the entry's calendar day,
+// so numbering starts at 1 each day and only ever grows. Deleted rows are
+// deliberately NOT filtered out, which is what keeps a number from being reused
+// after `tg del` (the day's numbering keeps its gaps). Its three placeholders
+// are the day's [from, to) bounds and the id to exclude (0 when inserting, so
+// nothing is excluded).
+const nextSeqExpr = `(SELECT COALESCE(MAX(seq), 0) + 1 FROM entries
+                       WHERE start >= ? AND start < ? AND id <> ?)`
+
+// dayBounds returns the half-open [midnight, next midnight) range of t's
+// calendar day in loc.
+func dayBounds(t time.Time, loc *time.Location) (from, to time.Time) {
+	from = dayStart(t, loc)
+	return from, from.AddDate(0, 0, 1)
+}
+
+// assignSeq (re)numbers an existing entry within the calendar day of start,
+// giving it the next free per-day number. It is used to back-fill pre-v4 rows
+// and to renumber an entry a remote update moved to another day; the row itself
+// is excluded from the maximum so it cannot bump itself.
+func (s *Store) assignSeq(id int64, start time.Time) error {
+	from, to := dayBounds(start, s.Location())
+	_, err := s.db.Exec("UPDATE entries SET seq = "+nextSeqExpr+" WHERE id = ?",
+		fmtTime(from), fmtTime(to), id, id)
+	return err
+}
+
 // CreateEntry inserts a new entry and returns its local id. The caller sets all
 // fields (Start/UpdatedAt/Dirty/Duration etc.); Duration -1 marks it running.
+//
+// The entry's per-day number (Entry.Seq) is assigned here, not by the caller: it
+// is one past the highest number handed out on the entry's calendar day, so
+// numbers reflect insertion order, restart at 1 every day, and are never reused
+// (see nextSeqExpr). Entries arriving from a pull are numbered the same way, in
+// the order the pull inserts them. Any Seq set on e is ignored.
 func (s *Store) CreateEntry(e Entry) (int64, error) {
+	from, to := dayBounds(e.Start, s.Location())
 	res, err := s.db.Exec(`
 INSERT INTO entries
   (remote_id, workspace_id, project_id, task_id, description, start, stop,
-   duration, billable, updated_at, synced_at, dirty, deleted)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+   duration, billable, seq, updated_at, synced_at, dirty, deleted)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, `+nextSeqExpr+`, ?, ?, ?, ?)`,
 		nullInt(e.RemoteID), e.WorkspaceID, nullInt(e.ProjectID), nullInt(e.TaskID),
 		e.Description, fmtTime(e.Start), nullTime(e.Stop), e.Duration, boolToInt(e.Billable),
+		fmtTime(from), fmtTime(to), int64(0),
 		fmtTime(e.UpdatedAt), nullTime(e.SyncedAt), boolToInt(e.Dirty), boolToInt(e.Deleted))
 	if err != nil {
 		return 0, err
@@ -373,7 +432,18 @@ UPDATE entries SET description = ?, start = ?, stop = ?, duration = ?,
 	if err != nil {
 		return err
 	}
-	return checkAffected(res, e.ID)
+	if err := checkAffected(res, e.ID); err != nil {
+		return err
+	}
+	// Retiming keeps an entry on its own day today (a relative timesign keeps
+	// the start and an absolute one is resolved on the entry's day), so this
+	// is a failsafe rather than a routine path: should an edit ever land the
+	// entry on another day, it joins that day's numbering instead of keeping a
+	// number nothing on the new day would show.
+	if !sameDay(stored, e.Start, s.Location()) {
+		return s.assignSeq(e.ID, e.Start)
+	}
+	return nil
 }
 
 // entryStart reads the persisted start of an entry by local id, so an edit can
@@ -431,15 +501,60 @@ UPDATE entries SET remote_id = ?, synced_at = ?, updated_at = ?, dirty = 0 WHERE
 
 // UpdateFromRemote overwrites a local entry with remote state (remote wins) and
 // marks it clean, aligning the LWW clocks to the remote at.
+//
+// A remote edit is the only thing that can move an entry to another calendar
+// day, which would strand its number in the day it no longer belongs to, so the
+// entry is renumbered into its new day when that happens. An entry that stays
+// put keeps the number `tg ls` published for it.
 func (s *Store) UpdateFromRemote(e Entry) error {
-	_, err := s.db.Exec(`
+	id, oldStart, err := s.entryByRemote(e.RemoteID)
+	if err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`
 UPDATE entries SET workspace_id = ?, project_id = ?, task_id = ?, description = ?,
   start = ?, stop = ?, duration = ?, billable = ?, updated_at = ?, synced_at = ?,
   dirty = 0, deleted = 0 WHERE remote_id = ?`,
 		e.WorkspaceID, nullInt(e.ProjectID), nullInt(e.TaskID), e.Description,
 		fmtTime(e.Start), nullTime(e.Stop), e.Duration, boolToInt(e.Billable),
-		fmtTime(e.UpdatedAt), nullTime(e.SyncedAt), nullInt(e.RemoteID))
-	return err
+		fmtTime(e.UpdatedAt), nullTime(e.SyncedAt), nullInt(e.RemoteID)); err != nil {
+		return err
+	}
+	if id == 0 || sameDay(oldStart, e.Start, s.Location()) {
+		return nil
+	}
+	return s.assignSeq(id, e.Start)
+}
+
+// entryByRemote reads the local id and stored start of the mirror of a remote
+// entry. A remote id that is unknown (or nil) yields id 0 and no error, since
+// callers only use it to decide whether an existing row needs follow-up work.
+func (s *Store) entryByRemote(remoteID *int64) (int64, time.Time, error) {
+	if remoteID == nil {
+		return 0, time.Time{}, nil
+	}
+	var (
+		id    int64
+		start string
+	)
+	err := s.db.QueryRow("SELECT id, start FROM entries WHERE remote_id = ?", *remoteID).
+		Scan(&id, &start)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, time.Time{}, nil
+	}
+	if err != nil {
+		return 0, time.Time{}, err
+	}
+	t, err := parseTime(start)
+	if err != nil {
+		return 0, time.Time{}, err
+	}
+	return id, t, nil
+}
+
+// sameDay reports whether a and b fall on the same calendar day in loc.
+func sameDay(a, b time.Time, loc *time.Location) bool {
+	return dayStart(a, loc).Equal(dayStart(b, loc))
 }
 
 // DeleteRow hard-deletes a local row (used after a remote delete is confirmed).
@@ -454,45 +569,29 @@ func (s *Store) DeleteByRemoteID(remoteID int64) error {
 	return err
 }
 
-// --- entry refs --------------------------------------------------------------
+// --- entry numbers -----------------------------------------------------------
 
-// ErrNoEntryRef reports that a local entry number does not resolve to an entry:
-// either no listing has been produced yet, or the numbering is stale (the entry
-// was deleted since). Callers should surface the wrapped message, which already
-// tells the user to re-run `tg ls`.
-var ErrNoEntryRef = errors.New("no such entry number")
+// ErrNoEntryNum reports that a local entry number does not resolve to an entry
+// on the day it was looked up on: nothing was ever numbered that high that day,
+// or the entry has since been deleted (its number stays vacant rather than
+// sliding onto its neighbour). Callers should surface the wrapped message,
+// which already tells the user to re-run `tg ls`.
+var ErrNoEntryNum = errors.New("no such entry number")
 
-// SaveEntryRefs replaces the whole number->entry mapping with ids numbered
-// 1..len(ids) in the given (display) order. `tg ls` calls it on every run, so
-// the numbers always describe the most recent listing; passing no ids clears
-// the mapping, which makes every number stale rather than wrong.
-func (s *Store) SaveEntryRefs(ids []int64) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec("DELETE FROM entry_refs"); err != nil {
-		return err
-	}
-	for i, id := range ids {
-		if _, err := tx.Exec("INSERT INTO entry_refs (num, entry_id) VALUES (?, ?)", i+1, id); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
-
-// EntryByRef resolves a local entry number published by the last `tg ls` (see
-// SaveEntryRefs) to its entry. An unknown number, or one whose entry has since
-// been deleted, yields an error wrapping ErrNoEntryRef.
-func (s *Store) EntryByRef(num int) (Entry, error) {
+// EntryByNum resolves a per-day entry number (the leading column of `tg ls`) to
+// its entry on the calendar day containing day, in the store's location. The
+// numbers are persistent, so this keeps working across listings and is not
+// affected by anything deleted in between: an unused or freed number is an
+// error wrapping ErrNoEntryNum rather than a different entry.
+func (s *Store) EntryByNum(num int, day time.Time) (Entry, error) {
+	from, to := dayBounds(day, s.Location())
 	row := s.db.QueryRow(entrySelect+`
-JOIN entry_refs r ON r.entry_id = e.id
-WHERE r.num = ? AND e.deleted = 0`, num)
+WHERE e.deleted = 0 AND e.seq = ? AND e.start >= ? AND e.start < ?
+LIMIT 1`, num, fmtTime(from), fmtTime(to))
 	e, err := scanEntry(row)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Entry{}, fmt.Errorf("%w %d; run `tg ls` to list entries", ErrNoEntryRef, num)
+		return Entry{}, fmt.Errorf("%w %d on %s; run `tg ls` to list entries",
+			ErrNoEntryNum, num, from.Format("2006-01-02"))
 	}
 	if err != nil {
 		return Entry{}, err

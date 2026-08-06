@@ -171,19 +171,55 @@ func trailingGap(last store.Entry, now time.Time, loc *time.Location) time.Durat
 	return gapBetween(last, store.Entry{Start: now}, loc)
 }
 
-// refWidth is the width of the leading local-number column for a listing of n
-// entries: enough digits for n, so the numbers stay right-aligned.
-func refWidth(n int) int {
-	return len(strconv.Itoa(n))
+// refWidth is the width of the leading local-number column for a listing whose
+// highest entry number is max: enough digits for it, so the numbers stay
+// right-aligned. A listing with no numbers still gets a single column.
+func refWidth(max int) int {
+	if max < 1 {
+		max = 1
+	}
+	return len(strconv.Itoa(max))
+}
+
+// maxSeq returns the highest per-day number among entries, which is what sizes
+// the number column. It is not len(entries): numbers are persistent, so a day
+// that has had entries deleted lists fewer entries than its highest number.
+func maxSeq(entries []store.Entry) int {
+	max := 0
+	for _, e := range entries {
+		if e.Seq > max {
+			max = e.Seq
+		}
+	}
+	return max
+}
+
+// dayHeader labels a day group in a multi-day listing (see renderToday).
+func dayHeader(t time.Time, loc *time.Location) string {
+	return t.In(loc).Format("Mon 2006-01-02")
+}
+
+// spansDays reports whether entries fall on more than one calendar day in loc,
+// which is what turns on the date headers in renderToday.
+func spansDays(entries []store.Entry, loc *time.Location) bool {
+	for i := 1; i < len(entries); i++ {
+		if dayHeader(entries[i].Start, loc) != dayHeader(entries[i-1].Start, loc) {
+			return true
+		}
+	}
+	return false
 }
 
 // renderToday writes the human-readable daily table to w. color enables the
 // per-project ANSI color block and should only be set when w is a terminal.
 //
-// Every entry line leads with its local reference number (1..N in display
-// order, the same numbering `tg ls` persists via store.SaveEntryRefs) so it can
-// be addressed later as `tg mod 2` / `tg del 3`. Filler rows (the gaps between
-// entries and the trailing gap up to now) are not entries and carry no number.
+// Every entry line leads with the entry's own per-day number (store.Entry.Seq,
+// assigned when it was inserted) so it can be addressed later as `tg mod 2` /
+// `tg del 3`. Those numbers are persistent and start again at 1 each calendar
+// day, so a listing can legitimately show gaps (an entry was deleted) and a
+// multi-day listing repeats numbers; the latter is grouped under a date header
+// so it stays readable. Filler rows (the gaps between entries and the trailing
+// gap up to now) are not entries and carry no number.
 func renderToday(w io.Writer, entries []store.Entry, now time.Time, loc *time.Location, color bool) {
 	if len(entries) == 0 {
 		fmt.Fprintln(w, "No entries.")
@@ -201,11 +237,18 @@ func renderToday(w io.Writer, entries []store.Entry, now time.Time, loc *time.Lo
 
 	// numWidth sizes the reference-number column; numPad blanks it out on the
 	// filler rows so their "(gap ...)" text stays aligned with the entries.
-	numWidth := refWidth(len(entries))
+	numWidth := refWidth(maxSeq(entries))
 	numPad := strings.Repeat(" ", numWidth+2)
+
+	// Date headers only appear when the listing actually covers several days
+	// (`tg ls --days N`), so the common single-day table is unchanged.
+	multiDay := spansDays(entries, loc)
 
 	total, anyRunning := totalDuration(entries, now)
 	for i, e := range entries {
+		if multiDay && (i == 0 || dayHeader(entries[i-1].Start, loc) != dayHeader(e.Start, loc)) {
+			fmt.Fprintln(w, dayHeader(e.Start, loc))
+		}
 		if i > 0 {
 			if gap := gapBetween(entries[i-1], e, loc); gap > 0 {
 				// Indented to the duration column so it reads as a filler row.
@@ -233,7 +276,7 @@ func renderToday(w io.Writer, entries []store.Entry, now time.Time, loc *time.Lo
 			}
 		}
 		line := fmt.Sprintf("%*d  %s%-12s%-7s%-17s %s",
-			numWidth, i+1, lead, startClk+"-"+stopClk, formatHM(dur), label, project)
+			numWidth, e.Seq, lead, startClk+"-"+stopClk, formatHM(dur), label, project)
 		fmt.Fprintln(w, strings.TrimRight(line, " "))
 	}
 
@@ -331,8 +374,9 @@ func renderCurrent(w io.Writer, last *store.Entry, dayTotal time.Duration, now t
 }
 
 // todayEntryJSON / todayJSON are the stable --json shapes for `today`. Num is
-// the local reference number (1..N in display order) that `tg ls` persists, so
-// scripted callers can address an entry the same way the human output does.
+// the entry's persistent per-day number (store.Entry.Seq), the same one the
+// human listing leads with, so scripted callers can address an entry the way
+// `tg mod`/`tg del` expect.
 type todayEntryJSON struct {
 	Num             int    `json:"num"`
 	ID              int64  `json:"id"`
@@ -353,10 +397,10 @@ type todayJSON struct {
 // renderTodayJSON writes the daily entries as the stable JSON shape.
 func renderTodayJSON(w io.Writer, entries []store.Entry, now time.Time) error {
 	out := todayJSON{Entries: []todayEntryJSON{}}
-	for i, e := range entries {
+	for _, e := range entries {
 		dur := displayDuration(e, now)
 		je := todayEntryJSON{
-			Num:             i + 1,
+			Num:             e.Seq,
 			ID:              e.ID,
 			Task:            e.TaskName,
 			Project:         e.ProjectName,

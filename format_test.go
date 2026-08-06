@@ -61,15 +61,17 @@ func TestFormatClock(t *testing.T) {
 	}
 }
 
-// sampleDay builds the two-entry fixture used across golden tests.
+// sampleDay builds the two-entry fixture used across golden tests. Seq is the
+// per-day number the store hands out at insert time; renderToday prints it
+// verbatim rather than counting rows, so the fixtures carry it explicitly.
 func sampleDay() (entries []store.Entry, now time.Time) {
 	start1 := time.Date(2026, 1, 2, 9, 15, 0, 0, time.UTC)
 	stop1 := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
 	start2 := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
 	now = time.Date(2026, 1, 2, 11, 15, 0, 0, time.UTC)
 	entries = []store.Entry{
-		{ID: 11, TaskName: "Fix login bug", ProjectName: "Backend", Start: start1, Stop: &stop1, Duration: 4500},
-		{ID: 12, TaskName: "Code review", ProjectName: "Backend", Start: start2, Duration: -1},
+		{ID: 11, Seq: 1, TaskName: "Fix login bug", ProjectName: "Backend", Start: start1, Stop: &stop1, Duration: 4500},
+		{ID: 12, Seq: 2, TaskName: "Code review", ProjectName: "Backend", Start: start2, Duration: -1},
 	}
 	return entries, now
 }
@@ -107,16 +109,16 @@ func TestRenderTodayGaps(t *testing.T) {
 		{
 			name: "gap shown",
 			entries: []store.Entry{
-				{TaskName: "A", Start: at(9 * time.Hour), Stop: pt(at(10 * time.Hour)), Duration: 3600},
-				{TaskName: "B", Start: at(10*time.Hour + 25*time.Minute), Stop: pt(at(11 * time.Hour)), Duration: 2100},
+				{Seq: 1, TaskName: "A", Start: at(9 * time.Hour), Stop: pt(at(10 * time.Hour)), Duration: 3600},
+				{Seq: 2, TaskName: "B", Start: at(10*time.Hour + 25*time.Minute), Stop: pt(at(11 * time.Hour)), Duration: 2100},
 			},
 			want: "               (gap 0h25m)\n",
 		},
 		{
 			name: "gap below threshold hidden",
 			entries: []store.Entry{
-				{TaskName: "A", Start: at(9 * time.Hour), Stop: pt(at(10 * time.Hour)), Duration: 3600},
-				{TaskName: "B", Start: at(10*time.Hour + 30*time.Second), Stop: pt(at(11 * time.Hour)), Duration: 3570},
+				{Seq: 1, TaskName: "A", Start: at(9 * time.Hour), Stop: pt(at(10 * time.Hour)), Duration: 3600},
+				{Seq: 2, TaskName: "B", Start: at(10*time.Hour + 30*time.Second), Stop: pt(at(11 * time.Hour)), Duration: 3570},
 			},
 			want:   "(gap",
 			absent: true,
@@ -124,8 +126,8 @@ func TestRenderTodayGaps(t *testing.T) {
 		{
 			name: "no cross-day gap",
 			entries: []store.Entry{
-				{TaskName: "A", Start: at(-2 * time.Hour), Stop: pt(at(-1 * time.Hour)), Duration: 3600},
-				{TaskName: "B", Start: at(9 * time.Hour), Stop: pt(at(10 * time.Hour)), Duration: 3600},
+				{Seq: 1, TaskName: "A", Start: at(-2 * time.Hour), Stop: pt(at(-1 * time.Hour)), Duration: 3600},
+				{Seq: 1, TaskName: "B", Start: at(9 * time.Hour), Stop: pt(at(10 * time.Hour)), Duration: 3600},
 			},
 			want:   "(gap",
 			absent: true,
@@ -133,8 +135,8 @@ func TestRenderTodayGaps(t *testing.T) {
 		{
 			name: "no gap after running entry",
 			entries: []store.Entry{
-				{TaskName: "A", Start: at(9 * time.Hour), Duration: -1},
-				{TaskName: "B", Start: at(10 * time.Hour), Stop: pt(at(11 * time.Hour)), Duration: 3600},
+				{Seq: 1, TaskName: "A", Start: at(9 * time.Hour), Duration: -1},
+				{Seq: 2, TaskName: "B", Start: at(10 * time.Hour), Stop: pt(at(11 * time.Hour)), Duration: 3600},
 			},
 			want:   "(gap",
 			absent: true,
@@ -142,8 +144,8 @@ func TestRenderTodayGaps(t *testing.T) {
 		{
 			name: "no gap on overlap",
 			entries: []store.Entry{
-				{TaskName: "A", Start: at(9 * time.Hour), Stop: pt(at(11 * time.Hour)), Duration: 7200},
-				{TaskName: "B", Start: at(10 * time.Hour), Stop: pt(at(10*time.Hour + 30*time.Minute)), Duration: 1800},
+				{Seq: 1, TaskName: "A", Start: at(9 * time.Hour), Stop: pt(at(11 * time.Hour)), Duration: 7200},
+				{Seq: 2, TaskName: "B", Start: at(10 * time.Hour), Stop: pt(at(10*time.Hour + 30*time.Minute)), Duration: 1800},
 			},
 			want:   "(gap",
 			absent: true,
@@ -182,13 +184,13 @@ func TestRenderTodayTrailingGap(t *testing.T) {
 	pt := func(t time.Time) *time.Time { return &t }
 
 	finished := []store.Entry{
-		{TaskName: "A", Start: at(9 * time.Hour), Stop: pt(at(10 * time.Hour)), Duration: 3600},
+		{Seq: 1, TaskName: "A", Start: at(9 * time.Hour), Stop: pt(at(10 * time.Hour)), Duration: 3600},
 	}
 	running := []store.Entry{
-		{TaskName: "A", Start: at(9 * time.Hour), Duration: -1},
+		{Seq: 1, TaskName: "A", Start: at(9 * time.Hour), Duration: -1},
 	}
 	yesterday := []store.Entry{
-		{TaskName: "A", Start: at(-3 * time.Hour), Stop: pt(at(-2 * time.Hour)), Duration: 3600},
+		{Seq: 1, TaskName: "A", Start: at(-3 * time.Hour), Stop: pt(at(-2 * time.Hour)), Duration: 3600},
 	}
 
 	cases := []struct {
@@ -250,9 +252,10 @@ func TestRenderTodayTrailingGap(t *testing.T) {
 	}
 }
 
-// TestRenderTodayRefNumbers pins the leading local reference numbers: entries
-// are numbered 1..N in display order, filler gap rows carry no number, and the
-// column widens (right-aligned) once the listing reaches ten entries.
+// TestRenderTodayRefNumbers pins the leading local reference numbers: each
+// entry shows its own persistent per-day number, filler gap rows carry no
+// number, and the column widens (right-aligned) once a number reaches two
+// digits.
 func TestRenderTodayRefNumbers(t *testing.T) {
 	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
 	at := func(d time.Duration) time.Time { return day.Add(d) }
@@ -260,9 +263,9 @@ func TestRenderTodayRefNumbers(t *testing.T) {
 
 	// Three entries, with a gap between the second and the third.
 	entries := []store.Entry{
-		{TaskName: "A", Start: at(9 * time.Hour), Stop: pt(at(10 * time.Hour)), Duration: 3600},
-		{TaskName: "B", Start: at(10 * time.Hour), Stop: pt(at(11 * time.Hour)), Duration: 3600},
-		{TaskName: "C", Start: at(11*time.Hour + 30*time.Minute), Stop: pt(at(12 * time.Hour)), Duration: 1800},
+		{Seq: 1, TaskName: "A", Start: at(9 * time.Hour), Stop: pt(at(10 * time.Hour)), Duration: 3600},
+		{Seq: 2, TaskName: "B", Start: at(10 * time.Hour), Stop: pt(at(11 * time.Hour)), Duration: 3600},
+		{Seq: 3, TaskName: "C", Start: at(11*time.Hour + 30*time.Minute), Stop: pt(at(12 * time.Hour)), Duration: 1800},
 	}
 	var buf bytes.Buffer
 	renderToday(&buf, entries, at(12*time.Hour), time.UTC, false)
@@ -290,7 +293,7 @@ func TestRenderTodayRefNumbers(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		start := at(time.Duration(i) * time.Hour)
 		stop := start.Add(time.Hour)
-		many = append(many, store.Entry{TaskName: "T", Start: start, Stop: &stop, Duration: 3600})
+		many = append(many, store.Entry{Seq: i + 1, TaskName: "T", Start: start, Stop: &stop, Duration: 3600})
 	}
 	buf.Reset()
 	renderToday(&buf, many, at(10*time.Hour), time.UTC, false)
@@ -302,6 +305,77 @@ func TestRenderTodayRefNumbers(t *testing.T) {
 	}
 }
 
+// TestRenderTodayNumbersAreNotPositions is the display half of the persistent
+// numbering: entries print the number they were given, gaps and all, so a day
+// whose entry 2 was deleted still lists 1 and 3 — and the column is sized by
+// the highest number, not by how many entries are left.
+func TestRenderTodayNumbersAreNotPositions(t *testing.T) {
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) time.Time { return day.Add(d) }
+	pt := func(t time.Time) *time.Time { return &t }
+
+	entries := []store.Entry{
+		{Seq: 1, TaskName: "A", Start: at(9 * time.Hour), Stop: pt(at(10 * time.Hour)), Duration: 3600},
+		{Seq: 3, TaskName: "C", Start: at(10 * time.Hour), Stop: pt(at(11 * time.Hour)), Duration: 3600},
+		{Seq: 12, TaskName: "L", Start: at(11 * time.Hour), Stop: pt(at(12 * time.Hour)), Duration: 3600},
+	}
+	var buf bytes.Buffer
+	renderToday(&buf, entries, at(12*time.Hour), time.UTC, false)
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	want := []string{
+		" 1  09:00-10:00 1h00m  A",
+		" 3  10:00-11:00 1h00m  C",
+		"12  11:00-12:00 1h00m  L",
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Errorf("line %d = %q, want %q", i, lines[i], want[i])
+		}
+	}
+}
+
+// TestRenderTodayMultiDayHeaders covers the one place the flat table changes
+// shape: each calendar day numbers from 1, so a listing spanning days labels
+// the groups. A single-day listing gets no header at all.
+func TestRenderTodayMultiDayHeaders(t *testing.T) {
+	first := time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC)
+	second := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
+	pt := func(t time.Time) *time.Time { return &t }
+
+	entries := []store.Entry{
+		{Seq: 1, TaskName: "A", Start: first, Stop: pt(first.Add(time.Hour)), Duration: 3600},
+		{Seq: 2, TaskName: "B", Start: first.Add(time.Hour), Stop: pt(first.Add(2 * time.Hour)), Duration: 3600},
+		{Seq: 1, TaskName: "C", Start: second, Stop: pt(second.Add(time.Hour)), Duration: 3600},
+	}
+	var buf bytes.Buffer
+	renderToday(&buf, entries, second.Add(time.Hour), time.UTC, false)
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	want := []string{
+		"Thu 2026-01-01",
+		"1  09:00-10:00 1h00m  A",
+		"2  10:00-11:00 1h00m  B",
+		"Fri 2026-01-02",
+		"1  09:00-10:00 1h00m  C",
+		todayDivider,
+		"Total: 3h00m",
+	}
+	if len(lines) != len(want) {
+		t.Fatalf("got %d lines, want %d:\n%s", len(lines), len(want), buf.String())
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Errorf("line %d = %q, want %q", i, lines[i], want[i])
+		}
+	}
+
+	// A single-day listing keeps the plain table.
+	buf.Reset()
+	renderToday(&buf, entries[:2], first.Add(2*time.Hour), time.UTC, false)
+	if strings.Contains(buf.String(), "2026-01-01") {
+		t.Errorf("single-day listing gained a date header:\n%s", buf.String())
+	}
+}
+
 // TestRenderTodayLongNameSpacing guards the separator between the task name
 // and the project bracket: names at or beyond the padding width must not run
 // into "[project]".
@@ -310,7 +384,7 @@ func TestRenderTodayLongNameSpacing(t *testing.T) {
 	stop := time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 1, 2, 11, 0, 0, 0, time.UTC)
 	entries := []store.Entry{
-		{ID: 1, TaskName: "A task name definitely longer than the pad", ProjectName: "Backend", Start: start, Stop: &stop, Duration: 3600},
+		{ID: 1, Seq: 1, TaskName: "A task name definitely longer than the pad", ProjectName: "Backend", Start: start, Stop: &stop, Duration: 3600},
 	}
 	var buf bytes.Buffer
 	renderToday(&buf, entries, now, time.UTC, false)

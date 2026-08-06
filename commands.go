@@ -112,8 +112,9 @@ func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, proj
 // cmdMod edits a single existing entry in place: its times (from a timesign),
 // its description, or both. At least one change must be requested.
 //
-// ref selects the entry: a local number published by the last `tg ls` (see
-// store.EntryByRef), or 0 meaning "the most recent entry" (store.LastEntry).
+// ref selects the entry: its number on today's listing (see store.EntryByNum;
+// the numbering is per-day and persistent), or 0 meaning "the most recent
+// entry" (store.LastEntry).
 //
 // The timesign is interpreted by form (see docs/timesig.md):
 //
@@ -143,7 +144,7 @@ func cmdMod(w io.Writer, st *store.Store, c *api.Client, ref int, timesign, desc
 		return errors.New("usage: tg mod [entry-number] [timesign] [--desc TEXT]")
 	}
 
-	e, err := modTarget(st, ref)
+	e, err := modTarget(st, ref, now)
 	if err != nil {
 		return err
 	}
@@ -194,10 +195,12 @@ func cmdMod(w io.Writer, st *store.Store, c *api.Client, ref int, timesign, desc
 }
 
 // modTarget resolves the entry `tg mod` acts on: the local number ref when it is
-// positive, otherwise the most recent entry.
-func modTarget(st *store.Store, ref int) (store.Entry, error) {
+// positive, otherwise the most recent entry. Numbers are per-day (see
+// store.EntryByNum), so a number is looked up on now's calendar day — which is
+// also the only day mod may write to.
+func modTarget(st *store.Store, ref int, now time.Time) (store.Entry, error) {
 	if ref > 0 {
-		return st.EntryByRef(ref)
+		return st.EntryByNum(ref, now)
 	}
 	last, err := st.LastEntry()
 	if err != nil {
@@ -228,17 +231,20 @@ func modSpan(e store.Entry, timesign string, now time.Time, loc *time.Location) 
 	return span.Start, span.Stop, nil
 }
 
-// cmdDel deletes the entry addressed by the local number ref (published by the
-// last `tg ls`; see store.EntryByRef). The deletion is soft: the row is marked
-// deleted and dirty so it vanishes from every listing at once and the removal
-// can still be pushed to Toggl, which is where the row is finally dropped (see
-// sync.Push). When c is non-nil that push is attempted immediately,
-// best-effort, exactly like `tg add`.
+// cmdDel deletes the entry addressed by the local number ref, resolved on
+// today's calendar day (see store.EntryByNum). The deletion is soft: the row is
+// marked deleted and dirty so it vanishes from every listing at once and the
+// removal can still be pushed to Toggl, which is where the row is finally
+// dropped (see sync.Push). When c is non-nil that push is attempted
+// immediately, best-effort, exactly like `tg add`.
+//
+// The deleted entry's number is retired with it: the day's numbering keeps the
+// gap instead of shifting every later entry down one.
 func cmdDel(w io.Writer, st *store.Store, c *api.Client, ref int, now time.Time, loc *time.Location) error {
 	if ref < 1 {
 		return errors.New("usage: tg del <entry-number>")
 	}
-	e, err := st.EntryByRef(ref)
+	e, err := st.EntryByNum(ref, now)
 	if err != nil {
 		return err
 	}
@@ -386,12 +392,13 @@ func cmdCurrent(w io.Writer, st *store.Store, now time.Time, loc *time.Location,
 // enables ANSI project-color blocks in the human output (never in JSON) and
 // should reflect whether w is a terminal.
 //
-// Listing also publishes the local entry numbers: the listed entries are
-// numbered 1..N in display order and that mapping is persisted (replacing the
-// previous one) so later commands can address an entry as `tg mod 2` /
-// `tg del 3`. The mapping is saved in both human and JSON mode, and an empty
-// listing clears it, so a number never resolves to something that was not on
-// screen.
+// The number each line leads with is the entry's own persistent per-day number,
+// handed out when the entry was inserted (see store.CreateEntry): it restarts
+// at 1 every calendar day, never changes, and is never reused, so `tg mod 2` /
+// `tg del 3` keep meaning the same entries however often the day is listed.
+// Deleting an entry therefore leaves a gap rather than renumbering the rest. A
+// multi-day listing groups entries under a date header, since each day carries
+// its own 1..N; `mod`/`del` address today's numbers.
 func cmdToday(w io.Writer, st *store.Store, now time.Time, loc *time.Location, days int, jsonOut, color bool) error {
 	if days < 1 {
 		days = 1
@@ -402,13 +409,6 @@ func cmdToday(w io.Writer, st *store.Store, now time.Time, loc *time.Location, d
 
 	entries, err := st.EntriesBetween(from, to)
 	if err != nil {
-		return err
-	}
-	ids := make([]int64, len(entries))
-	for i, e := range entries {
-		ids[i] = e.ID
-	}
-	if err := st.SaveEntryRefs(ids); err != nil {
 		return err
 	}
 	if jsonOut {

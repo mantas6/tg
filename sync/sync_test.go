@@ -23,9 +23,11 @@ func ts(s string) time.Time {
 	return t
 }
 
+// setup opens a throwaway store pinned to UTC (so the per-day entry numbering
+// lines up with the UTC timestamps the fixtures use) plus a stub Toggl server.
 func setup(t *testing.T, handler http.HandlerFunc) (*store.Store, *api.Client) {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "tg.db"))
+	st, err := store.OpenIn(filepath.Join(t.TempDir(), "tg.db"), time.UTC)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -168,6 +170,59 @@ func TestPullInsert(t *testing.T) {
 	got, _ := st.EntryByRemoteID(900)
 	if got == nil || got.Description != "Imported" || got.Dirty {
 		t.Fatalf("inserted entry = %+v", got)
+	}
+}
+
+// TestPullNumbersInsertedEntries pins how pulled entries join the local
+// per-day numbering: they are numbered like any other insert, in the order the
+// pull writes them, and each calendar day starts again at 1. A local entry
+// written first keeps the number it already had, so a pull never renumbers what
+// `tg ls` has already shown.
+func TestPullNumbersInsertedEntries(t *testing.T) {
+	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
+		// Deliberately not in start order: insertion order is what numbers them.
+		w.Write([]byte(`[{"id":901,"workspace_id":1,"description":"second",
+		  "start":"2026-01-02T14:00:00Z","stop":"2026-01-02T15:00:00Z",
+		  "duration":3600,"at":"2026-01-02T15:00:00Z"},
+		 {"id":902,"workspace_id":1,"description":"third",
+		  "start":"2026-01-02T11:00:00Z","stop":"2026-01-02T12:00:00Z",
+		  "duration":3600,"at":"2026-01-02T12:00:00Z"},
+		 {"id":903,"workspace_id":1,"description":"next day",
+		  "start":"2026-01-03T09:00:00Z","stop":"2026-01-03T10:00:00Z",
+		  "duration":3600,"at":"2026-01-03T10:00:00Z"}]`))
+	})
+
+	// A purely local entry already occupies number 1 on 2026-01-02.
+	local := ts("2026-01-02T09:00:00Z")
+	localStop := local.Add(time.Hour)
+	if _, err := st.CreateEntry(store.Entry{
+		WorkspaceID: 1, Start: local, Stop: &localStop,
+		Duration: 3600, UpdatedAt: localStop, Dirty: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Pull(st, c, nil, ts("2026-01-01T00:00:00Z"), ts("2026-01-03T12:00:00Z")); err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+
+	for _, tc := range []struct {
+		remoteID int64
+		wantSeq  int
+	}{{901, 2}, {902, 3}, {903, 1}} {
+		got, err := st.EntryByRemoteID(tc.remoteID)
+		if err != nil || got == nil {
+			t.Fatalf("EntryByRemoteID(%d) = %+v err=%v", tc.remoteID, got, err)
+		}
+		if got.Seq != tc.wantSeq {
+			t.Errorf("entry %d seq = %d, want %d", tc.remoteID, got.Seq, tc.wantSeq)
+		}
+	}
+
+	// Numbers address the entries they were given to.
+	got, err := st.EntryByNum(2, ts("2026-01-02T20:00:00Z"))
+	if err != nil || got.Description != "second" {
+		t.Errorf("EntryByNum(2) = %+v err=%v, want the first pulled entry", got, err)
 	}
 }
 

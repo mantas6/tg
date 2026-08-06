@@ -19,9 +19,13 @@ import (
 	"github.com/mantas6/tg/store"
 )
 
+// newStore opens a throwaway store pinned to UTC, matching the time.UTC the
+// command tests pass as the display location: the store reckons entry days (and
+// so the per-day numbering `tg ls` shows) in its own location, which a real
+// invocation and its listing must agree on.
 func newStore(t *testing.T) *store.Store {
 	t.Helper()
-	s, err := store.Open(filepath.Join(t.TempDir(), "tg.db"))
+	s, err := store.OpenIn(filepath.Join(t.TempDir(), "tg.db"), time.UTC)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -496,9 +500,10 @@ func TestAddSyncFailureIsNonFatal(t *testing.T) {
 var modNow = time.Date(2026, 1, 2, 15, 7, 0, 0, time.UTC)
 
 // seedModDay inserts two clean, already-synced finished entries on testStart's
-// day (09:00-10:00 Fix login bug, 10:00-11:00 Code review) and publishes the
-// `tg ls` numbering for them, so entry 1 and 2 are addressable. Both carry a
-// remote id and are non-dirty, so a later mod/del has to mark them dirty itself.
+// day (09:00-10:00 Fix login bug, 10:00-11:00 Code review). Inserting them is
+// what numbers them, so they are addressable as entry 1 and 2 without any
+// listing having to run first. Both carry a remote id and are non-dirty, so a
+// later mod/del has to mark them dirty itself.
 func seedModDay(t *testing.T, s *store.Store) []store.Entry {
 	t.Helper()
 	stop1 := testStart.Add(time.Hour)
@@ -525,12 +530,10 @@ func seedModDay(t *testing.T, s *store.Store) []store.Entry {
 	if len(entries) != 2 {
 		t.Fatalf("fixture has %d entries, want 2", len(entries))
 	}
-	ids := make([]int64, len(entries))
 	for i, e := range entries {
-		ids[i] = e.ID
-	}
-	if err := s.SaveEntryRefs(ids); err != nil {
-		t.Fatal(err)
+		if e.Seq != i+1 {
+			t.Fatalf("fixture entry %d has seq %d, want %d", i, e.Seq, i+1)
+		}
 	}
 	return entries
 }
@@ -646,10 +649,12 @@ func TestModEntryByNumber(t *testing.T) {
 }
 
 // TestModRefusesEntryOlderThanToday covers the failsafe: once an entry's day is
-// over it is history, so `tg mod` refuses to touch it — whether addressed by
-// number or as the implicit last entry, and whether the edit is a retime or
-// just a description. Nothing is written, nothing is printed, and no request is
-// made to Toggl.
+// over it is history, so `tg mod` refuses to touch it as the implicit last
+// entry, whether the edit is a retime or just a description. Nothing is
+// written, nothing is printed, and no request is made to Toggl. Addressing
+// yesterday's entry BY NUMBER cannot even reach the failsafe (numbers are
+// per-day, so today's numbering holds nothing); that is covered by
+// TestModNumberIsScopedToToday.
 func TestModRefusesEntryOlderThanToday(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
@@ -673,10 +678,9 @@ func TestModRefusesEntryOlderThanToday(t *testing.T) {
 		desc     string
 		setDesc  bool
 	}{
-		{"by number, retime", 1, "8-9:30", "", false},
-		{"by number, relative retime", 1, "+:30", "", false},
-		{"by number, description", 1, "", "late edit", true},
-		{"last entry", 0, "+:30", "", false},
+		{"last entry, relative retime", 0, "+:30", "", false},
+		{"last entry, absolute retime", 0, "8-9:30", "", false},
+		{"last entry, description", 0, "", "late edit", true},
 	}
 	for _, tc := range cases {
 		var buf bytes.Buffer
@@ -703,6 +707,38 @@ func TestModRefusesEntryOlderThanToday(t *testing.T) {
 		if got.Duration != e.Duration || !got.Start.Equal(e.Start) || got.Description != e.Description {
 			t.Errorf("entry %d = %+v, want it unchanged (%+v)", i+1, got, e)
 		}
+	}
+}
+
+// TestModNumberIsScopedToToday pins where entry numbers point: they are per-day
+// and `mod`/`del` resolve them on today's day, so yesterday's number is simply
+// not addressable today (rather than silently reaching back into history, which
+// mod would refuse anyway). Nothing is written.
+func TestModNumberIsScopedToToday(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+
+	nextDay := modNow.AddDate(0, 0, 1)
+	var buf bytes.Buffer
+	err := cmdMod(&buf, s, nil, 1, "+:30", "", false, nextDay, time.UTC)
+	if !errors.Is(err, store.ErrNoEntryNum) {
+		t.Fatalf("err = %v, want store.ErrNoEntryNum", err)
+	}
+	if !strings.Contains(err.Error(), "2026-01-03") {
+		t.Errorf("err = %v, want it to name the day it searched", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("output = %q, want nothing written", buf.String())
+	}
+	if got := entryByID(t, s, entries[0].ID); got.Dirty {
+		t.Error("a refused mod must not touch the entry")
+	}
+
+	// `del` resolves numbers the same way.
+	buf.Reset()
+	if err := cmdDel(&buf, s, nil, 1, nextDay, time.UTC); !errors.Is(err, store.ErrNoEntryNum) {
+		t.Errorf("del err = %v, want store.ErrNoEntryNum", err)
 	}
 }
 
@@ -839,8 +875,9 @@ func TestModRejectsOverlap(t *testing.T) {
 	}
 }
 
-// TestModStaleNumber verifies an unknown/stale local number is reported as such
-// (wrapping store.ErrNoEntryRef) rather than silently modifying something else.
+// TestModStaleNumber verifies a number today's numbering never handed out is
+// reported as such (wrapping store.ErrNoEntryNum) rather than silently
+// modifying something else.
 func TestModStaleNumber(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
@@ -848,8 +885,8 @@ func TestModStaleNumber(t *testing.T) {
 
 	var buf bytes.Buffer
 	err := cmdMod(&buf, s, nil, 7, "+:30", "", false, modNow, time.UTC)
-	if !errors.Is(err, store.ErrNoEntryRef) {
-		t.Fatalf("err = %v, want ErrNoEntryRef", err)
+	if !errors.Is(err, store.ErrNoEntryNum) {
+		t.Fatalf("err = %v, want ErrNoEntryNum", err)
 	}
 	if !strings.Contains(err.Error(), "tg ls") {
 		t.Errorf("err = %v, want it to suggest `tg ls`", err)
@@ -969,9 +1006,14 @@ func TestDelRemovesEntry(t *testing.T) {
 	if len(left) != 1 || left[0].ID != entries[1].ID {
 		t.Fatalf("remaining entries = %+v, want only entry 2", left)
 	}
-	// The number now resolves to nothing rather than to another entry.
-	if _, err := s.EntryByRef(1); !errors.Is(err, store.ErrNoEntryRef) {
-		t.Errorf("EntryByRef(1) after del = %v, want ErrNoEntryRef", err)
+	// The number now resolves to nothing rather than to another entry: entry 2
+	// keeps being entry 2 instead of sliding into the freed slot.
+	if _, err := s.EntryByNum(1, modNow); !errors.Is(err, store.ErrNoEntryNum) {
+		t.Errorf("EntryByNum(1) after del = %v, want ErrNoEntryNum", err)
+	}
+	if got, err := s.EntryByNum(2, modNow); err != nil || got.ID != entries[1].ID {
+		t.Errorf("EntryByNum(2) after del = %+v err=%v, want the surviving entry %d",
+			got, err, entries[1].ID)
 	}
 }
 
@@ -1012,8 +1054,8 @@ func TestDelMarksDeletedAndDirty(t *testing.T) {
 	}
 }
 
-// TestDelStaleNumber verifies an unknown/stale number is an error naming
-// `tg ls`, and that nothing is deleted.
+// TestDelStaleNumber verifies a number that resolves to nothing is an error
+// naming `tg ls`, and that nothing is deleted.
 func TestDelStaleNumber(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
@@ -1021,8 +1063,8 @@ func TestDelStaleNumber(t *testing.T) {
 
 	var buf bytes.Buffer
 	err := cmdDel(&buf, s, nil, 9, modNow, time.UTC)
-	if !errors.Is(err, store.ErrNoEntryRef) {
-		t.Fatalf("err = %v, want ErrNoEntryRef", err)
+	if !errors.Is(err, store.ErrNoEntryNum) {
+		t.Fatalf("err = %v, want ErrNoEntryNum", err)
 	}
 	if !strings.Contains(err.Error(), "tg ls") {
 		t.Errorf("err = %v, want it to suggest `tg ls`", err)
@@ -1034,13 +1076,13 @@ func TestDelStaleNumber(t *testing.T) {
 		t.Errorf("entries = %d, want both kept", len(left))
 	}
 
-	// Deleting the same entry twice hits the same stale path, since the first
-	// delete unpublishes the number.
+	// Deleting the same entry twice hits the same path: the first delete
+	// retires the number, and it is not handed to the surviving entry.
 	if err := cmdDel(&buf, s, nil, 1, modNow, time.UTC); err != nil {
 		t.Fatalf("del: %v", err)
 	}
-	if err := cmdDel(&buf, s, nil, 1, modNow, time.UTC); !errors.Is(err, store.ErrNoEntryRef) {
-		t.Errorf("second del error = %v, want ErrNoEntryRef", err)
+	if err := cmdDel(&buf, s, nil, 1, modNow, time.UTC); !errors.Is(err, store.ErrNoEntryNum) {
+		t.Errorf("second del error = %v, want ErrNoEntryNum", err)
 	}
 }
 
@@ -2344,10 +2386,11 @@ func TestTodayCommandGolden(t *testing.T) {
 	assertGolden(t, "today.txt", buf.String())
 }
 
-// TestTodayCommandSavesRefs pins the side effect behind `tg mod 2` / `tg del 3`:
-// listing numbers the entries in display order and persists that mapping, in
-// both human and JSON mode, replacing whatever the previous listing published.
-func TestTodayCommandSavesRefs(t *testing.T) {
+// TestTodayCommandNumbers pins the numbers behind `tg mod 2` / `tg del 3`: the
+// listing shows each entry's own persistent per-day number (human and JSON
+// alike), and those are exactly the numbers the store resolves — listing is a
+// read, so it never renumbers anything.
+func TestTodayCommandNumbers(t *testing.T) {
 	s := newStore(t)
 	now, loc := seedSampleDay(t, s)
 
@@ -2364,16 +2407,16 @@ func TestTodayCommandSavesRefs(t *testing.T) {
 		t.Fatalf("today: %v", err)
 	}
 	for i, e := range entries {
-		got, err := s.EntryByRef(i + 1)
+		got, err := s.EntryByNum(i+1, now)
 		if err != nil {
-			t.Fatalf("EntryByRef(%d): %v", i+1, err)
+			t.Fatalf("EntryByNum(%d): %v", i+1, err)
 		}
 		if got.ID != e.ID {
-			t.Errorf("EntryByRef(%d).ID = %d, want %d", i+1, got.ID, e.ID)
+			t.Errorf("EntryByNum(%d).ID = %d, want %d", i+1, got.ID, e.ID)
 		}
 	}
-	if _, err := s.EntryByRef(3); !errors.Is(err, store.ErrNoEntryRef) {
-		t.Errorf("EntryByRef(3) error = %v, want ErrNoEntryRef", err)
+	if _, err := s.EntryByNum(3, now); !errors.Is(err, store.ErrNoEntryNum) {
+		t.Errorf("EntryByNum(3) error = %v, want ErrNoEntryNum", err)
 	}
 
 	// The numbers are in the human output and in the JSON shape.
@@ -2387,19 +2430,75 @@ func TestTodayCommandSavesRefs(t *testing.T) {
 	if !strings.Contains(buf.String(), `"num":1`) || !strings.Contains(buf.String(), `"num":2`) {
 		t.Errorf("json listing missing entry numbers:\n%s", buf.String())
 	}
-	if got, err := s.EntryByRef(2); err != nil || got.ID != entries[1].ID {
-		t.Errorf("EntryByRef(2) after --json = %+v err=%v, want id %d", got, err, entries[1].ID)
+
+	// Deleting the first entry leaves the second one addressable as 2: the
+	// listing shows the surviving numbers, gap and all.
+	if err := cmdDel(io.Discard, s, nil, 1, now, loc); err != nil {
+		t.Fatalf("del: %v", err)
+	}
+	buf.Reset()
+	if err := cmdToday(&buf, s, now, loc, 1, false, false); err != nil {
+		t.Fatalf("today after del: %v", err)
+	}
+	if !strings.Contains(buf.String(), "2  10:30-") {
+		t.Errorf("listing renumbered the survivor:\n%s", buf.String())
 	}
 
-	// A day with nothing tracked clears the mapping rather than leaving the
-	// previous day's numbers addressable.
+	// Listing a day with nothing tracked is just an empty listing; it cannot
+	// make another day's numbers resolve.
 	empty := now.AddDate(0, 0, 1)
 	buf.Reset()
 	if err := cmdToday(&buf, s, empty, loc, 1, false, false); err != nil {
 		t.Fatalf("today (empty day): %v", err)
 	}
-	if _, err := s.EntryByRef(1); !errors.Is(err, store.ErrNoEntryRef) {
-		t.Errorf("EntryByRef(1) error = %v, want ErrNoEntryRef after an empty listing", err)
+	if _, err := s.EntryByNum(2, empty); !errors.Is(err, store.ErrNoEntryNum) {
+		t.Errorf("EntryByNum(2) on an empty day = %v, want ErrNoEntryNum", err)
+	}
+	if got, err := s.EntryByNum(2, now); err != nil || got.ID != entries[1].ID {
+		t.Errorf("EntryByNum(2) = %+v err=%v, want the number still live on its own day", got, err)
+	}
+}
+
+// TestTodayCommandMultiDayGrouping covers `tg ls --days N`: each day carries its
+// own 1..N, so the listing groups entries under a date header instead of
+// showing a flat run of repeated numbers.
+func TestTodayCommandMultiDayGrouping(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	mk := func(start time.Time) {
+		stop := start.Add(time.Hour)
+		if _, err := s.CreateEntry(store.Entry{
+			WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
+			Start: start, Stop: &stop, Duration: 3600, UpdatedAt: stop,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	yesterday := time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC)
+	today := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
+	mk(yesterday)
+	mk(yesterday.Add(2 * time.Hour))
+	mk(today)
+
+	now := today.Add(3 * time.Hour)
+	var buf bytes.Buffer
+	if err := cmdToday(&buf, s, now, time.UTC, 2, false, false); err != nil {
+		t.Fatalf("today --days 2: %v", err)
+	}
+	got := buf.String()
+	for _, want := range []string{"Thu 2026-01-01", "Fri 2026-01-02"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("listing missing date header %q:\n%s", want, got)
+		}
+	}
+	// Both days number from 1, and today's single entry is entry 1 of its own
+	// day rather than entry 3 of the listing.
+	if strings.Count(got, "1  09:00-10:00") != 2 {
+		t.Errorf("want each day to start numbering at 1:\n%s", got)
+	}
+	if e, err := s.EntryByNum(1, now); err != nil || !e.Start.Equal(today) {
+		t.Errorf("EntryByNum(1, today) = %+v err=%v, want today's entry", e, err)
 	}
 }
 
