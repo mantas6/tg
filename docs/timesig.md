@@ -112,12 +112,17 @@ entry instead of to today/now:
 | Form                | Effect on the entry                                        |
 | ------------------- | ---------------------------------------------------------- |
 | absolute `9-10:30`  | start and stop are set on the **entry's own calendar day** |
-| relative `+:20`     | the entry **keeps its start**; stop becomes start + `DURATION` |
+| relative `+:20`     | the entry **keeps its start**; stop becomes stop + `DURATION` |
 
-So a relative timesign sets the entry's **length**, it does not re-anchor the
-entry to now: `tg mod +:30` means "that entry was 30 minutes long", leaving the
-start where it is. Fixing a length is the common correction, and re-anchoring
-would silently move an entry recorded hours (or days) ago.
+So a relative timesign **extends** the entry, it does not re-anchor it to now
+and it is not an absolute length: `tg mod +:30` means "that entry ran 30 minutes
+longer than recorded", so an entry ending at 14:00 ends at 14:30. Topping up the
+entry you just finished is the common correction; re-anchoring would silently
+move an entry recorded hours ago, and running `mod +:30` twice adds an hour
+rather than being a no-op.
+
+A **running** entry has no stop to add to, so `mod +DURATION` refuses it (use an
+absolute range to give it a finished span instead).
 
 `mod` only ever edits **today's** entries: an entry whose start falls on an
 earlier calendar day is refused before the timesign is even applied, so the

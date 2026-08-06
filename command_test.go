@@ -567,8 +567,9 @@ func entryByID(t *testing.T, s *store.Store, id int64) store.Entry {
 
 // TestModLastEntryRelativeTimesign covers the default target (no number = the
 // last entry) and mod's reading of a relative timesign: the start is kept and
-// the stop moves to start+duration, so the entry is simply made 30m long. It is
-// deliberately NOT re-anchored to now the way `tg add` would.
+// the stop is pushed 30m later, so the 1h entry becomes 1h30m. It is
+// deliberately NOT re-anchored to now the way `tg add` would be, and it is not
+// read as an absolute length either.
 func TestModLastEntryRelativeTimesign(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
@@ -580,7 +581,7 @@ func TestModLastEntryRelativeTimesign(t *testing.T) {
 		t.Fatalf("mod: %v", err)
 	}
 	out := buf.String()
-	for _, want := range []string{"Modified: Code review", "10:00-10:30", "0h30m"} {
+	for _, want := range []string{"Modified: Code review", "10:00-11:30", "1h30m"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output = %q, want %q", out, want)
 		}
@@ -590,12 +591,12 @@ func TestModLastEntryRelativeTimesign(t *testing.T) {
 	if !got.Start.Equal(last.Start) {
 		t.Errorf("start = %v, want it unchanged at %v", got.Start, last.Start)
 	}
-	wantStop := last.Start.Add(30 * time.Minute)
+	wantStop := last.Stop.Add(30 * time.Minute)
 	if got.Stop == nil || !got.Stop.Equal(wantStop) {
 		t.Errorf("stop = %v, want %v", got.Stop, wantStop)
 	}
-	if got.Duration != 1800 {
-		t.Errorf("duration = %d, want 1800", got.Duration)
+	if got.Duration != 5400 {
+		t.Errorf("duration = %d, want 5400", got.Duration)
 	}
 	if !got.Dirty {
 		t.Error("modified entry should be dirty for a later push")
@@ -610,6 +611,80 @@ func TestModLastEntryRelativeTimesign(t *testing.T) {
 	// The untargeted entry is untouched.
 	if first := entryByID(t, s, entries[0].ID); first.Dirty {
 		t.Error("mod touched the entry it was not addressing")
+	}
+}
+
+// TestModRelativeAddsToTheEnd pins the arithmetic a relative timesign does: the
+// duration is added to the entry's CURRENT end, not to its start and not to
+// now, so repeating the edit keeps pushing the end out. The 1h entry ending at
+// 11:00 ends at 11:30, then 12:45 — never at start+duration (which would shrink
+// it back to 30m) and never anywhere near modNow (15:07).
+func TestModRelativeAddsToTheEnd(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+	last := entries[1] // 10:00-11:00 Code review
+
+	var buf bytes.Buffer
+	if err := cmdMod(&buf, s, nil, 2, "+:30", "", false, modNow, time.UTC); err != nil {
+		t.Fatalf("first mod: %v", err)
+	}
+	buf.Reset()
+	if err := cmdMod(&buf, s, nil, 2, "+1:15", "", false, modNow, time.UTC); err != nil {
+		t.Fatalf("second mod: %v", err)
+	}
+
+	got := entryByID(t, s, last.ID)
+	if !got.Start.Equal(last.Start) {
+		t.Errorf("start = %v, want it unchanged at %v", got.Start, last.Start)
+	}
+	wantStop := time.Date(2026, 1, 2, 12, 45, 0, 0, time.UTC)
+	if got.Stop == nil || !got.Stop.Equal(wantStop) {
+		t.Errorf("stop = %v, want %v (11:00 + 30m + 1h15m)", got.Stop, wantStop)
+	}
+	if got.Duration != 9900 {
+		t.Errorf("duration = %d, want 9900 (2h45m)", got.Duration)
+	}
+}
+
+// TestModRelativeRefusesRunningEntry covers the one entry a relative timesign
+// cannot act on: a running entry has no end to add to, so mod says so instead
+// of inventing one from now. An absolute sign still gives it a finished span.
+func TestModRelativeRefusesRunningEntry(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	start := time.Date(2026, 1, 2, 14, 0, 0, 0, time.UTC)
+	id, err := s.CreateEntry(store.Entry{
+		WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
+		Start: start, Duration: -1, UpdatedAt: start,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	err = cmdMod(&buf, s, nil, 0, "+:30", "", false, modNow, time.UTC)
+	if err == nil {
+		t.Fatal("mod +:30 on a running entry = nil error, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "running") {
+		t.Errorf("err = %v, want it to say the entry is still running", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("output = %q, want nothing written", buf.String())
+	}
+	if got := entryByID(t, s, id); got.Stop != nil || got.Duration != -1 {
+		t.Errorf("entry = %+v, want it left running", got)
+	}
+
+	// An absolute timesign is still accepted and closes the entry.
+	buf.Reset()
+	if err := cmdMod(&buf, s, nil, 0, "14-14:30", "", false, modNow, time.UTC); err != nil {
+		t.Fatalf("absolute mod on a running entry: %v", err)
+	}
+	if got := entryByID(t, s, id); got.Stop == nil || got.Duration != 1800 {
+		t.Errorf("entry = %+v, want it finished at 14:30", got)
 	}
 }
 
@@ -639,8 +714,8 @@ func TestModLastEntrySkipsFutureEntry(t *testing.T) {
 	if out := buf.String(); !strings.Contains(out, "Modified: Code review") {
 		t.Errorf("output = %q, want the 10:00 entry, not the one starting later today", out)
 	}
-	if got := entryByID(t, s, entries[1].ID); got.Duration != 1800 {
-		t.Errorf("last entry duration = %d, want 1800", got.Duration)
+	if got := entryByID(t, s, entries[1].ID); got.Duration != 5400 {
+		t.Errorf("last entry duration = %d, want 5400", got.Duration)
 	}
 	if got := entryByID(t, s, futureID); got.Dirty || got.Duration != 3600 {
 		t.Errorf("future entry = %+v, want it untouched", got)
@@ -785,11 +860,13 @@ func TestModAllowsTodaysEntryAtDayEnd(t *testing.T) {
 
 	lateToday := time.Date(2026, 1, 2, 23, 59, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdMod(&buf, s, nil, 1, "+:30", "", false, lateToday, time.UTC); err != nil {
+	// Entry 2 (10:00-11:00) is the one with room to grow; entry 1 butts
+	// straight into it (see TestModRejectsOverlap).
+	if err := cmdMod(&buf, s, nil, 2, "+:30", "", false, lateToday, time.UTC); err != nil {
 		t.Fatalf("mod at 23:59 on the entry's own day: %v", err)
 	}
-	if got := entryByID(t, s, entries[0].ID); got.Duration != 1800 {
-		t.Errorf("duration = %d, want 1800", got.Duration)
+	if got := entryByID(t, s, entries[1].ID); got.Duration != 5400 {
+		t.Errorf("duration = %d, want 5400", got.Duration)
 	}
 }
 
@@ -840,10 +917,10 @@ func TestModTimesignAndDescription(t *testing.T) {
 		t.Fatalf("mod: %v", err)
 	}
 	got := entryByID(t, s, entries[1].ID)
-	if got.Duration != 2700 {
-		t.Errorf("duration = %d, want 2700", got.Duration)
+	if got.Duration != 6300 {
+		t.Errorf("duration = %d, want 6300 (1h + the 45m added)", got.Duration)
 	}
-	wantStop := entries[1].Start.Add(45 * time.Minute)
+	wantStop := entries[1].Stop.Add(45 * time.Minute)
 	if got.Stop == nil || !got.Stop.Equal(wantStop) {
 		t.Errorf("stop = %v, want %v", got.Stop, wantStop)
 	}
@@ -881,8 +958,8 @@ func TestModRejectsOverlap(t *testing.T) {
 	seedCatalog(t, s)
 	entries := seedModDay(t, s)
 
-	// Entry 1 is 09:00-10:00 and entry 2 is 10:00-11:00, so making entry 1 90
-	// minutes long would run into entry 2.
+	// Entry 1 is 09:00-10:00 and entry 2 is 10:00-11:00, so pushing entry 1's
+	// end 90 minutes later would run into entry 2.
 	var buf bytes.Buffer
 	err := cmdMod(&buf, s, nil, 1, "+1:30", "", false, modNow, time.UTC)
 	if err == nil {
@@ -901,11 +978,31 @@ func TestModRejectsOverlap(t *testing.T) {
 		t.Errorf("entry = %+v, want the original 1h clean entry", got)
 	}
 
-	// Exactly meeting the neighbour is fine, and the entry keeping its own
-	// (unchanged) span is not a self-overlap either.
+	// Shrink entry 1 to 09:00-09:30 so there is room to grow it back, which
+	// also shows the entry is not compared against its own old span.
 	buf.Reset()
-	if err := cmdMod(&buf, s, nil, 1, "+1", "", false, modNow, time.UTC); err != nil {
+	if err := cmdMod(&buf, s, nil, 1, "9-9:30", "", false, modNow, time.UTC); err != nil {
+		t.Fatalf("shrinking mod: %v", err)
+	}
+
+	// Extending it exactly up to the neighbour's start is allowed: the
+	// intervals are half-open, so 09:00-10:00 and 10:00-11:00 do not overlap.
+	buf.Reset()
+	if err := cmdMod(&buf, s, nil, 1, "+:30", "", false, modNow, time.UTC); err != nil {
 		t.Fatalf("touching mod: %v", err)
+	}
+	if got := entryByID(t, s, entries[0].ID); got.Duration != 3600 {
+		t.Errorf("duration = %d, want 3600 (grown back up to 10:00)", got.Duration)
+	}
+
+	// One more minute would collide, and a refused extension leaves the entry
+	// exactly as it was.
+	buf.Reset()
+	if err := cmdMod(&buf, s, nil, 1, "+:01", "", false, modNow, time.UTC); err == nil {
+		t.Error("extending past the neighbour's start = nil error, want an overlap error")
+	}
+	if got := entryByID(t, s, entries[0].ID); got.Duration != 3600 {
+		t.Errorf("duration = %d, want the 3600 from the previous edit", got.Duration)
 	}
 }
 
@@ -984,8 +1081,8 @@ func TestModPushesBestEffort(t *testing.T) {
 	if method != http.MethodPut {
 		t.Errorf("method = %s %s, want PUT (an update, not a create)", method, path)
 	}
-	if got, _ := body["stop"].(string); got != "2026-01-02T10:30:00Z" {
-		t.Errorf("pushed stop = %v, want 2026-01-02T10:30:00Z", body["stop"])
+	if got, _ := body["stop"].(string); got != "2026-01-02T11:30:00Z" {
+		t.Errorf("pushed stop = %v, want 2026-01-02T11:30:00Z", body["stop"])
 	}
 	if got := entryByID(t, s, entries[1].ID); got.Dirty {
 		t.Error("entry should be clean after a successful push")
@@ -1013,8 +1110,8 @@ func TestModSyncFailureIsNonFatal(t *testing.T) {
 		t.Errorf("output = %q, want a sync warning", buf.String())
 	}
 	got := entryByID(t, s, entries[1].ID)
-	if !got.Dirty || got.Duration != 1800 {
-		t.Errorf("entry = %+v, want the 30m edit kept and dirty", got)
+	if !got.Dirty || got.Duration != 5400 {
+		t.Errorf("entry = %+v, want the +30m edit kept and dirty", got)
 	}
 }
 

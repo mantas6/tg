@@ -92,11 +92,11 @@ the same one `tg status` reports, resolved the same way: today's newest entry
 that has already started (see below).
 
 ```sh
-tg mod +:30                      # the last entry was 30 minutes long
-tg mod 2 +1:15                   # entry 2 was 1h15m long
+tg mod +:30                      # the last entry ran 30 minutes longer
+tg mod 2 +1:15                   # push entry 2's end 1h15m later
 tg mod 2 9-10:30                 # set entry 2's range explicitly
 tg mod --desc "reset password"   # only change the last entry's description
-tg mod 2 +:45 --desc "rebased"   # retime and re-describe entry 2
+tg mod 2 +:45 --desc "rebased"   # extend and re-describe entry 2
 tg del 3                         # remove entry 3
 ```
 
@@ -104,9 +104,12 @@ A timesign is read relative to the entry, not to today:
 
 - an **absolute** range (`9-10:30`) sets start and stop on the entry's *own*
   calendar day, so an edit never drags an entry onto another day;
-- a **relative** timesign (`+:30`) sets only the entry's *length*: the start is
-  kept and the stop moves to start + duration. It does **not** re-anchor the
-  entry to now the way `tg add` does.
+- a **relative** timesign (`+:30`) *extends* the entry by that duration: the
+  start is kept and the stop moves to stop + duration, so an entry ending at
+  14:00 ends at 14:30 after `tg mod +:30`. It does **not** re-anchor the entry
+  to now the way `tg add` does, and it is not an absolute length — repeating it
+  keeps adding time. A still-running entry has no end to extend, so `mod +`
+  refuses it; retime it with an absolute range instead.
 
 **Only today's entries can be modified.** Once an entry's calendar day is over
 it is history: `tg mod` refuses it outright ("refusing to update an entry older
@@ -262,8 +265,8 @@ mod:  numbers are the per-day ones shown by `tg ls`; without one the
       last entry is modified: today's newest already-started entry, the
       same one `tg status` shows. Only TODAY's entries can be modified.
       An absolute timesign sets the range on the entry's own day; a
-      relative one only sets its LENGTH, keeping the start (`tg mod
-      +:30` makes the entry 30m long).
+      relative one EXTENDS the entry, keeping the start (`tg mod +:30`
+      pushes the end 30m later).
 ```
 
 ### Syncing

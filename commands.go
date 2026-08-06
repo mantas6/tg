@@ -122,10 +122,11 @@ func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, proj
 //	absolute (9-10:30)  start and stop are set on the ENTRY's calendar day,
 //	                    not today's, so an edit never drags an entry onto
 //	                    another day.
-//	relative (+:20)     only the DURATION is taken: the entry keeps its start
-//	                    and its stop moves to start+duration. Fixing an
-//	                    entry's length is what mod is for, so a relative
-//	                    timesign is not re-anchored to now here (unlike `add`).
+//	relative (+:20)     only the DURATION is taken and it EXTENDS the entry:
+//	                    the start is kept and the stop moves to stop+duration.
+//	                    Topping up the entry you just finished is what mod is
+//	                    for, so a relative timesign is neither re-anchored to
+//	                    now (unlike `add`) nor read as an absolute length.
 //
 // setDesc distinguishes an omitted --desc from an explicit empty one, so a
 // description can be cleared with --desc "".
@@ -217,14 +218,20 @@ func modTarget(st *store.Store, ref int, now time.Time) (store.Entry, error) {
 
 // modSpan computes an entry's new [start, stop) from a timesign: an absolute
 // sign is resolved on the entry's own calendar day, while a relative sign
-// contributes only its duration, keeping the entry's start (see cmdMod).
+// contributes only its duration, which is ADDED to the entry's stop — the start
+// never moves (see cmdMod). A running entry has no stop to add to, so extending
+// one is refused; it can still be retimed with an absolute sign.
 func modSpan(e store.Entry, timesign string, now time.Time, loc *time.Location) (time.Time, time.Time, error) {
 	if timesig.IsRelative(timesign) {
 		span, err := timesig.ParseRelative(timesign, now, loc)
 		if err != nil {
 			return time.Time{}, time.Time{}, err
 		}
-		return e.Start, e.Start.Add(span.Duration()), nil
+		if e.Stop == nil {
+			return time.Time{}, time.Time{}, errors.New(
+				"entry is still running: it has no end time to extend, give an absolute timesign (e.g. 9-10:30) instead")
+		}
+		return e.Start, e.Stop.Add(span.Duration()), nil
 	}
 	// e.Start stands in for "now" so the range lands on the entry's day.
 	span, err := timesig.ParseAbsolute(timesign, e.Start, loc)
