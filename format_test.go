@@ -54,6 +54,44 @@ func TestFormatHM(t *testing.T) {
 	}
 }
 
+// TestFormatOvertime pins the signed h:mm rendering used by `tg daily`: unlike
+// formatHM it must keep the sign (so an under-run is never read as an over-run)
+// and it must not clamp negatives to zero.
+func TestFormatOvertime(t *testing.T) {
+	cases := []struct {
+		in   time.Duration
+		want string
+	}{
+		{0, "+0:00"},
+		{30 * time.Minute, "+0:30"},
+		{-30 * time.Minute, "-0:30"},
+		{75 * time.Minute, "+1:15"},
+		{-75 * time.Minute, "-1:15"},
+		{8 * time.Hour, "+8:00"},
+		{-25 * time.Hour, "-25:00"},
+		// Sub-minute residue is truncated, not rounded up into a minute.
+		{-30*time.Second - 90*time.Minute, "-1:30"},
+		{59 * time.Second, "+0:00"},
+	}
+	for _, c := range cases {
+		if got := formatOvertime(c.in); got != c.want {
+			t.Errorf("formatOvertime(%v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestPlural(t *testing.T) {
+	cases := []struct {
+		n    int
+		want string
+	}{{0, "0 days"}, {1, "1 day"}, {2, "2 days"}}
+	for _, c := range cases {
+		if got := plural(c.n, "day"); got != c.want {
+			t.Errorf("plural(%d) = %q, want %q", c.n, got, c.want)
+		}
+	}
+}
+
 func TestFormatClock(t *testing.T) {
 	tm := time.Date(2026, 1, 2, 9, 15, 0, 0, time.UTC)
 	if got := formatClock(tm, time.UTC); got != "09:15" {
@@ -700,4 +738,143 @@ func TestRenderCurrentNoneGolden(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertGolden(t, "current_none.json", js.String())
+}
+
+// sampleMonth builds the `tg daily` fixture: three worked days, one over the
+// 8h target, one under it, and one exactly on target that is still running.
+func sampleMonth() []dailyRow {
+	day := func(d int) time.Time { return time.Date(2026, 1, d, 0, 0, 0, 0, time.UTC) }
+	return []dailyRow{
+		{Day: day(5), Tracked: 8*time.Hour + 30*time.Minute},
+		{Day: day(6), Tracked: 7*time.Hour + 15*time.Minute},
+		{Day: day(7), Tracked: 8 * time.Hour, Running: true},
+	}
+}
+
+func TestRenderDailyGolden(t *testing.T) {
+	var buf bytes.Buffer
+	renderDaily(&buf, sampleMonth(), 8*time.Hour, time.UTC)
+	assertGolden(t, "daily.txt", buf.String())
+}
+
+func TestRenderDailyJSONGolden(t *testing.T) {
+	var buf bytes.Buffer
+	if err := renderDailyJSON(&buf, sampleMonth(), 8*time.Hour, time.UTC); err != nil {
+		t.Fatal(err)
+	}
+	assertGolden(t, "daily.json", buf.String())
+}
+
+// TestRenderDailyOvertimeColumn pins the per-day arithmetic: each line's third
+// column is tracked-minus-target, signed, and the divider footer sums the days
+// and measures them against target x the number of LISTED days.
+func TestRenderDailyOvertimeColumn(t *testing.T) {
+	var buf bytes.Buffer
+	renderDaily(&buf, sampleMonth(), 8*time.Hour, time.UTC)
+	out := buf.String()
+	for _, want := range []string{
+		"Mon 2026-01-05  8h30m   +0:30\n",
+		"Tue 2026-01-06  7h15m   -0:45\n",
+		"Wed 2026-01-07  8h00m*  +0:00\n",
+		todayDivider + "\n",
+		// 23h45m tracked against a 3 x 8h = 24h target.
+		"Total: 23h45m  -0:15  (3 days x 8h00m)",
+		// A running day keeps the day total live, so the footer says so.
+		"(* running)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("renderDaily output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestRenderDailyTargetChangesOnlyOvertime pins that --target moves the
+// overtime column (and the footer's target) without touching the tracked
+// durations, and that a non-integer target works.
+func TestRenderDailyTargetChangesOnlyOvertime(t *testing.T) {
+	var buf bytes.Buffer
+	renderDaily(&buf, sampleMonth(), 7*time.Hour+30*time.Minute, time.UTC)
+	out := buf.String()
+	for _, want := range []string{
+		"Mon 2026-01-05  8h30m   +1:00\n",
+		"Tue 2026-01-06  7h15m   -0:15\n",
+		"Wed 2026-01-07  8h00m*  +0:30\n",
+		// 23h45m against 3 x 7h30m = 22h30m.
+		"Total: 23h45m  +1:15  (3 days x 7h30m)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("renderDaily(target 7h30m) missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestRenderDailyZeroTarget covers the degenerate target: with no target every
+// overtime figure is just the tracked time, and nothing is ever negative.
+func TestRenderDailyZeroTarget(t *testing.T) {
+	var buf bytes.Buffer
+	renderDaily(&buf, sampleMonth(), 0, time.UTC)
+	out := buf.String()
+	if strings.Contains(out, "-") && !strings.Contains(out, "2026-01") {
+		t.Fatalf("unexpected negative overtime:\n%s", out)
+	}
+	for _, want := range []string{"+8:30", "+7:15", "+8:00", "Total: 23h45m  +23:45  (3 days x 0h00m)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("renderDaily(target 0) missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestRenderDailySingleDayFooter covers the footer's singular noun and the fact
+// that the footer target scales with the number of listed days.
+func TestRenderDailySingleDayFooter(t *testing.T) {
+	var buf bytes.Buffer
+	rows := []dailyRow{{Day: time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC), Tracked: 9 * time.Hour}}
+	renderDaily(&buf, rows, 8*time.Hour, time.UTC)
+	if want := "Total: 9h00m   +1:00  (1 day x 8h00m)\n"; !strings.Contains(buf.String(), want) {
+		t.Errorf("renderDaily footer = %q, want it to contain %q", buf.String(), want)
+	}
+	if strings.Contains(buf.String(), "running") {
+		t.Errorf("no entry is running, footer should not say so:\n%s", buf.String())
+	}
+}
+
+func TestRenderDailyEmpty(t *testing.T) {
+	var buf bytes.Buffer
+	renderDaily(&buf, nil, 8*time.Hour, time.UTC)
+	if got := buf.String(); got != "No entries this month.\n" {
+		t.Errorf("empty daily = %q", got)
+	}
+}
+
+// TestRenderDailyJSONEmpty pins that the JSON shape stays a well-formed object
+// with an empty (never null) days array when nothing was tracked.
+func TestRenderDailyJSONEmpty(t *testing.T) {
+	var buf bytes.Buffer
+	if err := renderDailyJSON(&buf, nil, 8*time.Hour, time.UTC); err != nil {
+		t.Fatal(err)
+	}
+	want := `{"days":[],"total_seconds":0,"target_seconds":28800,"overtime_seconds":0}` + "\n"
+	if got := buf.String(); got != want {
+		t.Errorf("empty daily json = %q, want %q", got, want)
+	}
+}
+
+// TestRenderDailyLocalDates pins that the date column is rendered in the
+// reporting location, not UTC: a day whose midnight is stored in a UTC-offset
+// zone must still print its own calendar date.
+func TestRenderDailyLocalDates(t *testing.T) {
+	loc := time.FixedZone("UTC+3", 3*60*60)
+	rows := []dailyRow{{Day: time.Date(2026, 1, 5, 0, 0, 0, 0, loc), Tracked: 8 * time.Hour}}
+	var human bytes.Buffer
+	renderDaily(&human, rows, 8*time.Hour, loc)
+	if !strings.Contains(human.String(), "Mon 2026-01-05") {
+		t.Errorf("daily = %q, want the local date", human.String())
+	}
+	var js bytes.Buffer
+	if err := renderDailyJSON(&js, rows, 8*time.Hour, loc); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(js.String(), `"date":"2026-01-05"`) {
+		t.Errorf("daily json = %q, want the local date", js.String())
+	}
 }

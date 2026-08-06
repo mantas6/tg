@@ -21,6 +21,21 @@ func formatHM(d time.Duration) string {
 	return fmt.Sprintf("%dh%02dm", total/60, total%60)
 }
 
+// formatOvertime renders a signed difference from a target as "<sign><h>:<mm>"
+// (e.g. +0:30, -1:15, +0:00 for exactly on target). The sign is always present
+// so an over- and an under-run can never be confused, and the minutes are
+// always two digits so the column lines up. Unlike formatHM this must keep the
+// sign, which is why it does not clamp negatives; the value is truncated to
+// whole minutes.
+func formatOvertime(d time.Duration) string {
+	sign := "+"
+	if d < 0 {
+		sign, d = "-", -d
+	}
+	total := int(d / time.Minute)
+	return fmt.Sprintf("%s%d:%02d", sign, total/60, total%60)
+}
+
 // formatClock renders the wall-clock time (HH:MM) in loc.
 func formatClock(t time.Time, loc *time.Location) string {
 	return t.In(loc).Format("15:04")
@@ -556,6 +571,98 @@ func renderTotalsJSON(w io.Writer, rows []totalRow) error {
 		})
 	}
 	out.TotalSeconds = total
+	return writeJSON(w, out)
+}
+
+// dailyDayJSON / dailyJSON are the stable --json shapes for `daily`. Date is
+// the calendar day (YYYY-MM-DD) in the reporting location, OvertimeSeconds is
+// the signed difference between the day's tracked time and TargetSeconds, and
+// the top-level OvertimeSeconds is measured against TargetSeconds multiplied by
+// the number of listed days (see cmdDaily).
+type dailyDayJSON struct {
+	Date            string `json:"date"`
+	DurationSeconds int64  `json:"duration_seconds"`
+	OvertimeSeconds int64  `json:"overtime_seconds"`
+	Running         bool   `json:"running"`
+}
+
+type dailyJSON struct {
+	Days            []dailyDayJSON `json:"days"`
+	Tracked         int64          `json:"total_seconds"`
+	TargetSeconds   int64          `json:"target_seconds"`
+	OvertimeSeconds int64          `json:"overtime_seconds"`
+}
+
+// dailyTotals sums the listed days and reports the aggregate the footer needs:
+// the tracked total, the overall overtime against target * number of listed
+// days, and whether any listed day is still accumulating time.
+func dailyTotals(rows []dailyRow, target time.Duration) (tracked, overtime time.Duration, anyRunning bool) {
+	for _, r := range rows {
+		tracked += r.Tracked
+		if r.Running {
+			anyRunning = true
+		}
+	}
+	return tracked, tracked - target*time.Duration(len(rows)), anyRunning
+}
+
+// renderDaily writes the per-day table for the current month: one line per day
+// that has tracked time, with its date, tracked total and signed overtime
+// against target, then a divider and the month's total. The footer's overtime is
+// measured against target multiplied by the number of LISTED days, so days with
+// nothing tracked never count against it (see cmdDaily).
+//
+// A day holding a still-running entry is flagged with `*` next to its duration
+// (and the footer says so), mirroring how `tg ls` marks a running entry: its
+// total is live and keeps growing.
+func renderDaily(w io.Writer, rows []dailyRow, target time.Duration, loc *time.Location) {
+	if len(rows) == 0 {
+		fmt.Fprintln(w, "No entries this month.")
+		return
+	}
+	for _, r := range rows {
+		dur := formatHM(r.Tracked)
+		if r.Running {
+			dur += "*"
+		}
+		fmt.Fprintf(w, "%s  %-8s%s\n", dayHeader(r.Day, loc), dur, formatOvertime(r.Tracked-target))
+	}
+	tracked, overtime, anyRunning := dailyTotals(rows, target)
+	fmt.Fprintln(w, todayDivider)
+	footer := fmt.Sprintf("Total: %-8s%s  (%s x %s)",
+		formatHM(tracked), formatOvertime(overtime), plural(len(rows), "day"), formatHM(target))
+	if anyRunning {
+		footer += "   (* running)"
+	}
+	fmt.Fprintln(w, footer)
+}
+
+// plural renders a count with its noun, appending "s" for anything but one
+// ("1 day", "2 days"). Only the regular plural is needed here.
+func plural(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
+// renderDailyJSON writes the per-day totals as the stable JSON shape.
+func renderDailyJSON(w io.Writer, rows []dailyRow, target time.Duration, loc *time.Location) error {
+	out := dailyJSON{
+		Days:          make([]dailyDayJSON, 0, len(rows)),
+		TargetSeconds: int64(target / time.Second),
+	}
+	for _, r := range rows {
+		out.Days = append(out.Days, dailyDayJSON{
+			Date:            r.Day.In(loc).Format("2006-01-02"),
+			DurationSeconds: int64(r.Tracked / time.Second),
+			OvertimeSeconds: int64((r.Tracked - target) / time.Second),
+			Running:         r.Running,
+		})
+	}
+	tracked, overtime, _ := dailyTotals(rows, target)
+	out.Tracked = int64(tracked / time.Second)
+	out.OvertimeSeconds = int64(overtime / time.Second)
 	return writeJSON(w, out)
 }
 

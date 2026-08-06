@@ -1,0 +1,1 @@
+{"days":[{"date":"2026-01-05","duration_seconds":30600,"overtime_seconds":1800,"running":false},{"date":"2026-01-06","duration_seconds":26100,"overtime_seconds":-2700,"running":false},{"date":"2026-01-07","duration_seconds":28800,"overtime_seconds":0,"running":true}],"total_seconds":85500,"target_seconds":28800,"overtime_seconds":-900}

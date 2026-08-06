@@ -235,6 +235,47 @@ entries, and the last one shows the idle time since the newest entry stopped
 listing groups the entries under a date header; `mod`/`del` address today's
 numbers. `--json` emits the same data with `num` on each entry.
 
+### Daily totals and overtime
+
+`daily` zooms out to the month: one line per day with everything you tracked on
+it and how far that is from a daily target, then a footer with the month's
+total and its overall overtime.
+
+```sh
+$ tg daily
+Mon 2026-01-05  8h30m   +0:30
+Tue 2026-01-06  7h15m   -0:45
+Wed 2026-01-07  8h00m*  +0:00
+----------------------------------------
+Total: 23h45m  -0:15  (3 days x 8h00m)   (* running)
+```
+
+The window is the **whole current calendar month**, from the 1st to the last
+day, regardless of where in the month you run it. The target is `-t`/`--target`
+in hours, defaulting to **8**, and fractional targets work (`-t 7.5`). The third
+column is that day's tracked time minus the target, always signed, as
+`h:mm` — `+0:30` is half an hour over, `-0:45` is three quarters of an hour
+short.
+
+```sh
+tg daily              # this month against an 8h/day target
+tg daily -t 6         # ...against 6h/day
+tg daily --target 7.5 # half-hour targets are fine
+tg daily --json       # machine-readable
+```
+
+**Only days you actually tracked something get a line**, and the footer's target
+is the daily target multiplied by the number of *listed* days — so weekends and
+days off never accumulate a deficit, and the total overtime answers "am I ahead
+or behind on the days I worked?". A day is summed from the entries that *start*
+on it (an entry crossing midnight counts entirely towards the day it began), and
+a still-running entry contributes its elapsed time so far exactly as `tg ls` and
+`tg status` count it, marked with `*`.
+
+Everything comes from the local store, so run `tg pull` first if days tracked
+elsewhere are missing. `--json` returns
+`{"days":[{"date":"2026-01-05","duration_seconds":30600,"overtime_seconds":1800,"running":false},...],"total_seconds":...,"target_seconds":28800,"overtime_seconds":...}`.
+
 ## Usage
 
 ```
@@ -247,6 +288,8 @@ commands:
   del <num>                 delete the entry numbered by `tg ls`
   current | status          last entry, gap, day total        [--json]
   today   | list | ls       show today's entries     [--days N] [--json]
+  daily                     this month's time per day and overtime
+                            vs a daily target      [-t HOURS] [--json]
   tasks                     list cached tasks                 [--all] [--json]
   grep <fragment>           list cached tasks matching it     [--all] [--json]
   projects                  list cached projects with ids     [--all] [--json]

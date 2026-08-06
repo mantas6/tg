@@ -44,6 +44,8 @@ func run(cmd string, args []string) error {
 		return runCurrent(args)
 	case "today", "list", "ls":
 		return runToday(args)
+	case "daily":
+		return runDaily(args)
 	case "tasks":
 		return runTasks(args)
 	case "grep":
@@ -201,6 +203,29 @@ func runToday(args []string) error {
 	defer st.Close()
 	color := term.IsTerminal(int(os.Stdout.Fd()))
 	return cmdToday(os.Stdout, st, time.Now(), time.Local, *days, *jsonOut, color)
+}
+
+// dailyDefaultTarget is `tg daily`'s default target: 8 hours worked per day.
+const dailyDefaultTarget = 8
+
+func runDaily(args []string) error {
+	fs := newFlagSet("daily")
+	jsonOut := fs.Bool("json", false, "emit JSON")
+	// --target and -t are aliases bound to the same variable: the target hours
+	// worked per day that each listed day's overtime is measured against. It is
+	// a float so half days (`-t 7.5`) work.
+	var target float64
+	fs.Float64Var(&target, "target", dailyDefaultTarget, "target hours worked per day")
+	fs.Float64Var(&target, "t", dailyDefaultTarget, "target hours worked per day (alias of --target)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	return cmdDaily(os.Stdout, st, time.Now(), time.Local, target, *jsonOut)
 }
 
 func runTasks(args []string) error {
@@ -611,6 +636,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  del <num>                 delete the entry numbered by `tg ls`")
 	fmt.Fprintln(w, "  current | status          last entry, gap, day total        [--json]")
 	fmt.Fprintln(w, "  today   | list | ls       show today's entries     [--days N] [--json]")
+	fmt.Fprintln(w, "  daily                     this month's time per day and overtime")
+	fmt.Fprintln(w, "                            vs a daily target      [-t HOURS] [--json]")
 	fmt.Fprintln(w, "  tasks                     list cached tasks                 [--all] [--json]")
 	fmt.Fprintln(w, "  grep <fragment>           list cached tasks matching it     [--all] [--json]")
 	fmt.Fprintln(w, "  projects                  list cached projects with ids     [--all] [--json]")

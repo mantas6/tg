@@ -20,20 +20,22 @@ func TestCompletionZsh(t *testing.T) {
 		"tg tasks --json",
 		// Every command and alias accepted by run() must be offered.
 		"'auth:", "'add:", "'mod:", "'del:", "\"current:", "\"status:",
-		"\"today:", "\"list:", "\"ls:", "'tasks:", "'grep:", "'projects:",
+		"\"today:", "\"list:", "\"ls:", "\"daily:", "'tasks:", "'grep:", "'projects:",
 		"\"update:", "'push:", "\"pull:", "'total:",
 		"'completion:", "'help:",
 		// `projects` has a subcommand of its own.
 		"__tg_projects_cmds", "'update:sync all workspace projects'",
 		// Per-command argument handling for the commands with flags.
 		"        add)", "        mod)", "        del)",
-		"        current|status|push)", "        today|list|ls)",
+		"        current|status|push)", "        today|list|ls)", "        daily)",
 		"        tasks)", "        grep)", "        projects)", "        update)",
 		"        pull)", "        total)",
 		"        completion)",
 		"--desc[", "--description[", "--json[", "--all[", "--since[", "--days[",
 		// `pull` widens its default today-only window with -a/--all.
 		"--all[pull this month", "-a[pull this month",
+		// `daily` measures each day against -t/--target.
+		"--target[target hours", "-t[target hours",
 	} {
 		if !strings.Contains(out, marker) {
 			t.Errorf("completion script missing %q", marker)
@@ -61,7 +63,7 @@ func TestCompletionCoversDispatch(t *testing.T) {
 	out := buf.String()
 	for _, cmd := range []string{
 		"auth", "add", "mod", "del", "current", "status", "today", "list",
-		"ls", "tasks", "grep", "projects", "update", "push",
+		"ls", "daily", "tasks", "grep", "projects", "update", "push",
 		"pull", "total", "completion", "help",
 	} {
 		if !strings.Contains(out, "'"+cmd+":") && !strings.Contains(out, `"`+cmd+":") {

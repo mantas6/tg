@@ -69,6 +69,7 @@ _tg() {
         "today:show today's entries"
         "list:show today's entries"
         "ls:show today's entries"
+        "daily:this month's tracked time per day and overtime"
         'tasks:list cached tasks'
         'grep:list cached tasks matching a fragment'
         'projects:list cached projects with ids (projects update syncs them)'
@@ -111,6 +112,11 @@ _tg() {
           ;;
         today|list|ls)
           _arguments '--json[emit JSON]' '--days[number of days to look back]:days:'
+          ;;
+        daily)
+          _arguments '--json[emit JSON]' \
+            '--target[target hours worked per day (default 8)]:hours:' \
+            '-t[target hours worked per day (alias of --target)]:hours:'
           ;;
         tasks)
           _arguments '--all[include inactive tasks]' '--json[emit JSON]'

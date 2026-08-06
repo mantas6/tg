@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -2801,6 +2802,277 @@ func TestTodayCommandTrailingGap(t *testing.T) {
 		todayDivider + "\nTotal: 1h00m\n"
 	if buf.String() != want {
 		t.Errorf("listing = %q, want %q", buf.String(), want)
+	}
+}
+
+// seedDailyMonth records one finished entry per given (day, duration) pair in
+// January 2026 and returns a `now` inside that month. Each entry starts at
+// 09:00 on its day, so the durations never collide.
+func seedDailyMonth(t *testing.T, s *store.Store, days map[int]time.Duration) {
+	t.Helper()
+	seedCatalog(t, s)
+	for day, d := range days {
+		start := time.Date(2026, 1, day, 9, 0, 0, 0, time.UTC)
+		stop := start.Add(d)
+		if _, err := s.CreateEntry(store.Entry{
+			WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
+			Start: start, Stop: &stop, Duration: int64(d / time.Second), UpdatedAt: stop,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestDailySumsPerDay is the core of `tg daily`: entries are summed per
+// calendar day, one line each, and every line reports the day's overtime
+// against the target. The footer sums the month and measures it against
+// target x the number of listed days.
+func TestDailySumsPerDay(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	// Two entries on 2026-01-05 (8h30m together) and one on 2026-01-06 (7h15m).
+	mk := func(start time.Time, d time.Duration) {
+		stop := start.Add(d)
+		if _, err := s.CreateEntry(store.Entry{
+			WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
+			Start: start, Stop: &stop, Duration: int64(d / time.Second), UpdatedAt: stop,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk(time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC), 4*time.Hour)
+	mk(time.Date(2026, 1, 5, 13, 0, 0, 0, time.UTC), 4*time.Hour+30*time.Minute)
+	mk(time.Date(2026, 1, 6, 9, 0, 0, 0, time.UTC), 7*time.Hour+15*time.Minute)
+
+	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
+	var buf bytes.Buffer
+	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false); err != nil {
+		t.Fatalf("daily: %v", err)
+	}
+	want := "Mon 2026-01-05  8h30m   +0:30\n" +
+		"Tue 2026-01-06  7h15m   -0:45\n" +
+		todayDivider + "\n" +
+		"Total: 15h45m  -0:15  (2 days x 8h00m)\n"
+	if buf.String() != want {
+		t.Errorf("daily = %q, want %q", buf.String(), want)
+	}
+}
+
+// TestDailyCoversWholeMonth pins the window: the listing spans the FULL
+// calendar month containing now, so days later in the month are included even
+// when now sits early in it, while the neighbouring months are excluded.
+func TestDailyCoversWholeMonth(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	mk := func(day time.Time) {
+		stop := day.Add(time.Hour)
+		if _, err := s.CreateEntry(store.Entry{
+			WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
+			Start: day, Stop: &stop, Duration: 3600, UpdatedAt: stop,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk(time.Date(2025, 12, 31, 9, 0, 0, 0, time.UTC)) // previous month
+	mk(time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC))   // first day of the month
+	mk(time.Date(2026, 1, 31, 9, 0, 0, 0, time.UTC))  // last day of the month
+	mk(time.Date(2026, 2, 1, 9, 0, 0, 0, time.UTC))   // next month
+
+	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+	var buf bytes.Buffer
+	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false); err != nil {
+		t.Fatalf("daily: %v", err)
+	}
+	got := buf.String()
+	for _, want := range []string{"Thu 2026-01-01", "Sat 2026-01-31", "(2 days x 8h00m)"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("daily missing %q:\n%s", want, got)
+		}
+	}
+	for _, gone := range []string{"2025-12-31", "2026-02-01"} {
+		if strings.Contains(got, gone) {
+			t.Errorf("daily leaked a neighbouring month (%s):\n%s", gone, got)
+		}
+	}
+}
+
+// TestDailyTargetFlag pins -t/--target: it shifts every overtime figure,
+// including the footer's, and defaults to 8 hours.
+func TestDailyTargetFlag(t *testing.T) {
+	s := newStore(t)
+	seedDailyMonth(t, s, map[int]time.Duration{5: 6 * time.Hour, 6: 6 * time.Hour})
+	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		target float64
+		day    string
+		footer string
+	}{
+		{dailyDefaultTarget, "-2:00", "Total: 12h00m  -4:00  (2 days x 8h00m)"},
+		{6, "+0:00", "Total: 12h00m  +0:00  (2 days x 6h00m)"},
+		{7.5, "-1:30", "Total: 12h00m  -3:00  (2 days x 7h30m)"},
+		{0, "+6:00", "Total: 12h00m  +12:00  (2 days x 0h00m)"},
+	}
+	for _, c := range cases {
+		var buf bytes.Buffer
+		if err := cmdDaily(&buf, s, now, time.UTC, c.target, false); err != nil {
+			t.Fatalf("daily -t %v: %v", c.target, err)
+		}
+		got := buf.String()
+		// The overtime closes each day line, so the newline keeps the footer's
+		// own figure out of the count.
+		if strings.Count(got, c.day+"\n") != 2 {
+			t.Errorf("daily -t %v: want both days at %q:\n%s", c.target, c.day, got)
+		}
+		if !strings.Contains(got, c.footer) {
+			t.Errorf("daily -t %v: want footer %q:\n%s", c.target, c.footer, got)
+		}
+	}
+}
+
+// TestDailyRejectsNegativeTarget: a negative target is nonsense (it would turn
+// every worked minute into double overtime), so it is a usage error rather than
+// something silently accepted.
+func TestDailyRejectsNegativeTarget(t *testing.T) {
+	s := newStore(t)
+	seedDailyMonth(t, s, map[int]time.Duration{5: 8 * time.Hour})
+	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
+	var buf bytes.Buffer
+	err := cmdDaily(&buf, s, now, time.UTC, -1, false)
+	if err == nil {
+		t.Fatalf("daily -t -1: expected an error, got %q", buf.String())
+	}
+	if !strings.Contains(err.Error(), "negative") {
+		t.Errorf("daily -t -1 error = %v, want it to mention the negative target", err)
+	}
+}
+
+// TestDailyCountsRunningEntryLive pins that a running entry contributes its
+// elapsed-so-far time, exactly as `tg today`/`tg status` count it, and that the
+// day is flagged as still growing.
+func TestDailyCountsRunningEntryLive(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	start := time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC)
+	if _, err := s.CreateEntry(store.Entry{
+		WorkspaceID: 1, ProjectID: p(1), TaskID: p(12),
+		Start: start, Duration: -1, UpdatedAt: start,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 1, 5, 11, 30, 0, 0, time.UTC)
+	var buf bytes.Buffer
+	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false); err != nil {
+		t.Fatalf("daily: %v", err)
+	}
+	want := "Mon 2026-01-05  2h30m*  -5:30\n" +
+		todayDivider + "\n" +
+		"Total: 2h30m   -5:30  (1 day x 8h00m)   (* running)\n"
+	if buf.String() != want {
+		t.Errorf("daily = %q, want %q", buf.String(), want)
+	}
+}
+
+// TestDailySkipsDeletedEntries pins that a soft-deleted entry stops counting
+// towards its day, and that a day left with nothing tracked drops out of the
+// listing entirely (which also shrinks the footer's target).
+func TestDailySkipsDeletedEntries(t *testing.T) {
+	s := newStore(t)
+	seedDailyMonth(t, s, map[int]time.Duration{5: 8 * time.Hour, 6: 8 * time.Hour})
+	now := time.Date(2026, 1, 6, 20, 0, 0, 0, time.UTC)
+
+	// Entry 1 of 2026-01-06 is today's only entry, so `tg del 1` removes it.
+	if err := cmdDel(io.Discard, s, nil, 1, now, time.UTC); err != nil {
+		t.Fatalf("del: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false); err != nil {
+		t.Fatalf("daily: %v", err)
+	}
+	got := buf.String()
+	if strings.Contains(got, "2026-01-06") {
+		t.Errorf("daily still lists the emptied day:\n%s", got)
+	}
+	if !strings.Contains(got, "Total: 8h00m   +0:00  (1 day x 8h00m)") {
+		t.Errorf("daily footer should count only the surviving day:\n%s", got)
+	}
+}
+
+// TestDailyEmptyMonth covers a month with nothing tracked: an explanatory line
+// rather than an error, so `tg daily` is safe to run on a fresh install.
+func TestDailyEmptyMonth(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
+	var buf bytes.Buffer
+	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false); err != nil {
+		t.Fatalf("daily: %v", err)
+	}
+	if got := buf.String(); got != "No entries this month.\n" {
+		t.Errorf("daily = %q, want the empty-month line", got)
+	}
+}
+
+// TestDailyJSON pins the machine-readable shape: one object per listed day with
+// its date, tracked seconds and signed overtime, plus the month totals and the
+// per-day target the overtimes were measured against.
+func TestDailyJSON(t *testing.T) {
+	s := newStore(t)
+	seedDailyMonth(t, s, map[int]time.Duration{
+		5: 8*time.Hour + 30*time.Minute,
+		6: 7*time.Hour + 15*time.Minute,
+	})
+	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
+	var buf bytes.Buffer
+	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, true); err != nil {
+		t.Fatalf("daily --json: %v", err)
+	}
+	var got dailyJSON
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal %q: %v", buf.String(), err)
+	}
+	want := dailyJSON{
+		Days: []dailyDayJSON{
+			{Date: "2026-01-05", DurationSeconds: 30600, OvertimeSeconds: 1800},
+			{Date: "2026-01-06", DurationSeconds: 26100, OvertimeSeconds: -2700},
+		},
+		Tracked:         56700,
+		TargetSeconds:   28800,
+		OvertimeSeconds: -900,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("daily --json = %+v, want %+v", got, want)
+	}
+}
+
+// TestGroupDailyBucketsByStartDay pins the grouping rule: an entry belongs
+// entirely to the calendar day it STARTED on, even when it runs past midnight,
+// and the rows come out in chronological order.
+func TestGroupDailyBucketsByStartDay(t *testing.T) {
+	loc := time.UTC
+	start1 := time.Date(2026, 1, 5, 9, 0, 0, 0, loc)
+	stop1 := start1.Add(time.Hour)
+	// 23:00 -> 01:00 the next day: two hours, all of them on the 6th.
+	start2 := time.Date(2026, 1, 6, 23, 0, 0, 0, loc)
+	stop2 := start2.Add(2 * time.Hour)
+	rows := groupDaily([]store.Entry{
+		{Start: start1, Stop: &stop1, Duration: 3600},
+		{Start: start2, Stop: &stop2, Duration: 7200},
+	}, time.Date(2026, 1, 7, 9, 0, 0, 0, loc), loc)
+
+	if len(rows) != 2 {
+		t.Fatalf("groupDaily returned %d rows, want 2", len(rows))
+	}
+	if !rows[0].Day.Equal(time.Date(2026, 1, 5, 0, 0, 0, 0, loc)) || rows[0].Tracked != time.Hour {
+		t.Errorf("rows[0] = %+v, want the 5th with 1h", rows[0])
+	}
+	if !rows[1].Day.Equal(time.Date(2026, 1, 6, 0, 0, 0, 0, loc)) || rows[1].Tracked != 2*time.Hour {
+		t.Errorf("rows[1] = %+v, want the 6th with 2h (the whole cross-midnight entry)", rows[1])
+	}
+	if rows[0].Running || rows[1].Running {
+		t.Errorf("no entry is running: %+v", rows)
 	}
 }
 

@@ -370,6 +370,75 @@ func cmdTotal(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, fr
 	return nil
 }
 
+// dailyRow is one line of `tg daily`: a calendar day with everything tracked on
+// it. Day is midnight of that day in the reporting location, Tracked is the sum
+// of the day's entry durations (live elapsed for a running one, see
+// displayDuration) and Running records that one of them has not stopped yet, so
+// the total is still growing.
+type dailyRow struct {
+	Day     time.Time
+	Tracked time.Duration
+	Running bool
+}
+
+// cmdDaily reports tracked time per calendar day for the CURRENT month: the
+// window is [first of now's month, first of next month) in loc, so the listing
+// covers the whole month regardless of how far into it now is. Everything comes
+// from the local store (store.EntriesBetween) — daily never talks to Toggl, so
+// run `tg pull` first if remote days are missing.
+//
+// Only days that actually have entries get a line: a month is listed as the
+// days you worked, not as 30 rows most of which are empty. That is also what
+// makes the footer's target meaningful, since it is targetHours multiplied by
+// the number of LISTED days (weekends and days off never count against you).
+//
+// targetHours is the target number of hours per day (`-t`/`--target`, default
+// dailyDefaultTarget); each day line and the footer show the signed difference
+// between tracked and target time (see formatOvertime). A zero target is
+// allowed and simply makes every overtime figure equal the tracked time; a
+// negative one is a usage error.
+//
+// A running entry contributes its live elapsed time, exactly as `tg today` and
+// `tg status` count it, so today's row keeps moving while something runs.
+func cmdDaily(w io.Writer, st *store.Store, now time.Time, loc *time.Location, targetHours float64, jsonOut bool) error {
+	if targetHours < 0 {
+		return fmt.Errorf("invalid target %g: hours per day must not be negative", targetHours)
+	}
+	from := startOfMonth(now, loc)
+	to := from.AddDate(0, 1, 0)
+	entries, err := st.EntriesBetween(from, to)
+	if err != nil {
+		return err
+	}
+	rows := groupDaily(entries, now, loc)
+	target := time.Duration(targetHours * float64(time.Hour))
+	if jsonOut {
+		return renderDailyJSON(w, rows, target, loc)
+	}
+	renderDaily(w, rows, target, loc)
+	return nil
+}
+
+// groupDaily folds entries into one row per calendar day in loc, preserving the
+// chronological order EntriesBetween returns. Entries are bucketed by the day
+// their START falls on, so an entry that crosses midnight counts entirely
+// towards the day it began — the same day its per-day number belongs to.
+func groupDaily(entries []store.Entry, now time.Time, loc *time.Location) []dailyRow {
+	var rows []dailyRow
+	for _, e := range entries {
+		day := startOfDay(e.Start, loc)
+		if n := len(rows); n == 0 || !rows[n-1].Day.Equal(day) {
+			rows = append(rows, dailyRow{Day: day})
+		}
+		r := &rows[len(rows)-1]
+		r.Tracked += displayDuration(e, now)
+		if e.Stop == nil {
+			r.Running = true
+		}
+	}
+	return rows
+}
+
 // cmdCurrent shows the terse status line: the most recent entry, the idle gap
 // between its stop and now, and today's tracked total.
 //
