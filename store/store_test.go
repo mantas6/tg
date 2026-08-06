@@ -562,7 +562,7 @@ func TestUpdateEntry(t *testing.T) {
 	if err := s.UpdateEntry(Entry{
 		ID: id, Description: "new", Start: newStart, Stop: &newStop,
 		Duration: 2700, UpdatedAt: modAt,
-	}); err != nil {
+	}, modAt, time.UTC); err != nil {
 		t.Fatalf("UpdateEntry: %v", err)
 	}
 
@@ -605,12 +605,103 @@ func TestUpdateEntry(t *testing.T) {
 func TestUpdateEntryMissing(t *testing.T) {
 	s := openTest(t)
 	at := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
-	err := s.UpdateEntry(Entry{ID: 999, Start: at, Duration: 60, UpdatedAt: at})
+	err := s.UpdateEntry(Entry{ID: 999, Start: at, Duration: 60, UpdatedAt: at}, at, time.UTC)
 	if err == nil {
 		t.Fatal("UpdateEntry on a missing id = nil error, want an error")
 	}
 	if !strings.Contains(err.Error(), "999") {
 		t.Errorf("err = %v, want it to name the id", err)
+	}
+}
+
+// TestUpdateEntryRefusesOlderThanToday pins the failsafe at its lowest level:
+// the store itself refuses to rewrite an entry that sits on an earlier calendar
+// day, no matter what the caller asks for, and leaves the row untouched.
+func TestUpdateEntryRefusesOlderThanToday(t *testing.T) {
+	s := openTest(t)
+	at := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
+	stop := at.Add(time.Hour)
+	id := mustCreate(t, s, Entry{
+		RemoteID: ptrInt(4242), WorkspaceID: 1, Description: "old",
+		Start: at, Stop: ptrTime(stop), Duration: 3600,
+		UpdatedAt: at, SyncedAt: ptrTime(at), Dirty: false,
+	})
+
+	// One day later the entry is history and must not be editable.
+	now := time.Date(2026, 1, 3, 10, 0, 0, 0, time.UTC)
+	newStop := at.Add(30 * time.Minute)
+	err := s.UpdateEntry(Entry{
+		ID: id, Description: "new", Start: at, Stop: &newStop,
+		Duration: 1800, UpdatedAt: now,
+	}, now, time.UTC)
+	if !errors.Is(err, ErrEntryTooOld) {
+		t.Fatalf("err = %v, want ErrEntryTooOld", err)
+	}
+
+	dirty, err := s.DirtyEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dirty) != 0 {
+		t.Errorf("dirty entries = %d, want 0 (nothing written)", len(dirty))
+	}
+	got, err := s.EntryByRemoteID(4242)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Description != "old" || got.Duration != 3600 {
+		t.Errorf("entry = %+v, want the original 1h %q entry", got, "old")
+	}
+}
+
+// TestUpdateEntryRefusesMoveIntoThePast covers the other half of the failsafe:
+// today's entry may be edited, but not dragged back onto an earlier day.
+func TestUpdateEntryRefusesMoveIntoThePast(t *testing.T) {
+	s := openTest(t)
+	now := time.Date(2026, 1, 3, 10, 0, 0, 0, time.UTC)
+	at := time.Date(2026, 1, 3, 9, 0, 0, 0, time.UTC)
+	stop := at.Add(time.Hour)
+	id := mustCreate(t, s, Entry{
+		WorkspaceID: 1, Description: "today", Start: at, Stop: ptrTime(stop),
+		Duration: 3600, UpdatedAt: at,
+	})
+
+	past := at.AddDate(0, 0, -1)
+	pastStop := past.Add(time.Hour)
+	err := s.UpdateEntry(Entry{
+		ID: id, Description: "today", Start: past, Stop: &pastStop,
+		Duration: 3600, UpdatedAt: now,
+	}, now, time.UTC)
+	if !errors.Is(err, ErrEntryTooOld) {
+		t.Fatalf("err = %v, want ErrEntryTooOld", err)
+	}
+	entries, err := s.EntriesBetween(past, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || !entries[0].Start.Equal(at) {
+		t.Errorf("entries = %+v, want the entry left on its own day %v", entries, at)
+	}
+}
+
+// TestCheckEditableDayLocalMidnight verifies the day boundary is the one in the
+// supplied location, not UTC: just after local midnight, an entry from a few
+// hours earlier is already yesterday's and is refused.
+func TestCheckEditableDayLocalMidnight(t *testing.T) {
+	loc := time.FixedZone("UTC+3", 3*60*60)
+	now := time.Date(2026, 1, 3, 0, 30, 0, 0, loc)
+
+	if err := CheckEditableDay(time.Date(2026, 1, 3, 0, 5, 0, 0, loc), now, loc); err != nil {
+		t.Errorf("entry from earlier today = %v, want it editable", err)
+	}
+	err := CheckEditableDay(time.Date(2026, 1, 2, 23, 30, 0, 0, loc), now, loc)
+	if !errors.Is(err, ErrEntryTooOld) {
+		t.Fatalf("err = %v, want ErrEntryTooOld", err)
+	}
+	// The same instants are the same calendar day in UTC, so a UTC-only
+	// comparison would (wrongly) allow the edit.
+	if err := CheckEditableDay(time.Date(2026, 1, 2, 23, 30, 0, 0, loc), now, time.UTC); err != nil {
+		t.Errorf("UTC-framed check = %v, want it editable there", err)
 	}
 }
 

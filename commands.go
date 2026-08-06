@@ -118,7 +118,8 @@ func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, proj
 // The timesign is interpreted by form (see docs/timesig.md):
 //
 //	absolute (9-10:30)  start and stop are set on the ENTRY's calendar day,
-//	                    not today's, so an entry from yesterday stays there.
+//	                    not today's, so an edit never drags an entry onto
+//	                    another day.
 //	relative (+:20)     only the DURATION is taken: the entry keeps its start
 //	                    and its stop moves to start+duration. Fixing an
 //	                    entry's length is what mod is for, so a relative
@@ -126,6 +127,12 @@ func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, proj
 //
 // setDesc distinguishes an omitted --desc from an explicit empty one, so a
 // description can be cleared with --desc "".
+//
+// Only today's entries may be edited: an entry that started on an earlier
+// calendar day (in loc), or an edit that would move an entry back before
+// today's midnight, is refused with an error wrapping store.ErrEntryTooOld.
+// The same failsafe is enforced again inside store.UpdateEntry, so no code path
+// can write past days.
 //
 // Retiming is refused when the new span would overlap another entry (the entry
 // being modified is excluded from the check). The entry is stored dirty so a
@@ -140,10 +147,19 @@ func cmdMod(w io.Writer, st *store.Store, c *api.Client, ref int, timesign, desc
 	if err != nil {
 		return err
 	}
+	// Failsafe: history is read-only. Checked here so the refusal is the first
+	// thing reported (before any timesign or overlap complaint) and again in
+	// store.UpdateEntry, which is the write that must never happen.
+	if err := store.CheckEditableDay(e.Start, now, loc); err != nil {
+		return err
+	}
 
 	if timesign != "" {
 		start, stop, err := modSpan(e, timesign, now, loc)
 		if err != nil {
+			return err
+		}
+		if err := store.CheckEditableDay(start, now, loc); err != nil {
 			return err
 		}
 		// Time is exclusive (see cmdAdd), but the entry may of course keep
@@ -165,7 +181,7 @@ func cmdMod(w io.Writer, st *store.Store, c *api.Client, ref int, timesign, desc
 	}
 
 	e.UpdatedAt = now
-	if err := st.UpdateEntry(e); err != nil {
+	if err := st.UpdateEntry(e, now, loc); err != nil {
 		return err
 	}
 	renderEntryChange(w, "Modified", e, loc)

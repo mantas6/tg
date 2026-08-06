@@ -119,6 +119,10 @@ entry to now: `tg mod +:30` means "that entry was 30 minutes long", leaving the
 start where it is. Fixing a length is the common correction, and re-anchoring
 would silently move an entry recorded hours (or days) ago.
 
+`mod` only ever edits **today's** entries: an entry whose start falls on an
+earlier calendar day is refused before the timesign is even applied, so the
+"entry's own calendar day" is in practice today's.
+
 The duration rules are otherwise unchanged: `+0` and friends are still errors,
 and the 5-minute flooring is irrelevant here because only `DURATION` is used.
 Absolute ranges still cannot cross midnight, and the resulting span must not

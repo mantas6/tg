@@ -612,17 +612,16 @@ func TestModLastEntryRelativeTimesign(t *testing.T) {
 
 // TestModEntryByNumber verifies an explicit local number addresses that entry
 // (not the last one) and that an absolute timesign sets the range on the
-// ENTRY's own calendar day rather than today's.
+// ENTRY's own calendar day. Editing is restricted to today, so the entry's day
+// and today's are necessarily the same here; the restriction itself is covered
+// by TestModRefusesEntryOlderThanToday.
 func TestModEntryByNumber(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 	entries := seedModDay(t, s)
 
-	// modNow is 15:07 on the same day as the fixture; to prove the entry's own
-	// day is used, run mod a day later.
-	nextDay := modNow.AddDate(0, 0, 1)
 	var buf bytes.Buffer
-	if err := cmdMod(&buf, s, nil, 1, "8-9:30", "", false, nextDay, time.UTC); err != nil {
+	if err := cmdMod(&buf, s, nil, 1, "8-9:30", "", false, modNow, time.UTC); err != nil {
 		t.Fatalf("mod: %v", err)
 	}
 	if out := buf.String(); !strings.Contains(out, "Modified: Fix login bug") || !strings.Contains(out, "08:00-09:30") {
@@ -643,6 +642,84 @@ func TestModEntryByNumber(t *testing.T) {
 	}
 	if second := entryByID(t, s, entries[1].ID); second.Dirty {
 		t.Error("mod 1 must not touch entry 2")
+	}
+}
+
+// TestModRefusesEntryOlderThanToday covers the failsafe: once an entry's day is
+// over it is history, so `tg mod` refuses to touch it — whether addressed by
+// number or as the implicit last entry, and whether the edit is a retime or
+// just a description. Nothing is written, nothing is printed, and no request is
+// made to Toggl.
+func TestModRefusesEntryOlderThanToday(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+
+	// The fixture sits on 2026-01-02; run mod the next day.
+	nextDay := modNow.AddDate(0, 0, 1)
+
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+
+	cases := []struct {
+		name     string
+		ref      int
+		timesign string
+		desc     string
+		setDesc  bool
+	}{
+		{"by number, retime", 1, "8-9:30", "", false},
+		{"by number, relative retime", 1, "+:30", "", false},
+		{"by number, description", 1, "", "late edit", true},
+		{"last entry", 0, "+:30", "", false},
+	}
+	for _, tc := range cases {
+		var buf bytes.Buffer
+		err := cmdMod(&buf, s, c, tc.ref, tc.timesign, tc.desc, tc.setDesc, nextDay, time.UTC)
+		if !errors.Is(err, store.ErrEntryTooOld) {
+			t.Errorf("%s: err = %v, want store.ErrEntryTooOld", tc.name, err)
+		}
+		if err != nil && !strings.Contains(err.Error(), "2026-01-02") {
+			t.Errorf("%s: err = %v, want it to name the entry's day", tc.name, err)
+		}
+		if buf.Len() != 0 {
+			t.Errorf("%s: output = %q, want nothing written", tc.name, buf.String())
+		}
+	}
+	if hits != 0 {
+		t.Errorf("Toggl requests = %d, want 0 (a refused mod syncs nothing)", hits)
+	}
+
+	for i, e := range entries {
+		got := entryByID(t, s, e.ID)
+		if got.Dirty {
+			t.Errorf("entry %d is dirty, want it untouched", i+1)
+		}
+		if got.Duration != e.Duration || !got.Start.Equal(e.Start) || got.Description != e.Description {
+			t.Errorf("entry %d = %+v, want it unchanged (%+v)", i+1, got, e)
+		}
+	}
+}
+
+// TestModAllowsTodaysEntryAtDayEnd guards the boundary from the other side: an
+// entry started earlier on the current day stays editable right up to midnight.
+func TestModAllowsTodaysEntryAtDayEnd(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+
+	lateToday := time.Date(2026, 1, 2, 23, 59, 0, 0, time.UTC)
+	var buf bytes.Buffer
+	if err := cmdMod(&buf, s, nil, 1, "+:30", "", false, lateToday, time.UTC); err != nil {
+		t.Fatalf("mod at 23:59 on the entry's own day: %v", err)
+	}
+	if got := entryByID(t, s, entries[0].ID); got.Duration != 1800 {
+		t.Errorf("duration = %d, want 1800", got.Duration)
 	}
 }
 

@@ -101,10 +101,16 @@ tg del 3                         # remove entry 3
 A timesign is read relative to the entry, not to today:
 
 - an **absolute** range (`9-10:30`) sets start and stop on the entry's *own*
-  calendar day, so an entry from yesterday stays on yesterday;
+  calendar day, so an edit never drags an entry onto another day;
 - a **relative** timesign (`+:30`) sets only the entry's *length*: the start is
   kept and the stop moves to start + duration. It does **not** re-anchor the
   entry to now the way `tg add` does.
+
+**Only today's entries can be modified.** Once an entry's calendar day is over
+it is history: `tg mod` refuses it outright ("refusing to update an entry older
+than today") and nothing is written locally or sent to Toggl. The check is
+enforced again in the storage layer, so no command can rewrite a past day. Use
+the Toggl web app for genuine corrections to older days.
 
 `mod` requires at least one change (a timesign, `--desc`, or both), refuses a new
 range that would overlap a *different* entry, and `--desc ""` clears the
@@ -207,9 +213,10 @@ timesign: absolute 9-:30, 10-11, 10:30-11:15 (today) or relative
       +:20, +1, +1:20 (that long, ending at the last 5m mark).
       Full spec: docs/timesig.md
 mod:  numbers come from the last `tg ls`; without one the last entry
-      is modified. An absolute timesign sets the range on the entry's
-      own day; a relative one only sets its LENGTH, keeping the start
-      (`tg mod +:30` makes the entry 30m long).
+      is modified. Only TODAY's entries can be modified. An absolute
+      timesign sets the range on the entry's own day; a relative one
+      only sets its LENGTH, keeping the start (`tg mod +:30` makes the
+      entry 30m long).
 ```
 
 ### Syncing

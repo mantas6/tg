@@ -315,13 +315,56 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	return res.LastInsertId()
 }
 
+// ErrEntryTooOld reports a refusal to edit an entry that belongs to a calendar
+// day before today: tg only ever rewrites the day being tracked, so history is
+// never silently rewritten (see CheckEditableDay and UpdateEntry).
+var ErrEntryTooOld = errors.New("refusing to update an entry older than today")
+
+// CheckEditableDay is the failsafe behind every entry edit: it rejects any
+// start that falls on a calendar day before now's day in loc, wrapping
+// ErrEntryTooOld. It is applied both to where an entry currently sits and to
+// where an edit would move it, so neither an old entry can be touched nor a
+// current one pushed back into the past. A nil loc means time.Local.
+func CheckEditableDay(start, now time.Time, loc *time.Location) error {
+	if loc == nil {
+		loc = time.Local
+	}
+	today := dayStart(now, loc)
+	if start.Before(today) {
+		return fmt.Errorf("%w: %s is before today (%s); only today's entries can be modified",
+			ErrEntryTooOld, start.In(loc).Format("2006-01-02 15:04"), today.Format("2006-01-02"))
+	}
+	return nil
+}
+
+// dayStart returns midnight of t's calendar day in loc.
+func dayStart(t time.Time, loc *time.Location) time.Time {
+	t = t.In(loc)
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, loc)
+}
+
 // UpdateEntry writes the locally editable fields of an entry — description,
 // start, stop and duration — back to the row identified by e.ID, then records
 // e.UpdatedAt as the LWW clock and marks the row dirty so a later `tg push`
 // sends the change. It backs `tg mod`; remote_id, synced_at and the deleted
 // flag are deliberately left alone, so an already-synced entry keeps its remote
 // identity and is PUT rather than re-created. A missing id is an error.
-func (s *Store) UpdateEntry(e Entry) error {
+//
+// This is the single local edit path, so it is also where the "today only"
+// failsafe lives: the stored start and the incoming start are both checked
+// against now (in loc) and an entry from an earlier day is refused with an
+// error wrapping ErrEntryTooOld, before anything is written.
+func (s *Store) UpdateEntry(e Entry, now time.Time, loc *time.Location) error {
+	stored, err := s.entryStart(e.ID)
+	if err != nil {
+		return err
+	}
+	if err := CheckEditableDay(stored, now, loc); err != nil {
+		return err
+	}
+	if err := CheckEditableDay(e.Start, now, loc); err != nil {
+		return err
+	}
 	res, err := s.db.Exec(`
 UPDATE entries SET description = ?, start = ?, stop = ?, duration = ?,
   updated_at = ?, dirty = 1 WHERE id = ?`,
@@ -331,6 +374,21 @@ UPDATE entries SET description = ?, start = ?, stop = ?, duration = ?,
 		return err
 	}
 	return checkAffected(res, e.ID)
+}
+
+// entryStart reads the persisted start of an entry by local id, so an edit can
+// be judged by where the entry actually sits rather than by the (possibly
+// already rewritten) copy the caller hands in. A missing id is an error.
+func (s *Store) entryStart(id int64) (time.Time, error) {
+	var start string
+	err := s.db.QueryRow("SELECT start FROM entries WHERE id = ?", id).Scan(&start)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, fmt.Errorf("no entry with id %d", id)
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	return parseTime(start)
 }
 
 // SoftDeleteEntry marks an entry deleted and dirty, keeping the row so the
