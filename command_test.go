@@ -94,7 +94,7 @@ func TestAddCreatesFinishedEntry(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, "9-:30", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, nil, 1, nil, false, "9-:30", "login", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	out := buf.String()
@@ -152,7 +152,7 @@ func TestAddAcceptsRelativeTimesign(t *testing.T) {
 	// 15:07 floors to 15:05, so "+:20" spans 14:45-15:05.
 	now := time.Date(2026, 1, 2, 15, 7, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, "+:20", "login", "", now, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, nil, 1, nil, false, "+:20", "login", "", now, time.UTC); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	if out := buf.String(); !strings.Contains(out, "14:45-15:05") {
@@ -184,7 +184,7 @@ func TestAddRejectsInvalidRelativeTimesign(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, "+:00", "login", "", addNow, time.UTC); err == nil {
+	if err := cmdAdd(&buf, s, nil, 1, nil, false, "+:00", "login", "", addNow, time.UTC); err == nil {
 		t.Fatal("add with +:00 = nil error, want an error")
 	}
 	if entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 0 {
@@ -202,11 +202,11 @@ func TestAddDurationStartsAtLastEntryEnd(t *testing.T) {
 	// The last entry today ends at 10:00, so "1:30" is 10:00-11:30 regardless
 	// of what time it is now (15:00).
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, "9-10", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, nil, 1, nil, false, "9-10", "login", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add first: %v", err)
 	}
 	buf.Reset()
-	if err := cmdAdd(&buf, s, nil, 1, nil, "1:30", "review", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, nil, 1, nil, false, "1:30", "review", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add duration: %v", err)
 	}
 	if out := buf.String(); !strings.Contains(out, "10:00-11:30") || !strings.Contains(out, "1h30m") {
@@ -235,7 +235,7 @@ func TestAddDurationStartsAtLastEntryEnd(t *testing.T) {
 
 	// A second bare duration chains off the one just added.
 	buf.Reset()
-	if err := cmdAdd(&buf, s, nil, 1, nil, ":30", "Fix", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, nil, 1, nil, false, ":30", "Fix", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add chained duration: %v", err)
 	}
 	if out := buf.String(); !strings.Contains(out, "11:30-12:00") {
@@ -253,13 +253,13 @@ func TestAddDurationWithoutLastEntry(t *testing.T) {
 
 	// Yesterday's entry is history: LastEntry is today-only, so it must not
 	// become the anchor.
-	if err := cmdAdd(&bytes.Buffer{}, s, nil, 1, nil, "9-10", "login", "",
+	if err := cmdAdd(&bytes.Buffer{}, s, nil, 1, nil, false, "9-10", "login", "",
 		addNow.AddDate(0, 0, -1), time.UTC); err != nil {
 		t.Fatalf("seed yesterday: %v", err)
 	}
 
 	var buf bytes.Buffer
-	err := cmdAdd(&buf, s, nil, 1, nil, "1:30", "review", "", addNow, time.UTC)
+	err := cmdAdd(&buf, s, nil, 1, nil, false, "1:30", "review", "", addNow, time.UTC)
 	if err == nil {
 		t.Fatal("add 1:30 with no entry today = nil error, want an error")
 	}
@@ -288,7 +288,7 @@ func TestAddDurationWithRunningLastEntry(t *testing.T) {
 	seedRunning(t, s, 12, testStart)
 
 	var buf bytes.Buffer
-	err := cmdAdd(&buf, s, nil, 1, nil, "1:30", "login", "", addNow, time.UTC)
+	err := cmdAdd(&buf, s, nil, 1, nil, false, "1:30", "login", "", addNow, time.UTC)
 	if err == nil {
 		t.Fatal("add 1:30 after a running entry = nil error, want an error")
 	}
@@ -311,16 +311,16 @@ func TestAddDurationRejectsOverlap(t *testing.T) {
 	// It is 10:30. Tracked so far today: 09:00-10:00. Booked for later:
 	// 11:00-12:00, which starts after now and so is never the anchor.
 	now := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
-	if err := cmdAdd(&bytes.Buffer{}, s, nil, 1, nil, "9-10", "login", "", now, time.UTC); err != nil {
+	if err := cmdAdd(&bytes.Buffer{}, s, nil, 1, nil, false, "9-10", "login", "", now, time.UTC); err != nil {
 		t.Fatalf("add first: %v", err)
 	}
-	if err := cmdAdd(&bytes.Buffer{}, s, nil, 1, nil, "11-12", "Fix", "", now, time.UTC); err != nil {
+	if err := cmdAdd(&bytes.Buffer{}, s, nil, 1, nil, false, "11-12", "Fix", "", now, time.UTC); err != nil {
 		t.Fatalf("add later: %v", err)
 	}
 
 	var buf bytes.Buffer
 	// 10:00 + 1h30m = 11:30, which straddles the 11:00-12:00 entry.
-	err := cmdAdd(&buf, s, nil, 1, nil, "1:30", "review", "", now, time.UTC)
+	err := cmdAdd(&buf, s, nil, 1, nil, false, "1:30", "review", "", now, time.UTC)
 	if err == nil {
 		t.Fatal("overlapping duration add = nil error, want an error")
 	}
@@ -335,7 +335,7 @@ func TestAddDurationRejectsOverlap(t *testing.T) {
 
 	// Exactly filling the gap up to the booked entry is fine (back to back).
 	buf.Reset()
-	if err := cmdAdd(&buf, s, nil, 1, nil, "1", "review", "", now, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, nil, 1, nil, false, "1", "review", "", now, time.UTC); err != nil {
 		t.Fatalf("gap-filling add: %v", err)
 	}
 	if out := buf.String(); !strings.Contains(out, "10:00-11:00") {
@@ -349,12 +349,12 @@ func TestAddRejectsInvalidDuration(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	if err := cmdAdd(&bytes.Buffer{}, s, nil, 1, nil, "9-10", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&bytes.Buffer{}, s, nil, 1, nil, false, "9-10", "login", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add first: %v", err)
 	}
 	for _, ts := range []string{"0", ":00", "24", "1:60", "1:"} {
 		var buf bytes.Buffer
-		err := cmdAdd(&buf, s, nil, 1, nil, ts, "review", "", addNow, time.UTC)
+		err := cmdAdd(&buf, s, nil, 1, nil, false, ts, "review", "", addNow, time.UTC)
 		if err == nil || !strings.Contains(err.Error(), "timesign") {
 			t.Errorf("add %q: err = %v, want a timesign parse error", ts, err)
 		}
@@ -371,7 +371,7 @@ func TestAddWithDescription(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, "9-:30", "login", "reset password flow", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, nil, 1, nil, false, "9-:30", "login", "reset password flow", addNow, time.UTC); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
@@ -399,7 +399,7 @@ func TestAddDescriptionInPushPayload(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, c, 1, nil, "9-:30", "login", "reset password flow", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, c, 1, nil, false, "9-:30", "login", "reset password flow", addNow, time.UTC); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	if got, _ := body["description"].(string); got != "reset password flow" {
@@ -415,7 +415,7 @@ func TestAddExactWins(t *testing.T) {
 
 	var buf bytes.Buffer
 	// "Fix" exactly matches task 11 even though it is a substring of others.
-	if err := cmdAdd(&buf, s, nil, 1, nil, "9-10", "Fix", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, nil, 1, nil, false, "9-10", "Fix", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
@@ -435,7 +435,7 @@ func TestAddNonBillableProject(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, "9-10", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, nil, 1, nil, false, "9-10", "login", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
@@ -453,7 +453,7 @@ func TestAddKeepsRunningEntry(t *testing.T) {
 	// entry occupies everything from its start onwards.
 	seedRunning(t, s, 12, testStart)
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, "7-8", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, nil, 1, nil, false, "7-8", "login", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	r, _ := s.Running()
@@ -470,13 +470,13 @@ func TestAddRejectsOverlap(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, "9-10", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, nil, 1, nil, false, "9-10", "login", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add first: %v", err)
 	}
 
 	// 09:30-10:30 straddles the 09:00-10:00 entry.
 	buf.Reset()
-	err := cmdAdd(&buf, s, nil, 1, nil, "9:30-10:30", "review", "", addNow, time.UTC)
+	err := cmdAdd(&buf, s, nil, 1, nil, false, "9:30-10:30", "review", "", addNow, time.UTC)
 	if err == nil {
 		t.Fatal("overlapping add = nil error, want an error")
 	}
@@ -497,7 +497,7 @@ func TestAddRejectsOverlap(t *testing.T) {
 
 	// A back-to-back entry starting exactly when the first ends is fine.
 	buf.Reset()
-	if err := cmdAdd(&buf, s, nil, 1, nil, "10-11", "review", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, nil, 1, nil, false, "10-11", "review", "", addNow, time.UTC); err != nil {
 		t.Fatalf("touching add: %v", err)
 	}
 	if entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 2 {
@@ -514,7 +514,7 @@ func TestAddRejectsOverlapWithRunningEntry(t *testing.T) {
 	seedRunning(t, s, 12, testStart)
 
 	var buf bytes.Buffer
-	err := cmdAdd(&buf, s, nil, 1, nil, "8:30-9:30", "login", "", addNow, time.UTC)
+	err := cmdAdd(&buf, s, nil, 1, nil, false, "8:30-9:30", "login", "", addNow, time.UTC)
 	if err == nil {
 		t.Fatal("add over a running entry = nil error, want an error")
 	}
@@ -535,7 +535,7 @@ func TestAddProjectScopeViaEnvID(t *testing.T) {
 	// "fix" matches several tasks, but scoping to project 2 leaves only one.
 	pid := int64(2)
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, &pid, "10-11", "fix", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, nil, 1, &pid, false, "10-11", "fix", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
@@ -560,15 +560,130 @@ func TestAddAmbiguous(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	err := cmdAdd(&buf, s, nil, 1, nil, "10-11", "write", "", addNow, time.UTC)
+	err := cmdAdd(&buf, s, nil, 1, nil, false, "10-11", "write", "", addNow, time.UTC)
 	if err == nil {
 		t.Fatal("expected ambiguity error")
 	}
 	if !strings.Contains(err.Error(), "Write tests") || !strings.Contains(err.Error(), "Write docs") {
 		t.Errorf("error should list candidates: %v", err)
 	}
+	// Each candidate carries its project, so same-named tasks are told apart,
+	// and the way out (`-1`) is advertised with the list.
+	if !strings.Contains(err.Error(), "[Backend]") {
+		t.Errorf("candidates should name their project: %v", err)
+	}
+	if !strings.Contains(err.Error(), "pass -1") {
+		t.Errorf("error should point at -1: %v", err)
+	}
 	if entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 0 {
 		t.Errorf("no entry should be created on ambiguity, got %d", len(entries))
+	}
+}
+
+// TestAddAmbiguousFirstMatchWins is `-1`'s reason to exist: two tasks sharing a
+// name in different projects cannot be told apart by any fragment, so without
+// the flag `add` refuses to guess and with it the FIRST candidate — the one the
+// ambiguity error lists first — is the task recorded against.
+func TestAddAmbiguousFirstMatchWins(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	// The same task name in a second project; "Code review" is now an exact
+	// match for two tasks at once.
+	if err := s.UpsertTask(store.Task{
+		ID: 22, WorkspaceID: 1, ProjectID: 2, Name: "Code review", Active: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	err := cmdAdd(&buf, s, nil, 1, nil, false, "10-11", "code review", "", addNow, time.UTC)
+	if err == nil || !strings.Contains(err.Error(), "multiple tasks match") {
+		t.Fatalf("err = %v, want an ambiguity error without -1", err)
+	}
+
+	// Candidates are ordered by name then id, so the first one is task 12.
+	buf.Reset()
+	if err := cmdAdd(&buf, s, nil, 1, nil, true, "10-11", "code review", "", addNow, time.UTC); err != nil {
+		t.Fatalf("add -1: %v", err)
+	}
+	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	if e.TaskID == nil || *e.TaskID != 12 {
+		t.Errorf("task_id = %v, want 12 (the first candidate)", e.TaskID)
+	}
+	if e.ProjectID == nil || *e.ProjectID != 1 {
+		t.Errorf("project_id = %v, want 1 (the first candidate's project)", e.ProjectID)
+	}
+}
+
+// TestAddFirstMatchIsNotNeededWhenUnique verifies `-1` is inert on a fragment
+// that already resolves: it never changes which task a working command picks.
+func TestAddFirstMatchIsNotNeededWhenUnique(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdAdd(&buf, s, nil, 1, nil, true, "9-:30", "login", "", addNow, time.UTC); err != nil {
+		t.Fatalf("add -1: %v", err)
+	}
+	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	if len(entries) != 1 || entries[0].TaskID == nil || *entries[0].TaskID != 10 {
+		t.Errorf("entries = %+v, want one entry on task 10", entries)
+	}
+}
+
+// TestAddFirstMatchDoesNotInventAMatch verifies `-1` only resolves ambiguity:
+// with nothing to choose from it still fails, pointing at `tg update`.
+func TestAddFirstMatchDoesNotInventAMatch(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	err := cmdAdd(&buf, s, nil, 1, nil, true, "10-11", "nonexistent", "", addNow, time.UTC)
+	if err == nil || !strings.Contains(err.Error(), "tg update") {
+		t.Errorf("err = %v, want the no-match error even with -1", err)
+	}
+}
+
+// TestResolveTaskFragment pins the shared task-fragment resolver every
+// fragment-taking command goes through: one match resolves, several fail with
+// the candidate list unless `-1` takes the first, and none never resolves.
+func TestResolveTaskFragment(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	for _, tc := range []struct {
+		name     string
+		fragment string
+		first    bool
+		wantID   int64
+		wantErr  string
+	}{
+		{name: "unique", fragment: "login", wantID: 10},
+		{name: "exact name wins", fragment: "fix", wantID: 11},
+		{name: "ambiguous", fragment: "write", wantErr: "multiple tasks match"},
+		{name: "ambiguous with -1", fragment: "write", first: true, wantID: 14}, // Write docs
+		{name: "none", fragment: "nonexistent", wantErr: "no task matches"},
+		{name: "none with -1", fragment: "nonexistent", first: true, wantErr: "no task matches"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveTaskFragment(s, tc.fragment, nil, tc.first)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want it to contain %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if got.ID != tc.wantID {
+				t.Errorf("task = %d (%s), want %d", got.ID, got.Name, tc.wantID)
+			}
+		})
 	}
 }
 
@@ -577,7 +692,7 @@ func TestAddNoneSuggestsUpdate(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	err := cmdAdd(&buf, s, nil, 1, nil, "10-11", "nonexistent", "", addNow, time.UTC)
+	err := cmdAdd(&buf, s, nil, 1, nil, false, "10-11", "nonexistent", "", addNow, time.UTC)
 	if err == nil || !strings.Contains(err.Error(), "tg update") {
 		t.Errorf("err = %v, want suggestion to run `tg update`", err)
 	}
@@ -588,7 +703,7 @@ func TestAddInvalidTimesign(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	err := cmdAdd(&buf, s, nil, 1, nil, "nope", "login", "", addNow, time.UTC)
+	err := cmdAdd(&buf, s, nil, 1, nil, false, "nope", "login", "", addNow, time.UTC)
 	if err == nil || !strings.Contains(err.Error(), "timesign") {
 		t.Errorf("err = %v, want a timesign parse error", err)
 	}
@@ -614,7 +729,7 @@ func TestAddBestEffortPush(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, c, 1, nil, "9-:30", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, c, 1, nil, false, "9-:30", "login", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	if gotMethod != http.MethodPost {
@@ -647,7 +762,7 @@ func TestAddSyncFailureIsNonFatal(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, c, 1, nil, "9-:30", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(&buf, s, c, 1, nil, false, "9-:30", "login", "", addNow, time.UTC); err != nil {
 		t.Fatalf("add should not fail on a sync error: %v", err)
 	}
 	if !strings.Contains(buf.String(), "warning") {
@@ -1537,6 +1652,55 @@ func TestParseArgsAndFlags(t *testing.T) {
 	}
 }
 
+// TestFirstFlagParsing pins the wiring of the shared `-1` flag (bindFirstFlag):
+// a bare "-1" is parsed as the boolean rather than swallowed as a positional or
+// rejected as an unknown flag, `--first` is the same flag, and (through
+// parseArgsAndFlags) either spelling may sit before, between or after the
+// positionals that make up the fragment. Anything else that looks like a
+// number-flag is still an error, so a typo is never taken for a fragment.
+func TestFirstFlagParsing(t *testing.T) {
+	for _, tc := range []struct {
+		args      []string
+		wantFirst bool
+		wantPos   []string
+		wantErr   bool
+	}{
+		{args: nil},
+		{args: []string{"write"}, wantPos: []string{"write"}},
+		{args: []string{"-1"}, wantFirst: true},
+		{args: []string{"-1", "write"}, wantFirst: true, wantPos: []string{"write"}},
+		{args: []string{"write", "-1"}, wantFirst: true, wantPos: []string{"write"}},
+		{args: []string{"--first", "write"}, wantFirst: true, wantPos: []string{"write"}},
+		{args: []string{"write", "--first"}, wantFirst: true, wantPos: []string{"write"}},
+		{args: []string{"-1=false", "write"}, wantPos: []string{"write"}},
+		// A timesign never starts with "-", so `add`'s positionals survive
+		// flag parsing wherever the flag is written.
+		{args: []string{"9-10", "-1", "code", "review"}, wantFirst: true, wantPos: []string{"9-10", "code", "review"}},
+		{args: []string{"-2", "write"}, wantErr: true},
+	} {
+		fs := newFlagSet("add")
+		fs.SetOutput(io.Discard)
+		var first bool
+		bindFirstFlag(fs, &first, "task")
+		pos, err := parseArgsAndFlags(fs, tc.args)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("parse %q: err = nil, want an unknown-flag error", tc.args)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.args, err)
+		}
+		if first != tc.wantFirst {
+			t.Errorf("parse %q: first = %v, want %v", tc.args, first, tc.wantFirst)
+		}
+		if strings.Join(pos, ",") != strings.Join(tc.wantPos, ",") {
+			t.Errorf("parse %q: positional = %q, want %q", tc.args, pos, tc.wantPos)
+		}
+	}
+}
+
 func TestTasksCommand(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
@@ -1607,7 +1771,7 @@ func TestGrepListsMatches(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdGrep(&buf, s, false, nil, "write", false); err != nil {
+	if err := cmdGrep(&buf, s, false, nil, false, "write", false); err != nil {
 		t.Fatalf("grep: %v", err)
 	}
 	out := buf.String()
@@ -1628,7 +1792,7 @@ func TestGrepCaseInsensitive(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdGrep(&buf, s, false, nil, "CODE REVIEW", false); err != nil {
+	if err := cmdGrep(&buf, s, false, nil, false, "CODE REVIEW", false); err != nil {
 		t.Fatalf("grep: %v", err)
 	}
 	if !strings.Contains(buf.String(), "Code review") {
@@ -1646,7 +1810,7 @@ func TestGrepExactDoesNotWin(t *testing.T) {
 	var buf bytes.Buffer
 	// "Fix" is an exact task name in the catalog; "Fix login bug" and
 	// "Payment fix" merely contain it, and all three must be listed.
-	if err := cmdGrep(&buf, s, false, nil, "fix", false); err != nil {
+	if err := cmdGrep(&buf, s, false, nil, false, "fix", false); err != nil {
 		t.Fatalf("grep: %v", err)
 	}
 	out := buf.String()
@@ -1660,12 +1824,48 @@ func TestGrepExactDoesNotWin(t *testing.T) {
 	}
 }
 
+// TestGrepFirstListsOneMatch verifies `-1` cuts grep down to its first
+// candidate, which is how the fragment a user is about to pass to `tg add -1`
+// is checked. The order is grep's own (catalog order), so "Write docs" leads.
+func TestGrepFirstListsOneMatch(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdGrep(&buf, s, false, nil, true, "write", false); err != nil {
+		t.Fatalf("grep -1: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Write docs") {
+		t.Errorf("grep -1 should list the first match:\n%s", out)
+	}
+	if strings.Contains(out, "Write tests") {
+		t.Errorf("grep -1 should list only one match:\n%s", out)
+	}
+	if lines := strings.Count(strings.TrimSpace(out), "\n") + 1; lines != 1 {
+		t.Errorf("grep -1 listed %d lines, want 1:\n%s", lines, out)
+	}
+}
+
+// TestGrepFirstStillFailsWithoutAMatch verifies `-1` does not turn an empty
+// result into a success (there is no first candidate to take).
+func TestGrepFirstStillFailsWithoutAMatch(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	err := cmdGrep(&buf, s, false, nil, true, "nothing here", false)
+	if err == nil || !strings.Contains(err.Error(), "no task matches") {
+		t.Errorf("err = %v, want a no-match error even with -1", err)
+	}
+}
+
 func TestGrepJoinsFragment(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdGrep(&buf, s, false, nil, "code review", false); err != nil {
+	if err := cmdGrep(&buf, s, false, nil, false, "code review", false); err != nil {
 		t.Fatalf("grep: %v", err)
 	}
 	if !strings.Contains(buf.String(), "Code review") {
@@ -1679,7 +1879,7 @@ func TestGrepProjectScope(t *testing.T) {
 
 	pid := int64(2) // Payments
 	var buf bytes.Buffer
-	if err := cmdGrep(&buf, s, false, &pid, "fix", false); err != nil {
+	if err := cmdGrep(&buf, s, false, &pid, false, "fix", false); err != nil {
 		t.Fatalf("grep: %v", err)
 	}
 	out := buf.String()
@@ -1704,7 +1904,7 @@ func TestGrepAllIncludesInactive(t *testing.T) {
 	}
 
 	var active bytes.Buffer
-	if err := cmdGrep(&active, s, false, nil, "task", false); err != nil {
+	if err := cmdGrep(&active, s, false, nil, false, "task", false); err != nil {
 		t.Fatalf("grep: %v", err)
 	}
 	if strings.Contains(active.String(), "Retired task") {
@@ -1712,7 +1912,7 @@ func TestGrepAllIncludesInactive(t *testing.T) {
 	}
 
 	var all bytes.Buffer
-	if err := cmdGrep(&all, s, true, nil, "task", false); err != nil {
+	if err := cmdGrep(&all, s, true, nil, false, "task", false); err != nil {
 		t.Fatalf("grep --all: %v", err)
 	}
 	if !strings.Contains(all.String(), "Retired task") {
@@ -1725,7 +1925,7 @@ func TestGrepNoMatch(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	err := cmdGrep(&buf, s, false, nil, "nothing here", false)
+	err := cmdGrep(&buf, s, false, nil, false, "nothing here", false)
 	if err == nil {
 		t.Fatal("expected an error when nothing matches")
 	}
@@ -1745,7 +1945,7 @@ func TestGrepRequiresFragment(t *testing.T) {
 	// `tg tasks`.
 	for _, frag := range []string{"", "   "} {
 		var buf bytes.Buffer
-		err := cmdGrep(&buf, s, false, nil, frag, false)
+		err := cmdGrep(&buf, s, false, nil, false, frag, false)
 		if err == nil || !strings.Contains(err.Error(), "usage: tg grep") {
 			t.Errorf("grep %q: err = %v, want a usage error", frag, err)
 		}
@@ -1757,7 +1957,7 @@ func TestGrepJSON(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdGrep(&buf, s, false, nil, "write", true); err != nil {
+	if err := cmdGrep(&buf, s, false, nil, false, "write", true); err != nil {
 		t.Fatalf("grep --json: %v", err)
 	}
 	var got []struct {
@@ -1802,7 +2002,7 @@ func TestResolvePullProjectRequiresFragment(t *testing.T) {
 
 	// pull ignores TOGGL_PROJECT_ID, so a blank argument is a hard error that
 	// must NOT suggest the env var as a fallback.
-	_, err := resolvePullProject(s, "  ")
+	_, err := resolvePullProject(s, "  ", false)
 	if err == nil || !strings.Contains(err.Error(), "project-name argument") {
 		t.Errorf("err = %v, want a required-argument error", err)
 	}
@@ -1815,7 +2015,7 @@ func TestResolvePullProjectUnique(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	got, err := resolvePullProject(s, "back")
+	got, err := resolvePullProject(s, "back", false)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -1833,12 +2033,39 @@ func TestResolvePullProjectAmbiguous(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := resolvePullProject(s, "back")
+	_, err := resolvePullProject(s, "back", false)
 	if err == nil {
 		t.Fatal("expected ambiguity error")
 	}
 	if !strings.Contains(err.Error(), "Backend") || !strings.Contains(err.Error(), "Back office") {
 		t.Errorf("error should list candidates: %v", err)
+	}
+	if !strings.Contains(err.Error(), "pass -1") {
+		t.Errorf("error should point at -1: %v", err)
+	}
+
+	// With -1 the first candidate is taken instead: candidates are ordered by
+	// name then id, so "Back office" (2) wins over "Backend" (1).
+	got, err := resolvePullProject(s, "back", true)
+	if err != nil {
+		t.Fatalf("resolve -1: %v", err)
+	}
+	if got == nil || *got != 2 {
+		t.Errorf("resolved = %v, want 2 (Back office, the first candidate)", got)
+	}
+}
+
+// TestResolvePullProjectFirstNeedsAMatch verifies `-1` only resolves ambiguity:
+// a fragment matching nothing, and a missing fragment, still fail.
+func TestResolvePullProjectFirstNeedsAMatch(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	if _, err := resolvePullProject(s, "nonexistent", true); err == nil {
+		t.Error("expected a no-match error even with -1")
+	}
+	if _, err := resolvePullProject(s, "  ", true); err == nil {
+		t.Error("expected a required-argument error even with -1")
 	}
 }
 
@@ -1846,7 +2073,7 @@ func TestResolvePullProjectNone(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	_, err := resolvePullProject(s, "nonexistent")
+	_, err := resolvePullProject(s, "nonexistent", false)
 	if err == nil || !strings.Contains(err.Error(), "tg update") {
 		t.Errorf("err = %v, want suggestion to run `tg update`", err)
 	}
@@ -1857,7 +2084,7 @@ func TestResolvePullScopeUnscopedMeansAll(t *testing.T) {
 	seedCatalog(t, s)
 
 	// A blank argument means "pull every project": nil scope.
-	got, err := resolvePullScope(s, "   ")
+	got, err := resolvePullScope(s, "   ", false)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -1874,7 +2101,7 @@ func TestResolvePullScopeIgnoresEnv(t *testing.T) {
 	seedCatalog(t, s)
 
 	t.Setenv("TOGGL_PROJECT_ID", "2")
-	got, err := resolvePullScope(s, "")
+	got, err := resolvePullScope(s, "", false)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -1887,7 +2114,7 @@ func TestResolvePullScopeFragment(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	got, err := resolvePullScope(s, "pay")
+	got, err := resolvePullScope(s, "pay", false)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -1918,7 +2145,7 @@ func TestPullAllProjectsUnscoped(t *testing.T) {
 	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
 	// empty argument => pull every project.
-	if err := cmdPull(&buf, s, c, "", since, now, false); err != nil {
+	if err := cmdPull(&buf, s, c, false, "", since, now, false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	if !strings.Contains(buf.String(), "2 inserted") {
@@ -1958,7 +2185,7 @@ func TestPullScopedByFragment(t *testing.T) {
 	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
 	// "back" resolves to Backend (project 1); only its entry is reconciled.
-	if err := cmdPull(&buf, s, c, "back", since, now, false); err != nil {
+	if err := cmdPull(&buf, s, c, false, "back", since, now, false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	if got, _ := s.EntryByRemoteID(1); got == nil {
@@ -2000,7 +2227,7 @@ func TestPullIgnoresProjectEnv(t *testing.T) {
 	since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdPull(&buf, s, c, "", since, now, false); err != nil {
+	if err := cmdPull(&buf, s, c, false, "", since, now, false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	if !strings.Contains(buf.String(), "2 inserted") {
@@ -2068,7 +2295,7 @@ func TestTotalMatchesLocalCatalogByID(t *testing.T) {
 	c, body := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, s, c, 1, "login", totalSince, totalNow, time.UTC, false); err != nil {
+	if err := cmdTotal(&buf, s, c, 1, false, "login", totalSince, totalNow, time.UTC, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	out := buf.String()
@@ -2101,7 +2328,7 @@ func TestTotalJoinsFragment(t *testing.T) {
 
 	var buf bytes.Buffer
 	// runTotal joins the positionals with a space before calling cmdTotal.
-	if err := cmdTotal(&buf, s, c, 1, strings.Join([]string{"write", "docs"}, " "), totalSince, totalNow, time.UTC, false); err != nil {
+	if err := cmdTotal(&buf, s, c, 1, false, strings.Join([]string{"write", "docs"}, " "), totalSince, totalNow, time.UTC, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	out := buf.String()
@@ -2123,7 +2350,7 @@ func TestTotalSinceOverridesStart(t *testing.T) {
 
 	since := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, s, c, 1, "login", since, totalNow, time.UTC, false); err != nil {
+	if err := cmdTotal(&buf, s, c, 1, false, "login", since, totalNow, time.UTC, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	if (*body)["start_date"] != "2025-01-01" {
@@ -2142,7 +2369,7 @@ func TestTotalFragmentMatchingMany(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, s, c, 1, "write", totalSince, totalNow, time.UTC, false); err != nil {
+	if err := cmdTotal(&buf, s, c, 1, false, "write", totalSince, totalNow, time.UTC, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	out := buf.String()
@@ -2151,6 +2378,30 @@ func TestTotalFragmentMatchingMany(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// TestTotalFirstMatchOnly verifies `-1` narrows a several-match fragment to its
+// first candidate — the same one `tg add -1` would record against — so only that
+// task's time is reported.
+func TestTotalFirstMatchOnly(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	c, _ := totalReportsServer(t)
+
+	var buf bytes.Buffer
+	if err := cmdTotal(&buf, s, c, 1, true, "write", totalSince, totalNow, time.UTC, false); err != nil {
+		t.Fatalf("total -1: %v", err)
+	}
+	out := buf.String()
+	// Candidates are ordered by name, so "Write docs" (0h15m) is the first.
+	for _, want := range []string{"Write docs", "0h15m", "Total: 0h15m"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "Write tests") {
+		t.Errorf("total -1 should report only the first match:\n%s", out)
 	}
 }
 
@@ -2165,7 +2416,7 @@ func TestTotalExactNameWins(t *testing.T) {
 	var buf bytes.Buffer
 	// Task 11 ("Fix") has no tracked time in the report, so the exact match
 	// winning is what makes this an empty result rather than "Fix login bug".
-	err := cmdTotal(&buf, s, c, 1, "fix", totalSince, totalNow, time.UTC, false)
+	err := cmdTotal(&buf, s, c, 1, false, "fix", totalSince, totalNow, time.UTC, false)
 	if err == nil || !strings.Contains(err.Error(), "no tracked time") {
 		t.Errorf("err = %v, want a no-tracked-time error for the exact match", err)
 	}
@@ -2180,7 +2431,7 @@ func TestTotalNoFragmentListsAll(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, s, c, 1, "", totalSince, totalNow, time.UTC, false); err != nil {
+	if err := cmdTotal(&buf, s, c, 1, false, "", totalSince, totalNow, time.UTC, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	out := buf.String()
@@ -2204,7 +2455,7 @@ func TestTotalUncataloguedNotMatchable(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	err := cmdTotal(&buf, s, c, 1, "legacy", totalSince, totalNow, time.UTC, false)
+	err := cmdTotal(&buf, s, c, 1, false, "legacy", totalSince, totalNow, time.UTC, false)
 	if err == nil || !strings.Contains(err.Error(), "no task matches") {
 		t.Errorf("err = %v, want a no-match error for an API-only title", err)
 	}
@@ -2216,7 +2467,7 @@ func TestTotalNoMatches(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	err := cmdTotal(&buf, s, c, 1, "nonexistent", totalSince, totalNow, time.UTC, false)
+	err := cmdTotal(&buf, s, c, 1, false, "nonexistent", totalSince, totalNow, time.UTC, false)
 	if err == nil || !strings.Contains(err.Error(), "no task matches") {
 		t.Errorf("err = %v, want a no-match error", err)
 	}
@@ -2234,7 +2485,7 @@ func TestTotalMatchedButUntracked(t *testing.T) {
 
 	var buf bytes.Buffer
 	// "payment" matches task 20, which the report does not mention.
-	err := cmdTotal(&buf, s, c, 1, "payment", totalSince, totalNow, time.UTC, false)
+	err := cmdTotal(&buf, s, c, 1, false, "payment", totalSince, totalNow, time.UTC, false)
 	if err == nil || !strings.Contains(err.Error(), "no tracked time") {
 		t.Errorf("err = %v, want a no-tracked-time error", err)
 	}
@@ -2246,7 +2497,7 @@ func TestTotalJSON(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, s, c, 1, "write", totalSince, totalNow, time.UTC, true); err != nil {
+	if err := cmdTotal(&buf, s, c, 1, false, "write", totalSince, totalNow, time.UTC, true); err != nil {
 		t.Fatalf("total --json: %v", err)
 	}
 	var got struct {
@@ -2315,7 +2566,7 @@ func TestResolveAddProjectUnique(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	got, err := resolveAddProject(s, "pay")
+	got, err := resolveAddProject(s, "pay", false)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -2328,7 +2579,7 @@ func TestResolveAddProjectNone(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	_, err := resolveAddProject(s, "nonexistent")
+	_, err := resolveAddProject(s, "nonexistent", false)
 	if err == nil || !strings.Contains(err.Error(), "tg update") {
 		t.Errorf("err = %v, want suggestion to run `tg update`", err)
 	}
@@ -2339,7 +2590,7 @@ func TestResolveUpdateProjectEnvWins(t *testing.T) {
 	seedCatalog(t, s)
 
 	pid := int64(2)
-	got, err := resolveUpdateProject(s, &pid, "backend")
+	got, err := resolveUpdateProject(s, &pid, "backend", false)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -2352,7 +2603,7 @@ func TestResolveUpdateProjectRequiresScope(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	_, err := resolveUpdateProject(s, nil, "  ")
+	_, err := resolveUpdateProject(s, nil, "  ", false)
 	if err == nil || !strings.Contains(err.Error(), "TOGGL_PROJECT_ID") {
 		t.Errorf("err = %v, want required-argument error mentioning TOGGL_PROJECT_ID", err)
 	}
@@ -2399,7 +2650,7 @@ func TestUpdateScopedToOneProject(t *testing.T) {
 
 	pid := int64(2)
 	var buf bytes.Buffer
-	if err := cmdUpdate(&buf, s, c, 1, &pid, "", updateSince, updateNow, false, false); err != nil {
+	if err := cmdUpdate(&buf, s, c, 1, &pid, false, "", updateSince, updateNow, false, false); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	// update is quiet: no progress or summary lines in human mode.
@@ -2457,7 +2708,7 @@ func TestUpdatePullsRecentEntries(t *testing.T) {
 
 	pid := int64(2)
 	var buf bytes.Buffer
-	if err := cmdUpdate(&buf, s, c, 1, &pid, "", updateSince, updateNow, false, false); err != nil {
+	if err := cmdUpdate(&buf, s, c, 1, &pid, false, "", updateSince, updateNow, false, false); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 
@@ -2498,7 +2749,7 @@ func TestUpdateJSONStillReports(t *testing.T) {
 
 	pid := int64(2)
 	var buf bytes.Buffer
-	if err := cmdUpdate(&buf, s, c, 1, &pid, "", updateSince, updateNow, false, true); err != nil {
+	if err := cmdUpdate(&buf, s, c, 1, &pid, false, "", updateSince, updateNow, false, true); err != nil {
 		t.Fatalf("update --json: %v", err)
 	}
 	out := buf.String()
@@ -2686,7 +2937,7 @@ func TestUpdateResolvesProjectByFragment(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	if err := cmdUpdate(&buf, s, c, 1, nil, "pay", updateSince, updateNow, false, false); err != nil {
+	if err := cmdUpdate(&buf, s, c, 1, nil, false, "pay", updateSince, updateNow, false, false); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	for _, p := range paths {
@@ -2728,7 +2979,7 @@ func TestUpdateAmbiguousProjectFragment(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	err := cmdUpdate(&buf, s, c, 1, nil, "back", updateSince, updateNow, false, false)
+	err := cmdUpdate(&buf, s, c, 1, nil, false, "back", updateSince, updateNow, false, false)
 	if err == nil {
 		t.Fatal("update: expected an ambiguous-fragment error")
 	}
@@ -2739,12 +2990,54 @@ func TestUpdateAmbiguousProjectFragment(t *testing.T) {
 	}
 	// An exact (case-insensitive) name still wins over the substring matches,
 	// so the ambiguity is escapable without reaching for TOGGL_PROJECT_ID.
-	got, err := resolveUpdateProject(s, nil, "backend")
+	got, err := resolveUpdateProject(s, nil, "backend", false)
 	if err != nil {
 		t.Fatalf("resolve exact name: %v", err)
 	}
 	if got == nil || *got != 1 {
 		t.Errorf("resolved = %v, want 1 (exact name wins)", got)
+	}
+}
+
+// TestUpdateAmbiguousProjectFragmentFirst verifies `-1` resolves the same
+// ambiguous fragment by taking the first candidate ("Backend", id 1) and that
+// update then really refreshes THAT project.
+func TestUpdateAmbiguousProjectFragmentFirst(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	if err := s.PutProject(store.Project{
+		ID: 3, WorkspaceID: 1, Name: "Backend API", Active: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/workspaces/1/projects/1/tasks":
+			w.Write([]byte(`[{"id":15,"workspace_id":1,"project_id":1,"name":"Fresh task","active":true}]`))
+		case "/me/time_entries":
+			w.Write([]byte(`[]`))
+		default:
+			t.Errorf("unexpected path %q (-1 should pick project 1)", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+
+	var buf bytes.Buffer
+	if err := cmdUpdate(&buf, s, c, 1, nil, true, "back", updateSince, updateNow, false, false); err != nil {
+		t.Fatalf("update -1: %v", err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("update -1 made no requests")
+	}
+	p1 := int64(1)
+	tasks, _ := s.ListTasks(false, &p1)
+	if len(tasks) != 1 || tasks[0].ID != 15 {
+		t.Errorf("project 1 tasks = %+v, want only id 15 (Backend was refreshed)", tasks)
 	}
 }
 
@@ -2881,7 +3174,7 @@ func TestPullTodayWindowKeepsStaleWatermark(t *testing.T) {
 	now := time.Date(2026, 1, 5, 12, 0, 0, 0, time.UTC)
 	since := startOfDay(now, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdPull(&buf, s, c, "", since, now, false); err != nil {
+	if err := cmdPull(&buf, s, c, false, "", since, now, false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	v, _, _ := s.GetMeta(store.MetaLastPull)

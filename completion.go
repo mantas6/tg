@@ -21,6 +21,9 @@ func cmdCompletion(w io.Writer, shell string) error {
 // eval'd/sourced after compinit (the trailing guard calls compdef itself).
 // `tg add` completion pulls task names from `tg tasks --json`, which reads
 // the local SQLite cache and honours TOGGL_PROJECT_ID scoping.
+//
+// Every fragment-taking command (`add`, `grep`, `total`, `update`, `pull`) also
+// offers -1/--first, the "use the first match" flag (see bindFirstFlag).
 const zshCompletion = `#compdef tg
 
 # Complete task names for ` + "`tg add`" + ` from the local catalog cache.
@@ -107,10 +110,12 @@ _tg() {
           # First positional is the timesign (absolute 9-:30, relative
           # +:20, or a bare duration 1:30 continuing the last entry);
           # later args are task names. --desc/--description set the
-          # entry description.
+          # entry description, -1/--first resolves an ambiguous fragment.
           _arguments \
             '--desc[entry description]:description:' \
             '--description[entry description (alias of --desc)]:description:' \
+            '-1[use the first match on an ambiguous fragment]' \
+            '--first[use the first match on an ambiguous fragment (alias of -1)]' \
             '1:timesign:' \
             '*:task fragment:__tg_tasks'
           ;;
@@ -142,7 +147,10 @@ _tg() {
           _arguments '--all[include inactive tasks]' '--json[emit JSON]'
           ;;
         grep)
-          _arguments '--all[include inactive tasks]' '--json[emit JSON]' '*:task fragment:__tg_tasks'
+          _arguments '--all[include inactive tasks]' '--json[emit JSON]' \
+            '-1[list only the first match]' \
+            '--first[list only the first match (alias of -1)]' \
+            '*:task fragment:__tg_tasks'
           ;;
         projects)
           # Bare ` + "`tg projects`" + ` lists the cache; the lone subcommand
@@ -162,16 +170,25 @@ _tg() {
             '-n[pull entries from the last N days (alias of --days)]:days:' \
             '--project[project name fragment to update]:project fragment:__tg_project_names' \
             '-p[project name fragment (alias of --project)]:project fragment:__tg_project_names' \
+            '-1[use the first match on an ambiguous fragment]' \
+            '--first[use the first match on an ambiguous fragment (alias of -1)]' \
             '*:project fragment:__tg_project_names'
           ;;
         pull)
           _arguments '--all[pull this month, not just today]' \
             '-a[pull this month, not just today (alias of --all)]' \
             '--since[pull entries modified since DATE]:date (YYYY-MM-DD):' \
-            '--json[emit JSON]' '*:project fragment:__tg_project_names'
+            '--json[emit JSON]' \
+            '-1[use the first match on an ambiguous fragment]' \
+            '--first[use the first match on an ambiguous fragment (alias of -1)]' \
+            '*:project fragment:__tg_project_names'
           ;;
         total)
-          _arguments '--since[total entries since DATE (default 3 months ago)]:date (YYYY-MM-DD):' '--json[emit JSON]' '*:task fragment:__tg_tasks'
+          _arguments '--since[total entries since DATE (default 3 months ago)]:date (YYYY-MM-DD):' \
+            '--json[emit JSON]' \
+            '-1[total only the first match]' \
+            '--first[total only the first match (alias of -1)]' \
+            '*:task fragment:__tg_tasks'
           ;;
         completion)
           local -a shells

@@ -36,6 +36,8 @@ func TestCompletionZsh(t *testing.T) {
 		"--all[pull this month", "-a[pull this month",
 		// `daily` measures each day against -t/--target.
 		"--target[target hours", "-t[target hours",
+		// Every fragment-taking command offers -1/--first.
+		"-1[", "--first[",
 	} {
 		if !strings.Contains(out, marker) {
 			t.Errorf("completion script missing %q", marker)
@@ -68,6 +70,46 @@ func TestCompletionCoversDispatch(t *testing.T) {
 	} {
 		if !strings.Contains(out, "'"+cmd+":") && !strings.Contains(out, `"`+cmd+":") {
 			t.Errorf("completion script does not offer command %q", cmd)
+		}
+	}
+}
+
+// TestCompletionOffersFirstFlag pins -1/--first to the commands that resolve a
+// name fragment (see bindFirstFlag): each of their `_arguments` blocks must
+// offer both spellings, and the commands without a fragment must not.
+func TestCompletionOffersFirstFlag(t *testing.T) {
+	var buf bytes.Buffer
+	if err := cmdCompletion(&buf, "zsh"); err != nil {
+		t.Fatalf("completion: %v", err)
+	}
+	// The per-command blocks are the "        <words>)" labels of the case
+	// statement, so splitting on them isolates each command's flag list.
+	blocks := map[string]string{}
+	var label string
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if trimmed := strings.TrimPrefix(line, "        "); trimmed != line &&
+			strings.HasSuffix(trimmed, ")") && !strings.Contains(trimmed, " ") {
+			label = strings.TrimSuffix(trimmed, ")")
+			continue
+		}
+		if label != "" {
+			blocks[label] += line + "\n"
+		}
+	}
+	for _, cmd := range []string{"add", "grep", "update", "pull", "total"} {
+		block, ok := blocks[cmd]
+		if !ok {
+			t.Fatalf("completion script has no %q block", cmd)
+		}
+		for _, want := range []string{"'-1[", "'--first["} {
+			if !strings.Contains(block, want) {
+				t.Errorf("%s block missing %q:\n%s", cmd, want, block)
+			}
+		}
+	}
+	for _, cmd := range []string{"mod", "del", "tasks", "daily"} {
+		if strings.Contains(blocks[cmd], "'-1[") {
+			t.Errorf("%s takes no fragment, it should not offer -1:\n%s", cmd, blocks[cmd])
 		}
 	}
 }

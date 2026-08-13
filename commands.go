@@ -23,13 +23,13 @@ import (
 // All three timesign forms are accepted; a bare duration ("1:30") has no times
 // of its own and picks up where the last entry ended (see addSpan).
 //
-// The task fragment is resolved with FindTasksByFragment scoped by projectID
+// The task fragment is resolved with resolveTaskFragment scoped by projectID
 // (from TOGGL_PROJECT_ID or, for the 2-argument form
 // `tg add <timesign> <project> <task>`, from the resolved project-name
 // argument; see runAdd / resolveAddProject): 1 match -> create the entry;
-// many -> error listing candidates; none -> error suggesting `tg update`. The
-// entry is stored dirty so a later `tg push` (or the best-effort push below)
-// sends it to Toggl.
+// many -> error listing candidates (unless first, the `-1` flag, picks the top
+// one); none -> error suggesting `tg update`. The entry is stored dirty so a
+// later `tg push` (or the best-effort push below) sends it to Toggl.
 //
 // When c is non-nil the new entry is pushed to Toggl immediately; the push is
 // best-effort so a sync failure just leaves the entry dirty (a warning is
@@ -37,7 +37,7 @@ import (
 //
 // desc is the entry's free-form description (from `--desc`/`--description`); an
 // empty desc leaves the description blank, matching the prior behavior.
-func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, projectID *int64, timesign, fragment, desc string, now time.Time, loc *time.Location) error {
+func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, projectID *int64, first bool, timesign, fragment, desc string, now time.Time, loc *time.Location) error {
 	start, stop, err := addSpan(st, timesign, now, loc)
 	if err != nil {
 		return err
@@ -61,56 +61,48 @@ func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, proj
 			formatClock(start, loc), formatClock(stop, loc), overlapLabel(clashes[0], loc))
 	}
 
-	tasks, err := st.FindTasksByFragment(fragment, projectID)
+	task, err := resolveTaskFragment(st, fragment, projectID, first)
 	if err != nil {
 		return err
 	}
 
-	switch len(tasks) {
-	case 0:
-		return fmt.Errorf("no task matches %q; run `tg update` to refresh the catalog", fragment)
-	case 1:
-		task := tasks[0]
-		taskID := task.ID
-		projID := task.ProjectID
-		// Carry the project's billable flag onto the entry: workspaces can
-		// reject non-billable entries in billable projects.
-		billable, err := projectBillable(st, projID)
-		if err != nil {
-			return err
-		}
-		dur := stop.Sub(start)
-		if _, err := st.CreateEntry(store.Entry{
-			WorkspaceID: workspaceID,
-			ProjectID:   &projID,
-			TaskID:      &taskID,
-			Description: desc,
-			Start:       start,
-			Stop:        &stop,
-			Duration:    int64(dur / time.Second),
-			Billable:    billable,
-			UpdatedAt:   now,
-			Dirty:       true,
-		}); err != nil {
-			return err
-		}
-		label := task.Name
-		if task.ProjectName != "" {
-			label += " [" + task.ProjectName + "]"
-		}
-		fmt.Fprintf(w, "Added: %s  %s-%s (%s)\n",
-			label, formatClock(start, loc), formatClock(stop, loc), formatHM(dur))
-		// Push the new entry so Toggl reflects it immediately. Best-effort:
-		// keep the local entry dirty for a later `tg push` if the sync fails.
-		if c != nil {
-			if _, err := sync.Push(st, c, now); err != nil {
-				fmt.Fprintf(w, "warning: could not sync to Toggl: %v\n", err)
-			}
-		}
-		return nil
-	default:
-		return fmt.Errorf("multiple tasks match %q:\n%s", fragment, candidateList(tasks))
+	taskID := task.ID
+	projID := task.ProjectID
+	// Carry the project's billable flag onto the entry: workspaces can
+	// reject non-billable entries in billable projects.
+	billable, err := projectBillable(st, projID)
+	if err != nil {
+		return err
 	}
+	dur := stop.Sub(start)
+	if _, err := st.CreateEntry(store.Entry{
+		WorkspaceID: workspaceID,
+		ProjectID:   &projID,
+		TaskID:      &taskID,
+		Description: desc,
+		Start:       start,
+		Stop:        &stop,
+		Duration:    int64(dur / time.Second),
+		Billable:    billable,
+		UpdatedAt:   now,
+		Dirty:       true,
+	}); err != nil {
+		return err
+	}
+	label := task.Name
+	if task.ProjectName != "" {
+		label += " [" + task.ProjectName + "]"
+	}
+	fmt.Fprintf(w, "Added: %s  %s-%s (%s)\n",
+		label, formatClock(start, loc), formatClock(stop, loc), formatHM(dur))
+	// Push the new entry so Toggl reflects it immediately. Best-effort:
+	// keep the local entry dirty for a later `tg push` if the sync fails.
+	if c != nil {
+		if _, err := sync.Push(st, c, now); err != nil {
+			fmt.Fprintf(w, "warning: could not sync to Toggl: %v\n", err)
+		}
+	}
+	return nil
 }
 
 // addSpan resolves `tg add`'s timesign into the new entry's [start, stop).
@@ -354,10 +346,14 @@ type totalRow struct {
 // match a fragment; unfiltered they are still listed, labelled with whatever
 // title the API supplied or `task #<id>`.
 //
+// A fragment matching several cached tasks totals all of them; first (`-1`)
+// narrows it to the first candidate (the same ordering resolveTaskFragment
+// picks from), so an ambiguous name can be reported on its own.
+//
 // The window defaults to the last three months (see runTotal/resolveTotalSince)
 // and can be overridden with `--since`. Output is one line per task with its
 // total, followed by the sum of all listed tasks.
-func cmdTotal(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, fragment string, since, now time.Time, loc *time.Location, jsonOut bool) error {
+func cmdTotal(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, first bool, fragment string, since, now time.Time, loc *time.Location, jsonOut bool) error {
 	fragment = strings.TrimSpace(fragment)
 
 	startDate := since.In(loc).Format("2006-01-02")
@@ -388,6 +384,9 @@ func cmdTotal(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, fr
 		}
 		if len(matched) == 0 {
 			return fmt.Errorf("no task matches %q", fragment)
+		}
+		if first {
+			matched = matched[:1]
 		}
 		keep = make(map[int64]bool, len(matched))
 		for _, t := range matched {
@@ -591,7 +590,12 @@ func cmdTasks(w io.Writer, st *store.Store, all bool, projectID *int64, jsonOut 
 // An empty fragment is a usage error rather than "list everything" (that is
 // what `tg tasks` is for), and finding nothing is an error too, so grep exits
 // non-zero when there is no match.
-func cmdGrep(w io.Writer, st *store.Store, all bool, projectID *int64, fragment string, jsonOut bool) error {
+//
+// first (`-1`) cuts the listing down to its first line, mirroring the flag the
+// other fragment-taking commands accept. The candidate is grep's own first one
+// (catalog order, no exact-name precedence), so it is not necessarily the task
+// `tg add -1` would pick with the same fragment.
+func cmdGrep(w io.Writer, st *store.Store, all bool, projectID *int64, first bool, fragment string, jsonOut bool) error {
 	fragment = strings.TrimSpace(fragment)
 	if fragment == "" {
 		return errors.New("usage: tg grep <fragment>")
@@ -603,6 +607,9 @@ func cmdGrep(w io.Writer, st *store.Store, all bool, projectID *int64, fragment 
 	matches := grepTasks(tasks, fragment)
 	if len(matches) == 0 {
 		return fmt.Errorf("no task matches %q; run `tg update` to refresh the catalog", fragment)
+	}
+	if first {
+		matches = matches[:1]
 	}
 	if jsonOut {
 		return renderTasksJSON(w, matches)
@@ -645,7 +652,8 @@ func cmdProjects(w io.Writer, st *store.Store, all, jsonOut bool) error {
 // cmdUpdate refreshes the local state for a SINGLE project (never the whole
 // workspace): its tasks are fetched and upserted, and its recent time entries
 // are pulled. The project is chosen by projectID (from TOGGL_PROJECT_ID) when
-// set; otherwise fragment must uniquely match a cached project name.
+// set; otherwise fragment must uniquely match a cached project name, or match
+// several with first (`-1`) picking the top candidate.
 // Refreshing every project at once is intentionally disallowed (see
 // resolveUpdateProject).
 //
@@ -663,8 +671,8 @@ func cmdProjects(w io.Writer, st *store.Store, all, jsonOut bool) error {
 // The command is quiet: in human mode it prints nothing at all (no progress or
 // summary lines) and reports only errors. Machine-readable output is still
 // available via --json.
-func cmdUpdate(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, projectID *int64, fragment string, since, now time.Time, all, jsonOut bool) error {
-	pid, err := resolveUpdateProject(st, projectID, fragment)
+func cmdUpdate(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, projectID *int64, first bool, fragment string, since, now time.Time, all, jsonOut bool) error {
+	pid, err := resolveUpdateProject(st, projectID, fragment, first)
 	if err != nil {
 		return err
 	}
@@ -742,15 +750,16 @@ func cmdPush(w io.Writer, st *store.Store, c *api.Client, now time.Time, jsonOut
 // argument it pulls EVERY project's entries in a single pass. Unlike
 // start/tasks/update, `tg pull` deliberately ignores TOGGL_PROJECT_ID: scoping
 // happens only via an explicit project-name fragment that uniquely matches a
-// cached project, and such a scoped (partial) pull leaves the last_pull
-// watermark untouched.
+// cached project (or matches several with first, `-1`, taking the top
+// candidate), and such a scoped (partial) pull leaves the last_pull watermark
+// untouched.
 //
 // The time window is the caller's: runPull defaults it to today and widens it
 // to the current month under --all/-a (see resolvePullSince). A window that
 // does not reach back to the watermark is partial too and leaves it untouched
 // (see sync.Pull).
-func cmdPull(w io.Writer, st *store.Store, c *api.Client, fragment string, since, now time.Time, jsonOut bool) error {
-	pid, err := resolvePullScope(st, fragment)
+func cmdPull(w io.Writer, st *store.Store, c *api.Client, first bool, fragment string, since, now time.Time, jsonOut bool) error {
+	pid, err := resolvePullScope(st, fragment, first)
 	if err != nil {
 		return err
 	}
@@ -766,14 +775,69 @@ func cmdPull(w io.Writer, st *store.Store, c *api.Client, fragment string, since
 	return nil
 }
 
+// firstMatchHint closes every ambiguous-fragment error: refining the fragment
+// is one way out, `-1` (see the first parameter threaded through the resolvers
+// below) is the other, so the flag is advertised where it is needed.
+const firstMatchHint = "pass -1 to use the first match"
+
+// resolveTaskFragment resolves a task-name fragment to the single cached task a
+// command should act on, optionally scoped to projectID (from TOGGL_PROJECT_ID
+// or an explicit project argument). Matching is the store's
+// (store.FindTasksByFragment: case-insensitive substring, an exact name winning
+// over mere substrings), and the candidates are ordered as candidateList prints
+// them, so "the first match" means the first line of the ambiguity error.
+//
+// A fragment matching several tasks is an error listing the candidates, unless
+// first (the `-1` flag) is set: then the top candidate is taken, which is how
+// two identically named tasks in different projects are disambiguated without
+// reaching for TOGGL_PROJECT_ID. No match is always an error, since there is
+// nothing to pick.
+func resolveTaskFragment(st *store.Store, fragment string, projectID *int64, first bool) (store.Task, error) {
+	tasks, err := st.FindTasksByFragment(fragment, projectID)
+	if err != nil {
+		return store.Task{}, err
+	}
+	switch {
+	case len(tasks) == 0:
+		return store.Task{}, fmt.Errorf("no task matches %q; run `tg update` to refresh the catalog", fragment)
+	case len(tasks) == 1, first:
+		return tasks[0], nil
+	default:
+		return store.Task{}, fmt.Errorf("multiple tasks match %q:\n%s%s",
+			fragment, candidateList(labelCandidates(st, tasks)), firstMatchHint)
+	}
+}
+
+// labelCandidates fills in the candidates' project names for the ambiguity
+// error: task matching runs on a name-only query (store.FindTasksByFragment
+// does not join projects), yet the projects are precisely what distinguishes
+// two tasks sharing a name — the case `-1` exists for. A lookup that fails is
+// ignored rather than replacing the ambiguity report with a database error: the
+// candidate then simply keeps its bare name.
+func labelCandidates(st *store.Store, tasks []store.Task) []store.Task {
+	out := make([]store.Task, len(tasks))
+	copy(out, tasks)
+	for i := range out {
+		if out[i].ProjectName != "" {
+			continue
+		}
+		if name, err := projectName(st, out[i].ProjectID); err == nil {
+			out[i].ProjectName = name
+		}
+	}
+	return out
+}
+
 // resolveCachedProject resolves an optional env project id or a project-name
 // fragment to exactly one cached project id. When projectID (TOGGL_PROJECT_ID)
 // is non-nil it wins and fragment is ignored. Otherwise fragment is required
 // (emptyErr is returned verbatim when it is blank) and must resolve to exactly
 // one cached project: none -> error + noMatchHint; many -> error listing
-// candidates. This is the shared machinery that keeps `add`, `pull`, and
-// `update` scoped to a single project rather than the whole workspace.
-func resolveCachedProject(st *store.Store, projectID *int64, fragment string, emptyErr error, noMatchHint string) (*int64, error) {
+// candidates, unless first (the `-1` flag) takes the top candidate, exactly as
+// resolveTaskFragment does for tasks. This is the shared machinery that keeps
+// `add`, `pull`, and `update` scoped to a single project rather than the whole
+// workspace.
+func resolveCachedProject(st *store.Store, projectID *int64, fragment string, first bool, emptyErr error, noMatchHint string) (*int64, error) {
 	if projectID != nil {
 		return projectID, nil
 	}
@@ -785,14 +849,15 @@ func resolveCachedProject(st *store.Store, projectID *int64, fragment string, em
 	if err != nil {
 		return nil, err
 	}
-	switch len(projects) {
-	case 0:
+	switch {
+	case len(projects) == 0:
 		return nil, fmt.Errorf("no project matches %q%s", fragment, noMatchHint)
-	case 1:
+	case len(projects) == 1, first:
 		id := projects[0].ID
 		return &id, nil
 	default:
-		return nil, fmt.Errorf("multiple projects match %q:\n%s", fragment, projectCandidateList(projects))
+		return nil, fmt.Errorf("multiple projects match %q:\n%s%s",
+			fragment, projectCandidateList(projects), firstMatchHint)
 	}
 }
 
@@ -801,39 +866,41 @@ func resolveCachedProject(st *store.Store, projectID *int64, fragment string, em
 // the default when no argument is given. TOGGL_PROJECT_ID is intentionally NOT
 // consulted here, so pull spans every project unless a name is given
 // explicitly. Otherwise the pull is scoped to exactly one cached project (see
-// resolvePullProject).
-func resolvePullScope(st *store.Store, fragment string) (*int64, error) {
+// resolvePullProject), with first (`-1`) resolving an ambiguous name.
+func resolvePullScope(st *store.Store, fragment string, first bool) (*int64, error) {
 	if strings.TrimSpace(fragment) == "" {
 		return nil, nil // no argument -> pull every project
 	}
-	return resolvePullProject(st, fragment)
+	return resolvePullProject(st, fragment, first)
 }
 
 // resolvePullProject resolves the single-project scope requested by `tg pull`'s
 // explicit project-name argument; see resolveCachedProject. The unscoped "pull
 // all projects" case is handled earlier by resolvePullScope. Unlike other
 // commands, pull never falls back to TOGGL_PROJECT_ID.
-func resolvePullProject(st *store.Store, fragment string) (*int64, error) {
-	return resolveCachedProject(st, nil, fragment,
+func resolvePullProject(st *store.Store, fragment string, first bool) (*int64, error) {
+	return resolveCachedProject(st, nil, fragment, first,
 		errors.New("pull requires a project-name argument"),
 		"; run `tg update` to refresh the catalog")
 }
 
 // resolveUpdateProject decides which single project `tg update` refreshes. When
 // TOGGL_PROJECT_ID is set it wins; otherwise the project-name argument must
-// uniquely match a cached project. This keeps update from ever refreshing every
-// project at once.
-func resolveUpdateProject(st *store.Store, projectID *int64, fragment string) (*int64, error) {
-	return resolveCachedProject(st, projectID, fragment,
+// uniquely match a cached project (or name several with `-1` set, which takes
+// the first). This keeps update from ever refreshing every project at once.
+func resolveUpdateProject(st *store.Store, projectID *int64, fragment string, first bool) (*int64, error) {
+	return resolveCachedProject(st, projectID, fragment, first,
 		errors.New("update requires a project-name argument (or set TOGGL_PROJECT_ID)"),
 		"; set TOGGL_PROJECT_ID to its id to update a project not yet cached")
 }
 
 // resolveAddProject resolves the project-name argument accepted by the 2-fragment
 // form of `tg add` (`tg add <timesign> <project> <task>`) to exactly one cached
-// project id, so the task search can be scoped to it.
-func resolveAddProject(st *store.Store, fragment string) (*int64, error) {
-	return resolveCachedProject(st, nil, fragment,
+// project id, so the task search can be scoped to it. first (`-1`) applies to
+// this fragment as well as to the task one, so an ambiguous pair is resolved in
+// one go.
+func resolveAddProject(st *store.Store, fragment string, first bool) (*int64, error) {
+	return resolveCachedProject(st, nil, fragment, first,
 		errors.New("usage: tg add <timesign> [project] <task-fragment>"),
 		"; run `tg update` to refresh the catalog")
 }

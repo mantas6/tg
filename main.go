@@ -80,7 +80,14 @@ func runAdd(args []string) error {
 	var desc string
 	fs.StringVar(&desc, "desc", "", "entry description")
 	fs.StringVar(&desc, "description", "", "entry description (alias of --desc)")
-	if err := fs.Parse(args); err != nil {
+	var first bool
+	bindFirstFlag(fs, &first, "task or project")
+	// Flags may follow the timesign and the fragment (`tg add 9-10 login -1`),
+	// so positionals are peeled off the same way `tg mod` does it. No timesign
+	// form starts with "-" (an absolute one needs a digit first), so nothing
+	// positional is mistaken for a flag.
+	rest, err := parseArgsAndFlags(fs, args)
+	if err != nil {
 		return err
 	}
 	cfg, err := config.Load()
@@ -96,7 +103,6 @@ func runAdd(args []string) error {
 	// First positional arg is the timesign. After it, two fragments mean
 	// `<project> <task>` (the first scopes to a project, overriding
 	// TOGGL_PROJECT_ID); one means `<task>` scoped by env.
-	rest := fs.Args()
 	if len(rest) < 2 {
 		return errors.New("usage: tg add <timesign> [project] <task-fragment>")
 	}
@@ -105,14 +111,14 @@ func runAdd(args []string) error {
 	projectID := projectIDFromEnv()
 	fragment := strings.Join(rest, " ")
 	if len(rest) == 2 {
-		pid, err := resolveAddProject(st, rest[0])
+		pid, err := resolveAddProject(st, rest[0], first)
 		if err != nil {
 			return err
 		}
 		projectID = pid
 		fragment = rest[1]
 	}
-	return cmdAdd(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectID, timesign, fragment, desc, time.Now(), time.Local)
+	return cmdAdd(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectID, first, timesign, fragment, desc, time.Now(), time.Local)
 }
 
 func runMod(args []string) error {
@@ -248,6 +254,8 @@ func runGrep(args []string) error {
 	fs := newFlagSet("grep")
 	all := fs.Bool("all", false, "include inactive tasks")
 	jsonOut := fs.Bool("json", false, "emit JSON")
+	var first bool
+	bindFirstFlag(fs, &first, "task")
 	// Flags may follow the fragment (`tg grep login --json`), so positionals
 	// are peeled off the same way `tg mod` does it.
 	rest, err := parseArgsAndFlags(fs, args)
@@ -261,7 +269,7 @@ func runGrep(args []string) error {
 	defer st.Close()
 	// All positionals form ONE fragment, exactly like `tg add`/`tg total`.
 	fragment := strings.Join(rest, " ")
-	return cmdGrep(os.Stdout, st, *all, projectIDFromEnv(), fragment, *jsonOut)
+	return cmdGrep(os.Stdout, st, *all, projectIDFromEnv(), first, fragment, *jsonOut)
 }
 
 func runProjects(args []string) error {
@@ -319,6 +327,8 @@ func runUpdate(args []string) error {
 	var project string
 	fs.StringVar(&project, "project", "", "project name fragment to update")
 	fs.StringVar(&project, "p", "", "project name fragment to update (alias of --project)")
+	var first bool
+	bindFirstFlag(fs, &first, "project")
 	// Flags may follow the project fragment (`tg update backend -n 3`), so
 	// positionals are peeled off the same way `tg grep` does it.
 	rest, err := parseArgsAndFlags(fs, args)
@@ -340,7 +350,7 @@ func runUpdate(args []string) error {
 	defer st.Close()
 	now := time.Now()
 	since := resolveUpdateSince(days, now, time.Local)
-	return cmdUpdate(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectIDFromEnv(), fragment, since, now, *all, *jsonOut)
+	return cmdUpdate(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectIDFromEnv(), first, fragment, since, now, *all, *jsonOut)
 }
 
 func runPush(args []string) error {
@@ -371,6 +381,8 @@ func runPull(args []string) error {
 	var all bool
 	fs.BoolVar(&all, "all", false, "pull this month's entries instead of only today's")
 	fs.BoolVar(&all, "a", false, "pull this month's entries (alias of --all)")
+	var first bool
+	bindFirstFlag(fs, &first, "project")
 	// Flags may follow the project fragment (`tg pull backend -a`), so
 	// positionals are peeled off the same way `tg update` does it.
 	rest, err := parseArgsAndFlags(fs, args)
@@ -396,14 +408,19 @@ func runPull(args []string) error {
 	// pull deliberately ignores TOGGL_PROJECT_ID (unlike add/tasks/update):
 	// it always reconciles every project. Scoping happens only via an explicit
 	// <project> argument, so the env project id is never passed through here.
-	return cmdPull(os.Stdout, st, api.New(cfg.APIToken), fragment, since, now, *jsonOut)
+	return cmdPull(os.Stdout, st, api.New(cfg.APIToken), first, fragment, since, now, *jsonOut)
 }
 
 func runTotal(args []string) error {
 	fs := newFlagSet("total")
 	jsonOut := fs.Bool("json", false, "emit JSON")
 	sinceFlag := fs.String("since", "", "total entries since DATE (YYYY-MM-DD); default 3 months ago")
-	if err := fs.Parse(args); err != nil {
+	var first bool
+	bindFirstFlag(fs, &first, "task")
+	// Flags may follow the fragment (`tg total login --json`), so positionals
+	// are peeled off the same way `tg grep` does it.
+	rest, err := parseArgsAndFlags(fs, args)
+	if err != nil {
 		return err
 	}
 	cfg, err := config.Load()
@@ -425,8 +442,8 @@ func runTotal(args []string) error {
 	defer st.Close()
 	// All positionals form ONE fragment, exactly like `tg add` (so
 	// `tg total code review` searches for "code review").
-	fragment := strings.Join(fs.Args(), " ")
-	return cmdTotal(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, fragment, since, now, time.Local, *jsonOut)
+	fragment := strings.Join(rest, " ")
+	return cmdTotal(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, first, fragment, since, now, time.Local, *jsonOut)
 }
 
 func runAuth(args []string) error {
@@ -473,6 +490,24 @@ func optionalClient() (*api.Client, error) {
 		return nil, err
 	}
 	return api.New(cfg.APIToken), nil
+}
+
+// bindFirstFlag binds the `-1` flag (long spelling `--first`) shared by every
+// command that resolves a name fragment: when the fragment matches more than
+// one candidate, take the FIRST one instead of failing with the candidate list.
+// That is what makes two identically named tasks in different projects usable
+// without exporting TOGGL_PROJECT_ID or renaming anything.
+//
+// The name is the digit "1", so the flag package parses a bare `-1` as this
+// boolean rather than treating it as an unknown flag or a positional: boolean
+// flags need no value, and `-1`, `--1`, `-first` and `--first` all set it.
+// Since it is a declared flag it also survives parseArgsAndFlags, so it may be
+// written before or after the fragment. subject names what the fragment
+// selects ("task", "project", ...) and only shapes the usage line.
+func bindFirstFlag(fs *flag.FlagSet, first *bool, subject string) {
+	usage := "on an ambiguous " + subject + " fragment, use the first match instead of failing"
+	fs.BoolVar(first, "1", false, usage)
+	fs.BoolVar(first, "first", false, usage+" (alias of -1)")
 }
 
 // parseArgsAndFlags parses args with fs and returns the positional arguments,
@@ -664,7 +699,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "commands:")
 	fmt.Fprintln(w, "  auth [token]              verify a Toggl API token and store config")
-	fmt.Fprintln(w, "  add <timesign> [project] <task>  add a finished entry [--desc TEXT]")
+	fmt.Fprintln(w, "  add <timesign> [project] <task>  add a finished entry [--desc TEXT] [-1]")
 	fmt.Fprintln(w, "  mod [num] [timesign]      retime/rename an entry (default: last) [--desc TEXT]")
 	fmt.Fprintln(w, "  del <num>                 delete the entry numbered by `tg ls`")
 	fmt.Fprintln(w, "  current | status          last entry, gap, day total        [--json]")
@@ -672,15 +707,15 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  daily                     this month's time per day and overtime")
 	fmt.Fprintln(w, "                            vs a daily target      [-t HOURS] [--json]")
 	fmt.Fprintln(w, "  tasks                     list cached tasks                 [--all] [--json]")
-	fmt.Fprintln(w, "  grep <fragment>           list cached tasks matching it     [--all] [--json]")
+	fmt.Fprintln(w, "  grep <fragment>           list cached tasks matching it [--all] [--json] [-1]")
 	fmt.Fprintln(w, "  projects                  list cached projects with ids     [--all] [--json]")
 	fmt.Fprintln(w, "  projects update           sync all workspace projects       [--all] [--json]")
 	fmt.Fprintln(w, "  update [project]          refresh a project's tasks and pull its recent")
-	fmt.Fprintln(w, "                            entries    [-p FRAGMENT] [--days N] [--all] [--json]")
+	fmt.Fprintln(w, "                            entries [-p FRAGMENT] [--days N] [--all] [--json] [-1]")
 	fmt.Fprintln(w, "  push                      send local changes to Toggl       [--json]")
 	fmt.Fprintln(w, "  pull [project]            fetch today's changes; all projects, or one")
-	fmt.Fprintln(w, "                            [-a|--all this month] [--since DATE] [--json]")
-	fmt.Fprintln(w, "  total [task]              total tracked hours per task; last 3 months [--since DATE] [--json]")
+	fmt.Fprintln(w, "                            [-a|--all this month] [--since DATE] [--json] [-1]")
+	fmt.Fprintln(w, "  total [task]              total tracked hours per task; last 3 months [--since DATE] [--json] [-1]")
 	fmt.Fprintln(w, "  completion zsh            print the zsh completion script")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "timesign: absolute 9-:30, 10-11, 10:30-11:15 (today), relative +:20,")
@@ -694,6 +729,11 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "      entry's own day; a relative one EXTENDS the entry, keeping the")
 	fmt.Fprintln(w, "      start (`tg mod +30` pushes the end 30m later); unlike other")
 	fmt.Fprintln(w, "      relative timesigns, a number without `:` is minutes for `mod`.")
+	fmt.Fprintln(w, "-1:   `add`/`grep`/`total`/`update`/`pull` match tasks and projects by")
+	fmt.Fprintln(w, "      name fragment; a fragment matching several of them normally")
+	fmt.Fprintln(w, "      fails with the candidates listed. `-1` (alias `--first`) takes")
+	fmt.Fprintln(w, "      the first candidate instead, which is how two tasks sharing a")
+	fmt.Fprintln(w, "      name in different projects are told apart.")
 	fmt.Fprintln(w, "sync: run `tg pull` then `tg push` for correct last-writer-wins.")
 	fmt.Fprintln(w, "env:  TOGGL_PROJECT_ID scopes `add`/`tasks`/`grep`/`update` to one project")
 	fmt.Fprintln(w, "      (and sets the project on entries created by `add`). `pull`")

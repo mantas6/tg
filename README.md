@@ -94,6 +94,41 @@ carried through to Toggl on push:
 tg add 9-:30 --desc "reset password flow" <task>
 ```
 
+Flags may come before or after the positional arguments, so
+`tg add 9-:30 login --desc "…"` works too.
+
+### Ambiguous fragments and `-1`
+
+Tasks and projects are named by **fragment**: a case-insensitive substring of
+the name, with an exact name winning over mere substrings. When a fragment
+matches several of them, the command refuses to guess and lists the candidates:
+
+```
+$ tg add 9-:30 "code review"
+tg: multiple tasks match "code review":
+  Code review [Backend]
+  Code review [Payments]
+pass -1 to use the first match
+```
+
+Refine the fragment when you can — but two tasks that *share* a name in
+different projects cannot be told apart that way. Pass **`-1`** (alias
+`--first`) to take the first candidate, the one listed at the top:
+
+```sh
+tg add 9-:30 "code review" -1     # records against Code review [Backend]
+tg grep "code review" -1          # only the first of the matching tasks
+```
+
+`-1` is accepted by every command that resolves a fragment — `add`, `grep`,
+`total`, `update` and `pull` — before or after the fragment, and it applies to
+project fragments as well as task ones (`tg pull back -1`, `tg update back -1`).
+It only ever resolves *ambiguity*: a fragment matching nothing still fails, and
+on a fragment that already matches one candidate the flag changes nothing.
+`grep` and `total` normally report every match, so there `-1` narrows the output
+to the first one instead (`grep` orders by project then name and gives an exact
+name no precedence, so its first line is not always the task `add -1` picks).
+
 ### Fixing and removing entries
 
 `mod` edits an entry that already exists and `del` removes one. Both address
@@ -153,6 +188,7 @@ tg grep login              # every task containing "login"
 tg grep code review        # one fragment: "code review"
 tg grep --all fix          # include inactive (archived) tasks
 tg grep login --json       # machine-readable, same shape as `tg tasks --json`
+tg grep login -1           # only the first match
 ```
 
 The arguments are joined into a single fragment and the output is the `tasks`
@@ -176,11 +212,13 @@ tg total login                        # last 3 months for "login"
 tg total code review                  # one fragment: "code review"
 tg total                              # every task with tracked time
 tg total --since 2025-01-01 login     # from 2025-01-01 through today
+tg total write -1                     # only the first matching task
 ```
 
 The arguments are joined into a single task-name fragment, matched against the
 cached tasks the same case-insensitive way as `tg add` (exact name wins over
-substrings), so run `tg update` if the catalog is stale. Without a fragment
+substrings), so run `tg update` if the catalog is stale. A fragment matching
+several tasks totals all of them; `-1` narrows it to the first. Without a fragment
 every task with tracked time is listed, including tasks missing from the local
 catalog (shown as `task #<id>` when the API gives no title); those cannot be
 reached by a fragment.
@@ -304,7 +342,7 @@ usage: tg <command> [flags]
 
 commands:
   auth [token]              verify a Toggl API token and store config
-  add <timesign> [project] <task>  add a finished entry [--desc TEXT]
+  add <timesign> [project] <task>  add a finished entry [--desc TEXT] [-1]
   mod [num] [timesign]      retime/rename an entry (default: last) [--desc TEXT]
   del <num>                 delete the entry numbered by `tg ls`
   current | status          last entry, gap, day total        [--json]
@@ -312,15 +350,15 @@ commands:
   daily                     this month's time per day and overtime
                             vs a daily target      [-t HOURS] [--json]
   tasks                     list cached tasks                 [--all] [--json]
-  grep <fragment>           list cached tasks matching it     [--all] [--json]
+  grep <fragment>           list cached tasks matching it [--all] [--json] [-1]
   projects                  list cached projects with ids     [--all] [--json]
   projects update           sync all workspace projects       [--all] [--json]
   update [project]          refresh a project's tasks and pull its recent
-                            entries    [-p FRAGMENT] [--days N] [--all] [--json]
+                            entries [-p FRAGMENT] [--days N] [--all] [--json] [-1]
   push                      send local changes to Toggl       [--json]
   pull [project]            fetch today's changes; all projects, or one
-                            [-a|--all this month] [--since DATE] [--json]
-  total [task]              total tracked hours per task; last 3 months [--since DATE] [--json]
+                            [-a|--all this month] [--since DATE] [--json] [-1]
+  total [task]              total tracked hours per task; last 3 months [--since DATE] [--json] [-1]
   completion zsh            print the zsh completion script
 
 timesign: absolute 9-:30, 10-11, 10:30-11:15 (today), relative +:20,
@@ -333,6 +371,11 @@ mod:  numbers are the per-day ones shown by `tg ls`; without one the
       An absolute timesign sets the range on the entry's own day; a
       relative one EXTENDS the entry, keeping the start (`tg mod +30`
       pushes the end 30m later); a number without `:` is minutes for `mod`.
+-1:   `add`/`grep`/`total`/`update`/`pull` match tasks and projects by
+      name fragment; a fragment matching several of them normally
+      fails with the candidates listed. `-1` (alias `--first`) takes
+      the first candidate instead, which is how two tasks sharing a
+      name in different projects are told apart.
 ```
 
 ### Syncing
@@ -353,6 +396,7 @@ midnight, local time). Widen it to the whole current calendar month — from the
 tg pull                # today's changes, every project
 tg pull -a             # everything changed this month
 tg pull backend -a     # ...scoped to one project
+tg pull back -1        # ...taking the first project the fragment matches
 tg pull --since 2026-01-01
 ```
 
@@ -389,11 +433,12 @@ $ tg update back
 tg: multiple projects match "back":
   Backend (1)
   Backend API (3)
+pass -1 to use the first match
 ```
 
-Refine the fragment (`tg update "backend api"`), or export
-`TOGGL_PROJECT_ID`, which takes precedence and also lets you update a project
-that is not cached yet.
+Refine the fragment (`tg update "backend api"`), pass `-1` to take the first
+candidate listed, or export `TOGGL_PROJECT_ID`, which takes precedence and also
+lets you update a project that is not cached yet.
 
 The entry window defaults to **one day back** and is set by `--days`/`-n`, a
 count of calendar days: the window starts at midnight that many days before
@@ -410,8 +455,9 @@ task count and pull counters.
   sets the project on entries created by `add`). `pull` ignores it and always
   reconciles every project; pass a `<project>` name to `pull` to scope it
   explicitly. When unset, `update` requires a `<project>` fragment (positional
-  or `--project`/`-p`) that matches exactly one cached project, and `add`
-  accepts `<timesign> <project> <task>` to scope by project name.
+  or `--project`/`-p`) that matches exactly one cached project — or several with
+  `-1`, which takes the first — and `add` accepts
+  `<timesign> <project> <task>` to scope by project name.
 - `XDG_STATE_HOME` controls where state is stored (`$XDG_STATE_HOME/tg`,
   falling back to `~/.local/state/tg`). This holds `config.json` (mode 0600)
   and the SQLite database.

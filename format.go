@@ -696,10 +696,18 @@ func writeJSON(w io.Writer, v any) error {
 	return err
 }
 
-// candidateList renders task match candidates for the ambiguous `start` case.
+// candidateList renders task match candidates for the ambiguous `add`/`total`
+// case, in the order the resolver would pick from, so the first line is the one
+// `-1` takes (see resolveTaskFragment). The project is appended when known:
+// two tasks may share a name in different projects, which is exactly the
+// ambiguity `-1` exists for, and the bare names alone would not tell them apart.
 func candidateList(tasks []store.Task) string {
 	var b strings.Builder
 	for _, t := range tasks {
+		if t.ProjectName != "" {
+			fmt.Fprintf(&b, "  %s [%s]\n", t.Name, t.ProjectName)
+			continue
+		}
 		fmt.Fprintf(&b, "  %s\n", t.Name)
 	}
 	return b.String()
