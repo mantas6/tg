@@ -742,24 +742,29 @@ func TestRenderCurrentNoneGolden(t *testing.T) {
 
 // sampleMonth builds the `tg daily` fixture: three worked days, one over the
 // 8h target, one under it, and one exactly on target that is still running.
-func sampleMonth() []dailyRow {
+// now sits on the last of them, so none of the rows is in the future.
+func sampleMonth() (rows []dailyRow, now time.Time) {
 	day := func(d int) time.Time { return time.Date(2026, 1, d, 0, 0, 0, 0, time.UTC) }
-	return []dailyRow{
+	now = time.Date(2026, 1, 7, 17, 0, 0, 0, time.UTC)
+	rows = []dailyRow{
 		{Day: day(5), Tracked: 8*time.Hour + 30*time.Minute},
 		{Day: day(6), Tracked: 7*time.Hour + 15*time.Minute},
 		{Day: day(7), Tracked: 8 * time.Hour, Running: true},
 	}
+	return rows, now
 }
 
 func TestRenderDailyGolden(t *testing.T) {
+	rows, now := sampleMonth()
 	var buf bytes.Buffer
-	renderDaily(&buf, sampleMonth(), 8*time.Hour, time.UTC)
+	renderDaily(&buf, rows, now, 8*time.Hour, time.UTC, false)
 	assertGolden(t, "daily.txt", buf.String())
 }
 
 func TestRenderDailyJSONGolden(t *testing.T) {
+	rows, _ := sampleMonth()
 	var buf bytes.Buffer
-	if err := renderDailyJSON(&buf, sampleMonth(), 8*time.Hour, time.UTC); err != nil {
+	if err := renderDailyJSON(&buf, rows, 8*time.Hour, time.UTC); err != nil {
 		t.Fatal(err)
 	}
 	assertGolden(t, "daily.json", buf.String())
@@ -769,8 +774,9 @@ func TestRenderDailyJSONGolden(t *testing.T) {
 // column is tracked-minus-target, signed, and the divider footer sums the days
 // and measures them against target x the number of LISTED days.
 func TestRenderDailyOvertimeColumn(t *testing.T) {
+	rows, now := sampleMonth()
 	var buf bytes.Buffer
-	renderDaily(&buf, sampleMonth(), 8*time.Hour, time.UTC)
+	renderDaily(&buf, rows, now, 8*time.Hour, time.UTC, false)
 	out := buf.String()
 	for _, want := range []string{
 		"Mon 2026-01-05  8h30m   +0:30\n",
@@ -792,8 +798,9 @@ func TestRenderDailyOvertimeColumn(t *testing.T) {
 // overtime column (and the footer's target) without touching the tracked
 // durations, and that a non-integer target works.
 func TestRenderDailyTargetChangesOnlyOvertime(t *testing.T) {
+	rows, now := sampleMonth()
 	var buf bytes.Buffer
-	renderDaily(&buf, sampleMonth(), 7*time.Hour+30*time.Minute, time.UTC)
+	renderDaily(&buf, rows, now, 7*time.Hour+30*time.Minute, time.UTC, false)
 	out := buf.String()
 	for _, want := range []string{
 		"Mon 2026-01-05  8h30m   +1:00\n",
@@ -811,8 +818,9 @@ func TestRenderDailyTargetChangesOnlyOvertime(t *testing.T) {
 // TestRenderDailyZeroTarget covers the degenerate target: with no target every
 // overtime figure is just the tracked time, and nothing is ever negative.
 func TestRenderDailyZeroTarget(t *testing.T) {
+	rows, now := sampleMonth()
 	var buf bytes.Buffer
-	renderDaily(&buf, sampleMonth(), 0, time.UTC)
+	renderDaily(&buf, rows, now, 0, time.UTC, false)
 	out := buf.String()
 	if strings.Contains(out, "-") && !strings.Contains(out, "2026-01") {
 		t.Fatalf("unexpected negative overtime:\n%s", out)
@@ -829,7 +837,7 @@ func TestRenderDailyZeroTarget(t *testing.T) {
 func TestRenderDailySingleDayFooter(t *testing.T) {
 	var buf bytes.Buffer
 	rows := []dailyRow{{Day: time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC), Tracked: 9 * time.Hour}}
-	renderDaily(&buf, rows, 8*time.Hour, time.UTC)
+	renderDaily(&buf, rows, time.Date(2026, 1, 5, 18, 0, 0, 0, time.UTC), 8*time.Hour, time.UTC, false)
 	if want := "Total: 9h00m   +1:00  (1 day x 8h00m)\n"; !strings.Contains(buf.String(), want) {
 		t.Errorf("renderDaily footer = %q, want it to contain %q", buf.String(), want)
 	}
@@ -840,7 +848,7 @@ func TestRenderDailySingleDayFooter(t *testing.T) {
 
 func TestRenderDailyEmpty(t *testing.T) {
 	var buf bytes.Buffer
-	renderDaily(&buf, nil, 8*time.Hour, time.UTC)
+	renderDaily(&buf, nil, time.Now(), 8*time.Hour, time.UTC, false)
 	if got := buf.String(); got != "No entries this month.\n" {
 		t.Errorf("empty daily = %q", got)
 	}
@@ -865,8 +873,9 @@ func TestRenderDailyJSONEmpty(t *testing.T) {
 func TestRenderDailyLocalDates(t *testing.T) {
 	loc := time.FixedZone("UTC+3", 3*60*60)
 	rows := []dailyRow{{Day: time.Date(2026, 1, 5, 0, 0, 0, 0, loc), Tracked: 8 * time.Hour}}
+	now := time.Date(2026, 1, 5, 18, 0, 0, 0, loc)
 	var human bytes.Buffer
-	renderDaily(&human, rows, 8*time.Hour, loc)
+	renderDaily(&human, rows, now, 8*time.Hour, loc, false)
 	if !strings.Contains(human.String(), "Mon 2026-01-05") {
 		t.Errorf("daily = %q, want the local date", human.String())
 	}
@@ -876,5 +885,72 @@ func TestRenderDailyLocalDates(t *testing.T) {
 	}
 	if !strings.Contains(js.String(), `"date":"2026-01-05"`) {
 		t.Errorf("daily json = %q, want the local date", js.String())
+	}
+}
+
+func TestFaint(t *testing.T) {
+	if got, want := faint("x"), "\x1b[2mx\x1b[0m"; got != want {
+		t.Errorf("faint = %q, want %q", got, want)
+	}
+}
+
+// TestRenderDailyGreysFutureDays pins the dimming of upcoming days: a day after
+// today (time booked ahead) is wrapped in the ANSI faint attribute, while today
+// and the days already behind stay plain — so the listing separates worked time
+// from planned time. Nothing is styled when color is off.
+func TestRenderDailyGreysFutureDays(t *testing.T) {
+	day := func(d int) time.Time { return time.Date(2026, 1, d, 0, 0, 0, 0, time.UTC) }
+	rows := []dailyRow{
+		{Day: day(5), Tracked: 8 * time.Hour}, // yesterday
+		{Day: day(6), Tracked: 7 * time.Hour}, // today
+		{Day: day(7), Tracked: 6 * time.Hour}, // tomorrow
+	}
+	now := time.Date(2026, 1, 6, 12, 0, 0, 0, time.UTC)
+
+	var buf bytes.Buffer
+	renderDaily(&buf, rows, now, 8*time.Hour, time.UTC, true)
+	out := buf.String()
+	for _, want := range []string{
+		"Mon 2026-01-05  8h00m   +0:00\n",
+		"Tue 2026-01-06  7h00m   -1:00\n",
+		faint("Wed 2026-01-07  6h00m   -2:00") + "\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("renderDaily output missing %q:\n%q", want, out)
+		}
+	}
+	// Only the one upcoming line is styled: the divider and the footer belong to
+	// no particular day, so they carry no escapes (faint opens and resets one).
+	if got, want := strings.Count(out, "\x1b"), 2; got != want {
+		t.Errorf("renderDaily emitted %d escapes, want %d:\n%q", got, want, out)
+	}
+
+	// color disabled: plain output, upcoming day included.
+	buf.Reset()
+	renderDaily(&buf, rows, now, 8*time.Hour, time.UTC, false)
+	if strings.Contains(buf.String(), "\x1b") {
+		t.Errorf("plain output contains ANSI escapes:\n%q", buf.String())
+	}
+}
+
+// TestRenderDailyFutureDayUsesLocalCalendar pins that "upcoming" is a calendar-
+// day question in the reporting location, not a raw instant comparison: just
+// after local midnight, today's row is still today (its midnight is behind now)
+// and only the next day is dimmed, even though both sit ahead of now in UTC.
+func TestRenderDailyFutureDayUsesLocalCalendar(t *testing.T) {
+	loc := time.FixedZone("UTC+3", 3*60*60)
+	rows := []dailyRow{
+		{Day: time.Date(2026, 1, 5, 0, 0, 0, 0, loc), Tracked: 8 * time.Hour},
+		{Day: time.Date(2026, 1, 6, 0, 0, 0, 0, loc), Tracked: 8 * time.Hour},
+	}
+	now := time.Date(2026, 1, 5, 0, 30, 0, 0, loc)
+	var buf bytes.Buffer
+	renderDaily(&buf, rows, now, 8*time.Hour, loc, true)
+	out := buf.String()
+	if want := "Mon 2026-01-05  8h00m   +0:00\n"; !strings.Contains(out, want) {
+		t.Errorf("today's row should be plain, want %q:\n%q", want, out)
+	}
+	if want := faint("Tue 2026-01-06  8h00m   +0:00") + "\n"; !strings.Contains(out, want) {
+		t.Errorf("tomorrow's row should be dimmed, want %q:\n%q", want, out)
 	}
 }

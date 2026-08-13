@@ -288,6 +288,11 @@ on it (an entry crossing midnight counts entirely towards the day it began), and
 a still-running entry contributes its elapsed time so far exactly as `tg ls` and
 `tg status` count it, marked with `*`.
 
+Days *after today* (time booked ahead) are greyed out, so planned days are easy
+to tell apart from worked ones. Like the project colors in `ls`, the dimming is
+only emitted when the output is a terminal — piped or redirected output stays
+plain, and `--json` never carries styling.
+
 Everything comes from the local store, so run `tg pull` first if days tracked
 elsewhere are missing. `--json` returns
 `{"days":[{"date":"2026-01-05","duration_seconds":30600,"overtime_seconds":1800,"running":false},...],"total_seconds":...,"target_seconds":28800,"overtime_seconds":...}`.

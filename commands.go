@@ -460,7 +460,10 @@ type dailyRow struct {
 //
 // A running entry contributes its live elapsed time, exactly as `tg today` and
 // `tg status` count it, so today's row keeps moving while something runs.
-func cmdDaily(w io.Writer, st *store.Store, now time.Time, loc *time.Location, targetHours float64, jsonOut bool) error {
+//
+// color enables ANSI styling in the human output (never in JSON): days after
+// today are greyed out, see renderDaily.
+func cmdDaily(w io.Writer, st *store.Store, now time.Time, loc *time.Location, targetHours float64, jsonOut, color bool) error {
 	if targetHours < 0 {
 		return fmt.Errorf("invalid target %g: hours per day must not be negative", targetHours)
 	}
@@ -475,7 +478,7 @@ func cmdDaily(w io.Writer, st *store.Store, now time.Time, loc *time.Location, t
 	if jsonOut {
 		return renderDailyJSON(w, rows, target, loc)
 	}
-	renderDaily(w, rows, target, loc)
+	renderDaily(w, rows, now, target, loc, color)
 	return nil
 }
 

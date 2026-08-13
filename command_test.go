@@ -3209,7 +3209,7 @@ func TestDailySumsPerDay(t *testing.T) {
 
 	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false); err != nil {
+	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false, false); err != nil {
 		t.Fatalf("daily: %v", err)
 	}
 	want := "Mon 2026-01-05  8h30m   +0:30\n" +
@@ -3244,7 +3244,7 @@ func TestDailyCoversWholeMonth(t *testing.T) {
 
 	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false); err != nil {
+	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false, false); err != nil {
 		t.Fatalf("daily: %v", err)
 	}
 	got := buf.String()
@@ -3257,6 +3257,42 @@ func TestDailyCoversWholeMonth(t *testing.T) {
 		if strings.Contains(got, gone) {
 			t.Errorf("daily leaked a neighbouring month (%s):\n%s", gone, got)
 		}
+	}
+}
+
+// TestDailyGreysUpcomingDays pins that days after today — the month's remaining
+// days, which can carry time booked ahead — are dimmed in the human listing so
+// they read as planned rather than worked. Today and the days behind it stay
+// plain, and JSON never carries styling.
+func TestDailyGreysUpcomingDays(t *testing.T) {
+	s := newStore(t)
+	seedDailyMonth(t, s, map[int]time.Duration{
+		19: 8 * time.Hour, // yesterday
+		20: 6 * time.Hour, // today
+		21: 4 * time.Hour, // booked ahead
+	})
+	now := time.Date(2026, 1, 20, 18, 0, 0, 0, time.UTC)
+
+	var buf bytes.Buffer
+	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false, true); err != nil {
+		t.Fatalf("daily: %v", err)
+	}
+	want := "Mon 2026-01-19  8h00m   +0:00\n" +
+		"Tue 2026-01-20  6h00m   -2:00\n" +
+		faint("Wed 2026-01-21  4h00m   -4:00") + "\n" +
+		todayDivider + "\n" +
+		"Total: 18h00m  -6:00  (3 days x 8h00m)\n"
+	if buf.String() != want {
+		t.Errorf("daily = %q, want %q", buf.String(), want)
+	}
+
+	// --json is a data shape, so it stays free of escapes even on a terminal.
+	buf.Reset()
+	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, true, true); err != nil {
+		t.Fatalf("daily --json: %v", err)
+	}
+	if strings.Contains(buf.String(), "\x1b") {
+		t.Errorf("daily --json contains ANSI escapes: %q", buf.String())
 	}
 }
 
@@ -3279,7 +3315,7 @@ func TestDailyTargetFlag(t *testing.T) {
 	}
 	for _, c := range cases {
 		var buf bytes.Buffer
-		if err := cmdDaily(&buf, s, now, time.UTC, c.target, false); err != nil {
+		if err := cmdDaily(&buf, s, now, time.UTC, c.target, false, false); err != nil {
 			t.Fatalf("daily -t %v: %v", c.target, err)
 		}
 		got := buf.String()
@@ -3302,7 +3338,7 @@ func TestDailyRejectsNegativeTarget(t *testing.T) {
 	seedDailyMonth(t, s, map[int]time.Duration{5: 8 * time.Hour})
 	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	err := cmdDaily(&buf, s, now, time.UTC, -1, false)
+	err := cmdDaily(&buf, s, now, time.UTC, -1, false, false)
 	if err == nil {
 		t.Fatalf("daily -t -1: expected an error, got %q", buf.String())
 	}
@@ -3326,7 +3362,7 @@ func TestDailyCountsRunningEntryLive(t *testing.T) {
 	}
 	now := time.Date(2026, 1, 5, 11, 30, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false); err != nil {
+	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false, false); err != nil {
 		t.Fatalf("daily: %v", err)
 	}
 	want := "Mon 2026-01-05  2h30m*  -5:30\n" +
@@ -3350,7 +3386,7 @@ func TestDailySkipsDeletedEntries(t *testing.T) {
 		t.Fatalf("del: %v", err)
 	}
 	var buf bytes.Buffer
-	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false); err != nil {
+	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false, false); err != nil {
 		t.Fatalf("daily: %v", err)
 	}
 	got := buf.String()
@@ -3369,7 +3405,7 @@ func TestDailyEmptyMonth(t *testing.T) {
 	seedCatalog(t, s)
 	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false); err != nil {
+	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false, false); err != nil {
 		t.Fatalf("daily: %v", err)
 	}
 	if got := buf.String(); got != "No entries this month.\n" {
@@ -3388,7 +3424,7 @@ func TestDailyJSON(t *testing.T) {
 	})
 	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, true); err != nil {
+	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, true, false); err != nil {
 		t.Fatalf("daily --json: %v", err)
 	}
 	var got dailyJSON

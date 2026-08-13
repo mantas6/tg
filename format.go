@@ -150,6 +150,14 @@ func colorBlock(hex string) string {
 	return fmt.Sprintf("\x1b[38;2;%d;%d;%dm\u25a0\x1b[0m", r, g, b)
 }
 
+// faint wraps s in the ANSI faint (dim) attribute, reset afterwards, so it
+// renders greyed out next to normal text. Like colorBlock it emits escapes
+// unconditionally, so callers must only reach for it when the output is a
+// terminal (the `color` flag on renderToday / renderDaily).
+func faint(s string) string {
+	return "\x1b[2m" + s + "\x1b[0m"
+}
+
 // gapThreshold is the smallest distance rendered as a gap (in the daily table
 // and in the status line). Entry times land on whole minutes at best, so a
 // sub-minute distance is rounding noise rather than real idle time.
@@ -615,17 +623,29 @@ func dailyTotals(rows []dailyRow, target time.Duration) (tracked, overtime time.
 // A day holding a still-running entry is flagged with `*` next to its duration
 // (and the footer says so), mirroring how `tg ls` marks a running entry: its
 // total is live and keeps growing.
-func renderDaily(w io.Writer, rows []dailyRow, target time.Duration, loc *time.Location) {
+//
+// Days after today in loc (entries booked ahead) are dimmed when color is set,
+// since their time has not been worked yet and their overtime is a plan rather
+// than a result. color enables ANSI styling and should only be set when w is a
+// terminal.
+func renderDaily(w io.Writer, rows []dailyRow, now time.Time, target time.Duration, loc *time.Location, color bool) {
 	if len(rows) == 0 {
 		fmt.Fprintln(w, "No entries this month.")
 		return
 	}
+	today := startOfDay(now, loc)
 	for _, r := range rows {
 		dur := formatHM(r.Tracked)
 		if r.Running {
 			dur += "*"
 		}
-		fmt.Fprintf(w, "%s  %-8s%s\n", dayHeader(r.Day, loc), dur, formatOvertime(r.Tracked-target))
+		line := fmt.Sprintf("%s  %-8s%s", dayHeader(r.Day, loc), dur, formatOvertime(r.Tracked-target))
+		// r.Day is already midnight, but normalising through startOfDay keeps
+		// the comparison a pure calendar-day one whatever zone it carries.
+		if color && startOfDay(r.Day, loc).After(today) {
+			line = faint(line)
+		}
+		fmt.Fprintln(w, line)
 	}
 	tracked, overtime, anyRunning := dailyTotals(rows, target)
 	fmt.Fprintln(w, todayDivider)

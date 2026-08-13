@@ -225,7 +225,8 @@ func runDaily(args []string) error {
 		return err
 	}
 	defer st.Close()
-	return cmdDaily(os.Stdout, st, time.Now(), time.Local, target, *jsonOut)
+	color := term.IsTerminal(int(os.Stdout.Fd()))
+	return cmdDaily(os.Stdout, st, time.Now(), time.Local, target, *jsonOut, color)
 }
 
 func runTasks(args []string) error {
