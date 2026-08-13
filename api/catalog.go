@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -25,11 +26,11 @@ func pageQuery(page int, includeInactive bool) url.Values {
 
 // getPaged walks a workspace-scoped endpoint that returns a bare JSON array,
 // page by page, until a short (or empty) page signals the end.
-func getPaged[T any](c *Client, path string, includeInactive bool) ([]T, error) {
+func getPaged[T any](ctx context.Context, c *Client, path string, includeInactive bool) ([]T, error) {
 	var out []T
 	for page := 1; ; page++ {
 		var batch []T
-		if err := c.do("GET", path+"?"+pageQuery(page, includeInactive).Encode(), nil, &batch); err != nil {
+		if err := c.do(ctx, "GET", path+"?"+pageQuery(page, includeInactive).Encode(), nil, &batch); err != nil {
 			return nil, err
 		}
 		out = append(out, batch...)
@@ -41,16 +42,16 @@ func getPaged[T any](c *Client, path string, includeInactive bool) ([]T, error) 
 
 // Projects returns the workspace's projects (active only unless includeInactive).
 // This endpoint returns a bare JSON array.
-func (c *Client) Projects(workspaceID int64, includeInactive bool) ([]Project, error) {
-	return getPaged[Project](c, fmt.Sprintf("/workspaces/%d/projects", workspaceID), includeInactive)
+func (c *Client) Projects(ctx context.Context, workspaceID int64, includeInactive bool) ([]Project, error) {
+	return getPaged[Project](ctx, c, fmt.Sprintf("/workspaces/%d/projects", workspaceID), includeInactive)
 }
 
 // Project returns a single workspace project by id. It is used by the
 // project-scoped `tg update` to refresh (or bootstrap) one project's metadata
 // without listing the whole workspace.
-func (c *Client) Project(workspaceID, projectID int64) (Project, error) {
+func (c *Client) Project(ctx context.Context, workspaceID, projectID int64) (Project, error) {
 	var p Project
-	err := c.do("GET", fmt.Sprintf("/workspaces/%d/projects/%d", workspaceID, projectID), nil, &p)
+	err := c.do(ctx, "GET", fmt.Sprintf("/workspaces/%d/projects/%d", workspaceID, projectID), nil, &p)
 	return p, err
 }
 
@@ -62,7 +63,7 @@ func (c *Client) Project(workspaceID, projectID int64) (Project, error) {
 // pages here would loop forever, because the endpoint ignores page/per_page and
 // returns the full list again for every page, so no page is ever short enough
 // to terminate a getPaged-style walk once a project has perPage+ tasks.
-func (c *Client) ProjectTasks(workspaceID, projectID int64, includeInactive bool) ([]Task, error) {
+func (c *Client) ProjectTasks(ctx context.Context, workspaceID, projectID int64, includeInactive bool) ([]Task, error) {
 	path := fmt.Sprintf("/workspaces/%d/projects/%d/tasks", workspaceID, projectID)
 	// The endpoint returns all tasks unless active=true is set; omitting the
 	// filter (includeInactive) yields both active and inactive tasks.
@@ -70,7 +71,7 @@ func (c *Client) ProjectTasks(workspaceID, projectID int64, includeInactive bool
 		path += "?active=true"
 	}
 	var tasks []Task
-	if err := c.do("GET", path, nil, &tasks); err != nil {
+	if err := c.do(ctx, "GET", path, nil, &tasks); err != nil {
 		return nil, err
 	}
 	return tasks, nil
@@ -90,12 +91,12 @@ type tasksResponse struct {
 // The endpoint paginates inside a {data, ...} envelope, so it is walked
 // separately from the bare-array collections. The walk stops on a short page or
 // once total_count items have been collected.
-func (c *Client) Tasks(workspaceID int64, includeInactive bool) ([]Task, error) {
+func (c *Client) Tasks(ctx context.Context, workspaceID int64, includeInactive bool) ([]Task, error) {
 	path := fmt.Sprintf("/workspaces/%d/tasks", workspaceID)
 	var out []Task
 	for page := 1; ; page++ {
 		var resp tasksResponse
-		if err := c.do("GET", path+"?"+pageQuery(page, includeInactive).Encode(), nil, &resp); err != nil {
+		if err := c.do(ctx, "GET", path+"?"+pageQuery(page, includeInactive).Encode(), nil, &resp); err != nil {
 			return nil, err
 		}
 		out = append(out, resp.Data...)

@@ -3,13 +3,16 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/term"
@@ -20,46 +23,55 @@ import (
 )
 
 func main() {
+	// One context per invocation, cancelled on Ctrl-C (SIGINT) or SIGTERM. It
+	// is threaded through the run*/cmd* layers into the HTTP client and every
+	// SQLite statement, so an interrupt stops a hanging sync or query instead
+	// of being noticed only after it finished. NotifyContext also restores the
+	// default signal behavior on stop, so a second Ctrl-C still kills tg
+	// outright if the first one somehow does not land.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	if len(os.Args) < 2 {
 		printUsage(os.Stderr)
 		os.Exit(1)
 	}
-	if err := run(os.Args[1], os.Args[2:]); err != nil {
+	if err := run(ctx, os.Args[1], os.Args[2:]); err != nil {
 		fmt.Fprintln(os.Stderr, "tg: "+err.Error())
 		os.Exit(1)
 	}
 }
 
-func run(cmd string, args []string) error {
+func run(ctx context.Context, cmd string, args []string) error {
 	switch cmd {
 	case "auth":
-		return runAuth(args)
+		return runAuth(ctx, args)
 	case "add":
-		return runAdd(args)
+		return runAdd(ctx, args)
 	case "mod":
-		return runMod(args)
+		return runMod(ctx, args)
 	case "del":
-		return runDel(args)
+		return runDel(ctx, args)
 	case "current", "status":
-		return runCurrent(args)
+		return runCurrent(ctx, args)
 	case "today", "list", "ls":
-		return runToday(args)
+		return runToday(ctx, args)
 	case "daily":
-		return runDaily(args)
+		return runDaily(ctx, args)
 	case "tasks":
-		return runTasks(args)
+		return runTasks(ctx, args)
 	case "grep":
-		return runGrep(args)
+		return runGrep(ctx, args)
 	case "projects":
-		return runProjects(args)
+		return runProjects(ctx, args)
 	case "update":
-		return runUpdate(args)
+		return runUpdate(ctx, args)
 	case "push":
-		return runPush(args)
+		return runPush(ctx, args)
 	case "pull":
-		return runPull(args)
+		return runPull(ctx, args)
 	case "total":
-		return runTotal(args)
+		return runTotal(ctx, args)
 	case "completion":
 		return runCompletion(args)
 	case "help", "-h", "--help":
@@ -73,7 +85,7 @@ func run(cmd string, args []string) error {
 
 // --- command wiring ----------------------------------------------------------
 
-func runAdd(args []string) error {
+func runAdd(ctx context.Context, args []string) error {
 	fs := newFlagSet("add")
 	// --desc and --description are aliases bound to the same variable, so
 	// either spelling sets the entry's description (empty leaves it blank).
@@ -90,16 +102,6 @@ func runAdd(args []string) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-
 	// First positional arg is the timesign. After it, two fragments mean
 	// `<project> <task>` (the first scopes to a project, overriding
 	// TOGGL_PROJECT_ID); one means `<task>` scoped by env.
@@ -112,19 +114,22 @@ func runAdd(args []string) error {
 	if err != nil {
 		return err
 	}
-	fragment := strings.Join(rest, " ")
-	if len(rest) == 2 {
-		pid, err := resolveAddProject(st, rest[0], first)
-		if err != nil {
-			return err
+	// The project-name form is resolved against the cached catalog, so it needs
+	// the store and happens inside withEnv.
+	return withEnv(ctx, func(env *cmdEnv) error {
+		pid, fragment := projectID, strings.Join(rest, " ")
+		if len(rest) == 2 {
+			resolved, err := resolveAddProject(env.ctx, env.st, rest[0], first)
+			if err != nil {
+				return err
+			}
+			pid, fragment = resolved, rest[1]
 		}
-		projectID = pid
-		fragment = rest[1]
-	}
-	return cmdAdd(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectID, first, timesign, fragment, desc, time.Now(), time.Local)
+		return cmdAdd(env, pid, first, timesign, fragment, desc)
+	})
 }
 
-func runMod(args []string) error {
+func runMod(ctx context.Context, args []string) error {
 	fs := newFlagSet("mod")
 	// Same --desc/--description alias pair as `add`; here an explicitly empty
 	// value clears the description, which is why the flag's presence is tracked
@@ -147,19 +152,12 @@ func runMod(args []string) error {
 	if err != nil {
 		return err
 	}
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	c, err := optionalClient()
-	if err != nil {
-		return err
-	}
-	return cmdMod(os.Stdout, st, c, ref, timesign, desc, setDesc, time.Now(), time.Local)
+	return withEnv(ctx, func(env *cmdEnv) error {
+		return cmdMod(env, ref, timesign, desc, setDesc)
+	})
 }
 
-func runDel(args []string) error {
+func runDel(ctx context.Context, args []string) error {
 	fs := newFlagSet("del")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -172,52 +170,35 @@ func runDel(args []string) error {
 	if err != nil {
 		return err
 	}
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	c, err := optionalClient()
-	if err != nil {
-		return err
-	}
-	return cmdDel(os.Stdout, st, c, ref, time.Now(), time.Local)
+	return withEnv(ctx, func(env *cmdEnv) error { return cmdDel(env, ref) })
 }
 
-func runCurrent(args []string) error {
+func runCurrent(ctx context.Context, args []string) error {
 	fs := newFlagSet("current")
 	jsonOut := fs.Bool("json", false, "emit JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	return cmdCurrent(os.Stdout, st, time.Now(), time.Local, *jsonOut)
+	return withEnv(ctx, func(env *cmdEnv) error { return cmdCurrent(env, *jsonOut) })
 }
 
-func runToday(args []string) error {
+func runToday(ctx context.Context, args []string) error {
 	fs := newFlagSet("today")
 	jsonOut := fs.Bool("json", false, "emit JSON")
 	days := fs.Int("days", 1, "number of days to look back")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
 	color := term.IsTerminal(int(os.Stdout.Fd()))
-	return cmdToday(os.Stdout, st, time.Now(), time.Local, *days, *jsonOut, color)
+	return withEnv(ctx, func(env *cmdEnv) error {
+		return cmdToday(env, *days, *jsonOut, color)
+	})
 }
 
 // dailyDefaultTarget is `tg daily`'s default target: 8 hours worked per day.
 const dailyDefaultTarget = 8
 
-func runDaily(args []string) error {
+func runDaily(ctx context.Context, args []string) error {
 	fs := newFlagSet("daily")
 	jsonOut := fs.Bool("json", false, "emit JSON")
 	// --target and -t are aliases bound to the same variable: the target hours
@@ -229,35 +210,29 @@ func runDaily(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
 	color := term.IsTerminal(int(os.Stdout.Fd()))
-	return cmdDaily(os.Stdout, st, time.Now(), time.Local, target, *jsonOut, color)
+	return withEnv(ctx, func(env *cmdEnv) error {
+		return cmdDaily(env, target, *jsonOut, color)
+	})
 }
 
-func runTasks(args []string) error {
+func runTasks(ctx context.Context, args []string) error {
 	fs := newFlagSet("tasks")
 	all := fs.Bool("all", false, "include inactive tasks")
 	jsonOut := fs.Bool("json", false, "emit JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
 	projectID, err := projectIDFromEnv()
 	if err != nil {
 		return err
 	}
-	return cmdTasks(os.Stdout, st, *all, projectID, *jsonOut)
+	return withEnv(ctx, func(env *cmdEnv) error {
+		return cmdTasks(env, *all, projectID, *jsonOut)
+	})
 }
 
-func runGrep(args []string) error {
+func runGrep(ctx context.Context, args []string) error {
 	fs := newFlagSet("grep")
 	all := fs.Bool("all", false, "include inactive tasks")
 	jsonOut := fs.Bool("json", false, "emit JSON")
@@ -269,26 +244,23 @@ func runGrep(args []string) error {
 	if err != nil {
 		return err
 	}
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
 	projectID, err := projectIDFromEnv()
 	if err != nil {
 		return err
 	}
 	// All positionals form ONE fragment, exactly like `tg add`/`tg total`.
 	fragment := strings.Join(rest, " ")
-	return cmdGrep(os.Stdout, st, *all, projectID, first, fragment, *jsonOut)
+	return withEnv(ctx, func(env *cmdEnv) error {
+		return cmdGrep(env, *all, projectID, first, fragment, *jsonOut)
+	})
 }
 
-func runProjects(args []string) error {
+func runProjects(ctx context.Context, args []string) error {
 	// `projects` owns one subcommand: `tg projects update` syncs the catalog
 	// from Toggl, while a bare `tg projects` lists what is already cached. The
 	// subcommand word must come first (flags after it belong to it).
 	if len(args) > 0 && args[0] == "update" {
-		return runProjectsUpdate(args[1:])
+		return runProjectsUpdate(ctx, args[1:])
 	}
 	fs := newFlagSet("projects")
 	all := fs.Bool("all", false, "include inactive projects")
@@ -296,34 +268,24 @@ func runProjects(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	return cmdProjects(os.Stdout, st, *all, *jsonOut)
+	return withEnv(ctx, func(env *cmdEnv) error {
+		return cmdProjects(env, *all, *jsonOut)
+	})
 }
 
-func runProjectsUpdate(args []string) error {
+func runProjectsUpdate(ctx context.Context, args []string) error {
 	fs := newFlagSet("projects update")
 	all := fs.Bool("all", false, "include inactive projects")
 	jsonOut := fs.Bool("json", false, "emit JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	return cmdUpdateProjects(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, *all, *jsonOut)
+	return withEnv(ctx, func(env *cmdEnv) error {
+		return cmdUpdateProjects(env, *all, *jsonOut)
+	})
 }
 
-func runUpdate(args []string) error {
+func runUpdate(ctx context.Context, args []string) error {
 	fs := newFlagSet("update")
 	all := fs.Bool("all", false, "include inactive tasks")
 	jsonOut := fs.Bool("json", false, "emit JSON")
@@ -350,43 +312,26 @@ func runUpdate(args []string) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
 	projectID, err := projectIDFromEnv()
 	if err != nil {
 		return err
 	}
-	now := time.Now()
-	since := resolveUpdateSince(days, now, time.Local)
-	return cmdUpdate(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectID, first, fragment, since, now, *all, *jsonOut)
+	return withEnv(ctx, func(env *cmdEnv) error {
+		since := resolveUpdateSince(days, env.now, env.loc)
+		return cmdUpdate(env, projectID, first, fragment, since, *all, *jsonOut)
+	})
 }
 
-func runPush(args []string) error {
+func runPush(ctx context.Context, args []string) error {
 	fs := newFlagSet("push")
 	jsonOut := fs.Bool("json", false, "emit JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	return cmdPush(os.Stdout, st, api.New(cfg.APIToken), time.Now(), *jsonOut)
+	return withEnv(ctx, func(env *cmdEnv) error { return cmdPush(env, *jsonOut) })
 }
 
-func runPull(args []string) error {
+func runPull(ctx context.Context, args []string) error {
 	fs := newFlagSet("pull")
 	jsonOut := fs.Bool("json", false, "emit JSON")
 	sinceFlag := fs.String("since", "", "pull entries modified since DATE (YYYY-MM-DD)")
@@ -404,29 +349,21 @@ func runPull(args []string) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-
-	now := time.Now()
-	since, err := resolvePullSince(*sinceFlag, all, now, time.Local)
-	if err != nil {
-		return err
-	}
 	fragment := strings.Join(rest, " ")
-	// pull deliberately ignores TOGGL_PROJECT_ID (unlike add/tasks/update):
-	// it always reconciles every project. Scoping happens only via an explicit
-	// <project> argument, so the env project id is never passed through here.
-	return cmdPull(os.Stdout, st, api.New(cfg.APIToken), first, fragment, since, now, *jsonOut)
+	return withEnv(ctx, func(env *cmdEnv) error {
+		since, err := resolvePullSince(*sinceFlag, all, env.now, env.loc)
+		if err != nil {
+			return err
+		}
+		// pull deliberately ignores TOGGL_PROJECT_ID (unlike add/tasks/update):
+		// it always reconciles every project. Scoping happens only via an
+		// explicit <project> argument, so the env project id is never passed
+		// through here.
+		return cmdPull(env, first, fragment, since, *jsonOut)
+	})
 }
 
-func runTotal(args []string) error {
+func runTotal(ctx context.Context, args []string) error {
 	fs := newFlagSet("total")
 	jsonOut := fs.Bool("json", false, "emit JSON")
 	sinceFlag := fs.String("since", "", "total entries since DATE (YYYY-MM-DD); default 3 months ago")
@@ -438,35 +375,29 @@ func runTotal(args []string) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	now := time.Now()
-	since, err := resolveTotalSince(*sinceFlag, now, time.Local)
-	if err != nil {
-		return err
-	}
-	// The store is needed even though the totals come from the Reports API: it
-	// is what resolves the reported task ids to names and what fragments are
-	// matched against (see cmdTotal).
-	st, err := openStore()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
 	// All positionals form ONE fragment, exactly like `tg add` (so
 	// `tg total code review` searches for "code review").
 	fragment := strings.Join(rest, " ")
-	return cmdTotal(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, first, fragment, since, now, time.Local, *jsonOut)
+	// The store is opened even though the totals come from the Reports API: it
+	// is what resolves the reported task ids to names and what fragments are
+	// matched against (see cmdTotal).
+	return withEnv(ctx, func(env *cmdEnv) error {
+		since, err := resolveTotalSince(*sinceFlag, env.now, env.loc)
+		if err != nil {
+			return err
+		}
+		return cmdTotal(env, first, fragment, since, *jsonOut)
+	})
 }
 
-func runAuth(args []string) error {
+func runAuth(ctx context.Context, args []string) error {
 	fs := newFlagSet("auth")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	return cmdAuth(os.Stdout, tokenSource(fs.Args()), func(token string) *api.Client {
+	// auth is the one command that needs no store and no stored config: it is
+	// what writes the config, so it builds its client from the typed token.
+	return cmdAuth(ctx, os.Stdout, tokenSource(fs.Args()), func(token string) *api.Client {
 		return api.New(token)
 	})
 }
@@ -480,8 +411,41 @@ func runCompletion(args []string) error {
 
 // --- helpers -----------------------------------------------------------------
 
+// withEnv is the prologue every command shares: it loads the stored
+// credentials (if any), opens the SQLite database, hands the resulting cmdEnv to
+// fn and closes the database again afterwards. It replaces the
+// config-then-store-then-defer-close block that each run* function used to
+// repeat, so the commands differ only in their own flags and arguments.
+//
+// A missing config is deliberately NOT an error here. tg is local-first: adding,
+// editing, deleting and listing entries all work without credentials (the edits
+// stay dirty for a later `tg push`), so only the commands that genuinely need
+// the API say so, by asking for the client (see cmdEnv.client) — which then
+// reports the very same "run `tg auth`" error a missing config always did.
+//
+// The clock and calendar are pinned once per invocation, so every part of a
+// command sees the same "now" rather than sampling it repeatedly.
+func withEnv(ctx context.Context, fn func(env *cmdEnv) error) error {
+	cfg, err := optionalConfig()
+	if err != nil {
+		return err
+	}
+	st, err := openStore(ctx)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	env := &cmdEnv{ctx: ctx, w: os.Stdout, st: st, now: time.Now(), loc: time.Local}
+	if cfg != nil {
+		env.c = api.New(cfg.APIToken)
+		env.workspaceID = cfg.WorkspaceID
+	}
+	return fn(env)
+}
+
 // openStore ensures the state directory exists and opens the SQLite database.
-func openStore() (*store.Store, error) {
+func openStore(ctx context.Context) (*store.Store, error) {
 	if _, err := config.EnsureDir(); err != nil {
 		return nil, err
 	}
@@ -489,14 +453,13 @@ func openStore() (*store.Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return store.Open(path)
+	return store.Open(ctx, path)
 }
 
-// optionalClient builds an API client from the stored config for the
-// best-effort pushes done by the mutating commands. A missing config is not an
-// error: the local edit still applies and stays dirty for a later `tg push`,
-// which keeps `mod`/`del` usable before `tg auth`.
-func optionalClient() (*api.Client, error) {
+// optionalConfig loads the stored config, reporting "no config yet" as a nil
+// config rather than as an error: that is what makes tg usable before (or
+// without) `tg auth`, since only the commands that talk to Toggl need it.
+func optionalConfig() (*config.Config, error) {
 	cfg, err := config.Load()
 	if errors.Is(err, config.ErrNotConfigured) {
 		return nil, nil
@@ -504,7 +467,7 @@ func optionalClient() (*api.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return api.New(cfg.APIToken), nil
+	return cfg, nil
 }
 
 // bindFirstFlag binds the `-1` flag (long spelling `--first`) shared by every
@@ -619,17 +582,13 @@ func projectIDFromEnv() (*int64, error) {
 // day-aligned in loc (like resolveUpdateSince) so they mean "today" and "this
 // month" in calendar terms rather than a rolling cut.
 //
-// There is no explicit window END: sync.Pull asks Toggl for everything modified
+// There is no explicit window END: togglsync.Pull asks Toggl for everything modified
 // at or after `since`, and nothing can be modified after `now`, so today's
 // window ends at now and the current month's window ends at the month's end as
 // it is reached.
 func resolvePullSince(sinceFlag string, all bool, now time.Time, loc *time.Location) (time.Time, error) {
 	if sinceFlag != "" {
-		t, err := time.ParseInLocation("2006-01-02", sinceFlag, loc)
-		if err != nil {
-			return time.Time{}, fmt.Errorf("invalid --since %q (want YYYY-MM-DD)", sinceFlag)
-		}
-		return t, nil
+		return parseSinceFlag(sinceFlag, loc)
 	}
 	if all {
 		return startOfMonth(now, loc), nil
@@ -681,13 +640,20 @@ func resolveUpdateSince(days int, now time.Time, loc *time.Location) time.Time {
 // the default three calendar months before now.
 func resolveTotalSince(sinceFlag string, now time.Time, loc *time.Location) (time.Time, error) {
 	if sinceFlag != "" {
-		t, err := time.ParseInLocation("2006-01-02", sinceFlag, loc)
-		if err != nil {
-			return time.Time{}, fmt.Errorf("invalid --since %q (want YYYY-MM-DD)", sinceFlag)
-		}
-		return t, nil
+		return parseSinceFlag(sinceFlag, loc)
 	}
 	return now.AddDate(0, -3, 0), nil
+}
+
+// parseSinceFlag parses a --since value, the one date format tg accepts on the
+// command line (YYYY-MM-DD), as midnight of that day in loc. It is shared by
+// `pull` and `total` so both spell the format and the complaint identically.
+func parseSinceFlag(value string, loc *time.Location) (time.Time, error) {
+	t, err := time.ParseInLocation("2006-01-02", value, loc)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid --since %q (want YYYY-MM-DD)", value)
+	}
+	return t, nil
 }
 
 // tokenSource returns a function that yields the API token: an explicit arg, a

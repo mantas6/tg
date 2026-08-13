@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"time"
 )
@@ -78,31 +79,31 @@ var addColumns = []struct{ table, column, ddl string }{
 // pre-existing databases, numbers any entry that predates entries.seq, drops
 // retired tables, and records the schema version. It is safe to run on every
 // Open (idempotent).
-func (s *Store) migrate() error {
-	if _, err := s.db.Exec(schemaSQL); err != nil {
+func (s *Store) migrate(ctx context.Context) error {
+	if _, err := s.ex.ExecContext(ctx, schemaSQL); err != nil {
 		return err
 	}
 	for _, c := range addColumns {
-		has, err := s.hasColumn(c.table, c.column)
+		has, err := s.hasColumn(ctx, c.table, c.column)
 		if err != nil {
 			return err
 		}
 		if has {
 			continue
 		}
-		if _, err := s.db.Exec(c.ddl); err != nil {
+		if _, err := s.ex.ExecContext(ctx, c.ddl); err != nil {
 			return err
 		}
 	}
 	for _, t := range dropTables {
-		if _, err := s.db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
+		if _, err := s.ex.ExecContext(ctx, "DROP TABLE IF EXISTS "+t); err != nil {
 			return err
 		}
 	}
-	if err := s.backfillSeq(); err != nil {
+	if err := s.backfillSeq(ctx); err != nil {
 		return err
 	}
-	return s.SetMeta(MetaSchemaVersion, schemaVersion)
+	return s.SetMeta(ctx, MetaSchemaVersion, schemaVersion)
 }
 
 // backfillSeq hands a per-day number to every entry that has none (seq 0),
@@ -111,8 +112,8 @@ func (s *Store) migrate() error {
 // and each day starts again from 1. It is a no-op once every row is numbered,
 // so running it on every Open costs a single indexless scan of an already
 // migrated table.
-func (s *Store) backfillSeq() error {
-	rows, err := s.db.Query("SELECT id, start FROM entries WHERE seq = 0 ORDER BY id")
+func (s *Store) backfillSeq(ctx context.Context) error {
+	rows, err := s.ex.QueryContext(ctx, "SELECT id, start FROM entries WHERE seq = 0 ORDER BY id")
 	if err != nil {
 		return err
 	}
@@ -144,7 +145,7 @@ func (s *Store) backfillSeq() error {
 	rows.Close()
 
 	for _, p := range todo {
-		if err := s.assignSeq(p.id, p.start); err != nil {
+		if err := s.assignSeq(ctx, p.id, p.start); err != nil {
 			return err
 		}
 	}
@@ -154,8 +155,8 @@ func (s *Store) backfillSeq() error {
 // hasColumn reports whether table already has the named column. SQLite lacks
 // ADD COLUMN IF NOT EXISTS, so migrations probe the schema first. The table name
 // is a trusted constant (never user input), so interpolating it is safe.
-func (s *Store) hasColumn(table, column string) (bool, error) {
-	rows, err := s.db.Query("PRAGMA table_info(" + table + ")")
+func (s *Store) hasColumn(ctx context.Context, table, column string) (bool, error) {
+	rows, err := s.ex.QueryContext(ctx, "PRAGMA table_info("+table+")")
 	if err != nil {
 		return false, err
 	}

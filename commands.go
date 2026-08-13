@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -11,9 +12,89 @@ import (
 	"github.com/mantas6/tg/api"
 	"github.com/mantas6/tg/config"
 	"github.com/mantas6/tg/store"
-	"github.com/mantas6/tg/sync"
 	"github.com/mantas6/tg/timesig"
+	"github.com/mantas6/tg/togglsync"
 )
+
+// cmdEnv is everything a command needs of its surroundings, as opposed to its
+// own arguments: the context it runs under, where its output goes, the local
+// store, the Toggl client, and the clock and calendar it reckons time in. The
+// run* wiring in main.go builds one per invocation (see withEnv) and the cmd*
+// functions take it as their first parameter, so their signatures are about the
+// command — `tg add`'s timesign, `tg mod`'s entry number — rather than about
+// re-threading the same six values through every one of them.
+//
+// A cmdEnv is read-only for the commands: nothing mutates it.
+type cmdEnv struct {
+	ctx context.Context
+	w   io.Writer
+	st  *store.Store
+
+	// c is the Toggl client, nil exactly when tg has no credentials yet (see
+	// offline). Commands never test it directly: they either tolerate its
+	// absence via bestEffortPush or demand it via client.
+	c *api.Client
+
+	// workspaceID is the configured workspace new entries are filed under; 0
+	// when tg is unauthenticated (see workspaceFor).
+	workspaceID int64
+
+	now time.Time
+	loc *time.Location
+}
+
+// offline reports whether this invocation has no Toggl credentials, i.e. `tg
+// auth` has not run (or its config was removed). tg is local-first, so the
+// commands that only touch the local store keep working offline; the ones that
+// cannot do anything without the API ask for the client explicitly and get a
+// clear error instead (see client).
+func (e *cmdEnv) offline() bool { return e.c == nil }
+
+// client returns the Toggl client for a command that cannot work without it
+// (push, pull, update, total), or config.ErrNotConfigured — the same "run
+// `tg auth`" error a missing config produced before — when tg is offline. It is
+// the single explicit place the credentials requirement is stated, rather than a
+// nil check spread over the command bodies.
+func (e *cmdEnv) client() (*api.Client, error) {
+	if e.offline() {
+		return nil, config.ErrNotConfigured
+	}
+	return e.c, nil
+}
+
+// bestEffortPush sends the dirty local entries right after a local edit
+// (`add`/`mod`/`del`) so Toggl reflects it immediately. It is best-effort by
+// design: a failure is reported as a warning on the command's own output and the
+// entry simply stays dirty for a later `tg push`, which is what keeps editing
+// usable with no network — or with no credentials at all, where the push is
+// skipped entirely.
+func (e *cmdEnv) bestEffortPush() {
+	if e.offline() {
+		return
+	}
+	if _, err := togglsync.Push(e.ctx, e.st, e.c, e.now); err != nil {
+		fmt.Fprintf(e.w, "warning: could not sync to Toggl: %v\n", err)
+	}
+}
+
+// workspaceFor decides which workspace a newly created entry belongs to: the
+// configured one when tg is authenticated, otherwise the workspace of the task
+// the entry is filed under, which the local catalog knows because every cached
+// task was fetched from that workspace. That is what lets `tg add` work while
+// offline or after the config was lost, like `tg mod`/`tg del` always have,
+// instead of refusing an edit the local store is perfectly able to record.
+//
+// Neither source knowing a workspace is a genuine dead end (the entry could
+// never be pushed), so it is an error naming `tg auth`.
+func (e *cmdEnv) workspaceFor(task store.Task) (int64, error) {
+	if e.workspaceID != 0 {
+		return e.workspaceID, nil
+	}
+	if task.WorkspaceID != 0 {
+		return task.WorkspaceID, nil
+	}
+	return 0, fmt.Errorf("unknown workspace for task %q: %w", task.Name, config.ErrNotConfigured)
+}
 
 // cmdAdd records a single, already-stopped time entry from a timesign (see the
 // timesig package and docs/timesig.md) and a task-title fragment. The created
@@ -31,14 +112,14 @@ import (
 // one); none -> error suggesting `tg update`. The entry is stored dirty so a
 // later `tg push` (or the best-effort push below) sends it to Toggl.
 //
-// When c is non-nil the new entry is pushed to Toggl immediately; the push is
+// The new entry is pushed to Toggl immediately unless tg is offline; the push is
 // best-effort so a sync failure just leaves the entry dirty (a warning is
-// printed) for a later `tg push`.
+// printed) for a later `tg push`. See cmdEnv.bestEffortPush.
 //
 // desc is the entry's free-form description (from `--desc`/`--description`); an
 // empty desc leaves the description blank, matching the prior behavior.
-func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, projectID *int64, first bool, timesign, fragment, desc string, now time.Time, loc *time.Location) error {
-	start, stop, err := addSpan(st, timesign, now, loc)
+func cmdAdd(env *cmdEnv, projectID *int64, first bool, timesign, fragment, desc string) error {
+	start, stop, err := addSpan(env.ctx, env.st, timesign, env.now, env.loc)
 	if err != nil {
 		return err
 	}
@@ -52,30 +133,34 @@ func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, proj
 	// already tracked (a running entry counts as occupying everything from its
 	// start onwards). Reported before the catalog lookup so the conflict is the
 	// error the user sees.
-	clashes, err := st.FindOverlapping(start, stop)
+	clashes, err := env.st.FindOverlapping(env.ctx, start, stop)
 	if err != nil {
 		return err
 	}
 	if len(clashes) > 0 {
 		return fmt.Errorf("%s-%s overlaps existing entry %s",
-			formatClock(start, loc), formatClock(stop, loc), overlapLabel(clashes[0], loc))
+			formatClock(start, env.loc), formatClock(stop, env.loc), overlapLabel(clashes[0], env.loc))
 	}
 
-	task, err := resolveTaskFragment(st, fragment, projectID, first)
+	task, err := resolveTaskFragment(env.ctx, env.st, fragment, projectID, first)
 	if err != nil {
 		return err
 	}
 
+	workspaceID, err := env.workspaceFor(task)
+	if err != nil {
+		return err
+	}
 	taskID := task.ID
 	projID := task.ProjectID
 	// Carry the project's billable flag onto the entry: workspaces can
 	// reject non-billable entries in billable projects.
-	billable, err := projectBillable(st, projID)
+	billable, err := projectBillable(env.ctx, env.st, projID)
 	if err != nil {
 		return err
 	}
 	dur := stop.Sub(start)
-	if _, err := st.CreateEntry(store.Entry{
+	if _, err := env.st.CreateEntry(env.ctx, store.Entry{
 		WorkspaceID: workspaceID,
 		ProjectID:   &projID,
 		TaskID:      &taskID,
@@ -84,7 +169,7 @@ func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, proj
 		Stop:        &stop,
 		Duration:    int64(dur / time.Second),
 		Billable:    billable,
-		UpdatedAt:   now,
+		UpdatedAt:   env.now,
 		Dirty:       true,
 	}); err != nil {
 		return err
@@ -93,15 +178,11 @@ func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, proj
 	if task.ProjectName != "" {
 		label += " [" + task.ProjectName + "]"
 	}
-	fmt.Fprintf(w, "Added: %s  %s-%s (%s)\n",
-		label, formatClock(start, loc), formatClock(stop, loc), formatHM(dur))
+	fmt.Fprintf(env.w, "Added: %s  %s-%s (%s)\n",
+		label, formatClock(start, env.loc), formatClock(stop, env.loc), formatHM(dur))
 	// Push the new entry so Toggl reflects it immediately. Best-effort:
 	// keep the local entry dirty for a later `tg push` if the sync fails.
-	if c != nil {
-		if _, err := sync.Push(st, c, now); err != nil {
-			fmt.Fprintf(w, "warning: could not sync to Toggl: %v\n", err)
-		}
-	}
+	env.bestEffortPush()
 	return nil
 }
 
@@ -126,7 +207,7 @@ func cmdAdd(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, proj
 // applies, which is what catches a duration long enough to run into an entry
 // already booked for later today (LastEntry skips those, so they are never the
 // anchor).
-func addSpan(st *store.Store, timesign string, now time.Time, loc *time.Location) (time.Time, time.Time, error) {
+func addSpan(ctx context.Context, st *store.Store, timesign string, now time.Time, loc *time.Location) (time.Time, time.Time, error) {
 	if !timesig.IsDuration(timesign) {
 		span, err := timesig.Parse(timesign, now, loc)
 		if err != nil {
@@ -138,7 +219,7 @@ func addSpan(st *store.Store, timesign string, now time.Time, loc *time.Location
 	if err != nil {
 		return time.Time{}, time.Time{}, err
 	}
-	last, err := st.LastEntry(now)
+	last, err := st.LastEntry(ctx, now)
 	if err != nil {
 		return time.Time{}, time.Time{}, err
 	}
@@ -184,41 +265,41 @@ func addSpan(st *store.Store, timesign string, now time.Time, loc *time.Location
 //
 // Retiming is refused when the new span would overlap another entry (the entry
 // being modified is excluded from the check). The entry is stored dirty so a
-// later `tg push` sends it; when c is non-nil the push is attempted immediately,
-// best-effort, exactly like `tg add`.
-func cmdMod(w io.Writer, st *store.Store, c *api.Client, ref int, timesign, desc string, setDesc bool, now time.Time, loc *time.Location) error {
+// later `tg push` sends it; unless tg is offline the push is attempted
+// immediately, best-effort, exactly like `tg add`.
+func cmdMod(env *cmdEnv, ref int, timesign, desc string, setDesc bool) error {
 	if timesign == "" && !setDesc {
 		return errors.New("usage: tg mod [entry-number] [timesign] [--desc TEXT]")
 	}
 
-	e, err := modTarget(st, ref, now)
+	e, err := modTarget(env.ctx, env.st, ref, env.now)
 	if err != nil {
 		return err
 	}
 	// Failsafe: history is read-only. Checked here so the refusal is the first
 	// thing reported (before any timesign or overlap complaint) and again in
 	// store.UpdateEntry, which is the write that must never happen.
-	if err := store.CheckEditableDay(e.Start, now, loc); err != nil {
+	if err := store.CheckEditableDay(e.Start, env.now, env.loc); err != nil {
 		return err
 	}
 
 	if timesign != "" {
-		start, stop, err := modSpan(e, timesign, now, loc)
+		start, stop, err := modSpan(e, timesign, env.now, env.loc)
 		if err != nil {
 			return err
 		}
-		if err := store.CheckEditableDay(start, now, loc); err != nil {
+		if err := store.CheckEditableDay(start, env.now, env.loc); err != nil {
 			return err
 		}
 		// Time is exclusive (see cmdAdd), but the entry may of course keep
 		// overlapping itself, so it is excluded from the conflict search.
-		clashes, err := st.FindOverlappingExcluding(start, stop, e.ID)
+		clashes, err := env.st.FindOverlappingExcluding(env.ctx, start, stop, e.ID)
 		if err != nil {
 			return err
 		}
 		if len(clashes) > 0 {
 			return fmt.Errorf("%s-%s overlaps existing entry %s",
-				formatClock(start, loc), formatClock(stop, loc), overlapLabel(clashes[0], loc))
+				formatClock(start, env.loc), formatClock(stop, env.loc), overlapLabel(clashes[0], env.loc))
 		}
 		e.Start = start
 		e.Stop = &stop
@@ -228,16 +309,12 @@ func cmdMod(w io.Writer, st *store.Store, c *api.Client, ref int, timesign, desc
 		e.Description = strings.TrimSpace(desc)
 	}
 
-	e.UpdatedAt = now
-	if err := st.UpdateEntry(e, now, loc); err != nil {
+	e.UpdatedAt = env.now
+	if err := env.st.UpdateEntry(env.ctx, e, env.now, env.loc); err != nil {
 		return err
 	}
-	renderEntryChange(w, "Modified", e, loc)
-	if c != nil {
-		if _, err := sync.Push(st, c, now); err != nil {
-			fmt.Fprintf(w, "warning: could not sync to Toggl: %v\n", err)
-		}
-	}
+	renderEntryChange(env.w, "Modified", e, env.loc)
+	env.bestEffortPush()
 	return nil
 }
 
@@ -247,11 +324,11 @@ func cmdMod(w io.Writer, st *store.Store, c *api.Client, ref int, timesign, desc
 // numbers are per-day (see store.EntryByNum) and the last entry is today's —
 // which is also the only day mod may write to, so an unaddressable entry is
 // reported as missing rather than as a refused edit.
-func modTarget(st *store.Store, ref int, now time.Time) (store.Entry, error) {
+func modTarget(ctx context.Context, st *store.Store, ref int, now time.Time) (store.Entry, error) {
 	if ref > 0 {
-		return st.EntryByNum(ref, now)
+		return st.EntryByNum(ctx, ref, now)
 	}
-	last, err := st.LastEntry(now)
+	last, err := st.LastEntry(ctx, now)
 	if err != nil {
 		return store.Entry{}, err
 	}
@@ -297,28 +374,24 @@ func modSpan(e store.Entry, timesign string, now time.Time, loc *time.Location) 
 // today's calendar day (see store.EntryByNum). The deletion is soft: the row is
 // marked deleted and dirty so it vanishes from every listing at once and the
 // removal can still be pushed to Toggl, which is where the row is finally
-// dropped (see sync.Push). When c is non-nil that push is attempted
+// dropped (see togglsync.Push). Unless tg is offline that push is attempted
 // immediately, best-effort, exactly like `tg add`.
 //
 // The deleted entry's number is retired with it: the day's numbering keeps the
 // gap instead of shifting every later entry down one.
-func cmdDel(w io.Writer, st *store.Store, c *api.Client, ref int, now time.Time, loc *time.Location) error {
+func cmdDel(env *cmdEnv, ref int) error {
 	if ref < 1 {
 		return errors.New("usage: tg del <entry-number>")
 	}
-	e, err := st.EntryByNum(ref, now)
+	e, err := env.st.EntryByNum(env.ctx, ref, env.now)
 	if err != nil {
 		return err
 	}
-	if err := st.SoftDeleteEntry(e.ID, now); err != nil {
+	if err := env.st.SoftDeleteEntry(env.ctx, e.ID, env.now); err != nil {
 		return err
 	}
-	renderEntryChange(w, "Deleted", e, loc)
-	if c != nil {
-		if _, err := sync.Push(st, c, now); err != nil {
-			fmt.Fprintf(w, "warning: could not sync to Toggl: %v\n", err)
-		}
-	}
+	renderEntryChange(env.w, "Deleted", e, env.loc)
+	env.bestEffortPush()
 	return nil
 }
 
@@ -353,19 +426,23 @@ type totalRow struct {
 // The window defaults to the last three months (see runTotal/resolveTotalSince)
 // and can be overridden with `--since`. Output is one line per task with its
 // total, followed by the sum of all listed tasks.
-func cmdTotal(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, first bool, fragment string, since, now time.Time, loc *time.Location, jsonOut bool) error {
+func cmdTotal(env *cmdEnv, first bool, fragment string, since time.Time, jsonOut bool) error {
+	c, err := env.client()
+	if err != nil {
+		return err
+	}
 	fragment = strings.TrimSpace(fragment)
 
-	startDate := since.In(loc).Format("2006-01-02")
-	endDate := now.In(loc).Format("2006-01-02")
-	rows, err := c.SummaryByTask(workspaceID, startDate, endDate)
+	startDate := since.In(env.loc).Format("2006-01-02")
+	endDate := env.now.In(env.loc).Format("2006-01-02")
+	rows, err := c.SummaryByTask(env.ctx, env.workspaceID, startDate, endDate)
 	if err != nil {
 		return err
 	}
 
 	// Catalog lookup for display: inactive tasks are included so a row for an
 	// archived task still gets a name, and ListTasks joins the project name.
-	catalog, err := st.ListTasks(true, nil)
+	catalog, err := env.st.ListTasks(env.ctx, true, nil)
 	if err != nil {
 		return err
 	}
@@ -378,7 +455,7 @@ func cmdTotal(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, fi
 	// the resulting task ids are what filters the summary rows.
 	var keep map[int64]bool
 	if fragment != "" {
-		matched, err := st.FindTasksByFragment(fragment, nil)
+		matched, err := env.st.FindTasksByFragment(env.ctx, fragment, nil)
 		if err != nil {
 			return err
 		}
@@ -423,9 +500,9 @@ func cmdTotal(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, fi
 	})
 
 	if jsonOut {
-		return renderTotalsJSON(w, out)
+		return renderTotalsJSON(env.w, out)
 	}
-	renderTotals(w, out)
+	renderTotals(env.w, out)
 	return nil
 }
 
@@ -462,22 +539,22 @@ type dailyRow struct {
 //
 // color enables ANSI styling in the human output (never in JSON): days after
 // today are greyed out, see renderDaily.
-func cmdDaily(w io.Writer, st *store.Store, now time.Time, loc *time.Location, targetHours float64, jsonOut, color bool) error {
+func cmdDaily(env *cmdEnv, targetHours float64, jsonOut, color bool) error {
 	if targetHours < 0 {
 		return fmt.Errorf("invalid target %g: hours per day must not be negative", targetHours)
 	}
-	from := startOfMonth(now, loc)
+	from := startOfMonth(env.now, env.loc)
 	to := from.AddDate(0, 1, 0)
-	entries, err := st.EntriesBetween(from, to)
+	entries, err := env.st.EntriesBetween(env.ctx, from, to)
 	if err != nil {
 		return err
 	}
-	rows := groupDaily(entries, now, loc)
+	rows := groupDaily(entries, env.now, env.loc)
 	target := time.Duration(targetHours * float64(time.Hour))
 	if jsonOut {
-		return renderDailyJSON(w, rows, target, loc)
+		return renderDailyJSON(env.w, rows, target, env.loc)
 	}
-	renderDaily(w, rows, now, target, loc, color)
+	renderDaily(env.w, rows, env.now, target, env.loc, color)
 	return nil
 }
 
@@ -512,26 +589,26 @@ func groupDaily(entries []store.Entry, now time.Time, loc *time.Location) []dail
 // already started, so a fresh day reports no entry rather than yesterday's, and
 // something booked for later today is not mistaken for the last thing tracked.
 // The total always covers today only.
-func cmdCurrent(w io.Writer, st *store.Store, now time.Time, loc *time.Location, jsonOut bool) error {
-	last, err := st.Running()
+func cmdCurrent(env *cmdEnv, jsonOut bool) error {
+	last, err := env.st.Running(env.ctx)
 	if err != nil {
 		return err
 	}
 	if last == nil {
-		if last, err = st.LastEntry(now); err != nil {
+		if last, err = env.st.LastEntry(env.ctx, env.now); err != nil {
 			return err
 		}
 	}
-	dayStart := startOfDay(now, loc)
+	dayStart := startOfDay(env.now, env.loc)
 	// A calendar day is not always 24 hours long: AddDate walks to the next
 	// midnight in loc, so a DST transition day neither leaks an hour of
 	// tomorrow into today's total nor drops one of its own (see cmdDaily).
-	entries, err := st.EntriesBetween(dayStart, dayStart.AddDate(0, 0, 1))
+	entries, err := env.st.EntriesBetween(env.ctx, dayStart, dayStart.AddDate(0, 0, 1))
 	if err != nil {
 		return err
 	}
-	total, _ := totalDuration(entries, now)
-	return renderCurrent(w, last, total, now, loc, jsonOut)
+	total, _ := totalDuration(entries, env.now)
+	return renderCurrent(env.w, last, total, env.now, env.loc, jsonOut)
 }
 
 // cmdToday lists entries for the current day (or the last `days` days). color
@@ -545,40 +622,40 @@ func cmdCurrent(w io.Writer, st *store.Store, now time.Time, loc *time.Location,
 // Deleting an entry therefore leaves a gap rather than renumbering the rest. A
 // multi-day listing groups entries under a date header, since each day carries
 // its own 1..N; `mod`/`del` address today's numbers.
-func cmdToday(w io.Writer, st *store.Store, now time.Time, loc *time.Location, days int, jsonOut, color bool) error {
+func cmdToday(env *cmdEnv, days int, jsonOut, color bool) error {
 	if days < 1 {
 		days = 1
 	}
-	dayStart := startOfDay(now, loc)
+	dayStart := startOfDay(env.now, env.loc)
 	from := dayStart.AddDate(0, 0, -(days - 1))
 	// Both bounds are walked by calendar days rather than by 24-hour steps, so
 	// the window ends at tomorrow's midnight in loc even on a 23- or 25-hour
 	// DST transition day (see cmdCurrent).
 	to := dayStart.AddDate(0, 0, 1)
 
-	entries, err := st.EntriesBetween(from, to)
+	entries, err := env.st.EntriesBetween(env.ctx, from, to)
 	if err != nil {
 		return err
 	}
 	if jsonOut {
-		return renderTodayJSON(w, entries, now)
+		return renderTodayJSON(env.w, entries, env.now)
 	}
-	renderToday(w, entries, now, loc, color)
+	renderToday(env.w, entries, env.now, env.loc, color)
 	return nil
 }
 
 // cmdTasks lists the locally cached task catalog. `--all` includes inactive
 // tasks; a non-nil projectID (from TOGGL_PROJECT_ID) scopes the listing to one
 // project. Refresh the cache with `tg update`.
-func cmdTasks(w io.Writer, st *store.Store, all bool, projectID *int64, jsonOut bool) error {
-	tasks, err := st.ListTasks(all, projectID)
+func cmdTasks(env *cmdEnv, all bool, projectID *int64, jsonOut bool) error {
+	tasks, err := env.st.ListTasks(env.ctx, all, projectID)
 	if err != nil {
 		return err
 	}
 	if jsonOut {
-		return renderTasksJSON(w, tasks)
+		return renderTasksJSON(env.w, tasks)
 	}
-	renderTasks(w, tasks)
+	renderTasks(env.w, tasks)
 	return nil
 }
 
@@ -601,12 +678,12 @@ func cmdTasks(w io.Writer, st *store.Store, all bool, projectID *int64, jsonOut 
 // other fragment-taking commands accept. The candidate is grep's own first one
 // (catalog order, no exact-name precedence), so it is not necessarily the task
 // `tg add -1` would pick with the same fragment.
-func cmdGrep(w io.Writer, st *store.Store, all bool, projectID *int64, first bool, fragment string, jsonOut bool) error {
+func cmdGrep(env *cmdEnv, all bool, projectID *int64, first bool, fragment string, jsonOut bool) error {
 	fragment = strings.TrimSpace(fragment)
 	if fragment == "" {
 		return errors.New("usage: tg grep <fragment>")
 	}
-	tasks, err := st.ListTasks(all, projectID)
+	tasks, err := env.st.ListTasks(env.ctx, all, projectID)
 	if err != nil {
 		return err
 	}
@@ -618,9 +695,9 @@ func cmdGrep(w io.Writer, st *store.Store, all bool, projectID *int64, first boo
 		matches = matches[:1]
 	}
 	if jsonOut {
-		return renderTasksJSON(w, matches)
+		return renderTasksJSON(env.w, matches)
 	}
-	renderTasks(w, matches)
+	renderTasks(env.w, matches)
 	return nil
 }
 
@@ -643,15 +720,15 @@ func grepTasks(tasks []store.Task, fragment string) []store.Task {
 // cmdProjects lists the locally cached project catalog with ids so the id can
 // be exported as TOGGL_PROJECT_ID to scope other commands. `--all` includes
 // inactive projects; refresh the cache with `tg update`.
-func cmdProjects(w io.Writer, st *store.Store, all, jsonOut bool) error {
-	projects, err := st.ListProjects(all)
+func cmdProjects(env *cmdEnv, all, jsonOut bool) error {
+	projects, err := env.st.ListProjects(env.ctx, all)
 	if err != nil {
 		return err
 	}
 	if jsonOut {
-		return renderProjectsJSON(w, projects)
+		return renderProjectsJSON(env.w, projects)
 	}
-	renderProjects(w, projects)
+	renderProjects(env.w, projects)
 	return nil
 }
 
@@ -666,30 +743,34 @@ func cmdProjects(w io.Writer, st *store.Store, all, jsonOut bool) error {
 // The project catalog itself is NOT synced here: update never fetches project
 // metadata from Toggl. Refresh the catalog with `tg projects update`. (The
 // entry pull may still self-heal catalog rows from each entry's meta payload;
-// see sync.healCatalog.)
+// see togglsync's healCatalog.)
 //
 // The entry pull reconciles everything modified in [since, now] and is scoped
 // to the same project, so it is partial and leaves the last_pull watermark
-// untouched (see sync.Pull): a later `tg pull` still sees every other
+// untouched (see togglsync.Pull): a later `tg pull` still sees every other
 // project's changes. runUpdate derives since from --days/-n, which defaults to
 // one day back (see resolveUpdateSince).
 //
 // The command is quiet: in human mode it prints nothing at all (no progress or
 // summary lines) and reports only errors. Machine-readable output is still
 // available via --json.
-func cmdUpdate(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, projectID *int64, first bool, fragment string, since, now time.Time, all, jsonOut bool) error {
-	pid, err := resolveUpdateProject(st, projectID, fragment, first)
+func cmdUpdate(env *cmdEnv, projectID *int64, first bool, fragment string, since time.Time, all, jsonOut bool) error {
+	c, err := env.client()
 	if err != nil {
 		return err
 	}
-	tasks, err := c.ProjectTasks(workspaceID, *pid, all)
+	pid, err := resolveUpdateProject(env.ctx, env.st, projectID, fragment, first)
 	if err != nil {
 		return err
 	}
-	if err := st.ReplaceProjectTasks(*pid, toStoreTasks(tasks)); err != nil {
+	tasks, err := c.ProjectTasks(env.ctx, env.workspaceID, *pid, all)
+	if err != nil {
 		return err
 	}
-	entries, err := sync.Pull(st, c, pid, since, now)
+	if err := env.st.ReplaceProjectTasks(env.ctx, *pid, toStoreTasks(tasks)); err != nil {
+		return err
+	}
+	entries, err := togglsync.Pull(env.ctx, env.st, c, pid, since, env.now)
 	if err != nil {
 		return err
 	}
@@ -698,11 +779,11 @@ func cmdUpdate(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, p
 		// The name comes from the local catalog (looked up after the pull so a
 		// row healed by it is visible) and is empty for a project that is not
 		// cached yet, e.g. an uncached TOGGL_PROJECT_ID.
-		name, err := projectName(st, *pid)
+		name, err := projectName(env.ctx, env.st, *pid)
 		if err != nil {
 			return err
 		}
-		return writeJSON(w, map[string]any{
+		return writeJSON(env.w, map[string]any{
 			"project": name,
 			"tasks":   len(tasks),
 			"entries": entries,
@@ -717,39 +798,58 @@ func cmdUpdate(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, p
 // cmdUpdate (which is deliberately scoped to a single project), this walks the
 // entire workspace, but it never fetches tasks — refresh a project's tasks with
 // `tg update`. `--all` includes inactive projects.
-func cmdUpdateProjects(w io.Writer, st *store.Store, c *api.Client, workspaceID int64, all, jsonOut bool) error {
+func cmdUpdateProjects(env *cmdEnv, all, jsonOut bool) error {
+	c, err := env.client()
+	if err != nil {
+		return err
+	}
 	// Progress line goes to the writer only in human mode; under --json it is
 	// suppressed so the JSON output stays clean (see cmdUpdate).
 	if !jsonOut {
-		fmt.Fprintln(w, "Fetching projects...")
+		fmt.Fprintln(env.w, "Fetching projects...")
 	}
-	projects, err := c.Projects(workspaceID, all)
+	projects, err := c.Projects(env.ctx, env.workspaceID, all)
 	if err != nil {
 		return err
 	}
 	for _, p := range projects {
-		if err := st.PutProject(toStoreProject(p)); err != nil {
+		if err := env.st.PutProject(env.ctx, toStoreProject(p)); err != nil {
 			return err
 		}
 	}
 	if jsonOut {
-		return writeJSON(w, map[string]any{"projects": len(projects)})
+		return writeJSON(env.w, map[string]any{"projects": len(projects)})
 	}
-	fmt.Fprintf(w, "Updated project catalog: %d projects.\n", len(projects))
+	fmt.Fprintf(env.w, "Updated project catalog: %d projects.\n", len(projects))
 	return nil
 }
 
 // cmdPush sends dirty local entries to Toggl.
-func cmdPush(w io.Writer, st *store.Store, c *api.Client, now time.Time, jsonOut bool) error {
-	res, err := sync.Push(st, c, now)
+//
+// Entries Toggl refuses do not abort the push (see togglsync.Push): the rest of
+// the queue is still sent, so the summary is printed either way and the
+// rejections are reported afterwards — as the command's error, so the exit
+// status still says something went wrong, and under --json as the result's
+// "failed" list. Anything else (a store failure, a cancelled context) is fatal
+// and reported on its own.
+func cmdPush(env *cmdEnv, jsonOut bool) error {
+	c, err := env.client()
 	if err != nil {
 		return err
 	}
-	if jsonOut {
-		return writeJSON(w, res)
+	res, pushErr := togglsync.Push(env.ctx, env.st, c, env.now)
+	var failures *togglsync.PushError
+	if pushErr != nil && !errors.As(pushErr, &failures) {
+		return pushErr
 	}
-	fmt.Fprintf(w, "Pushed: %d created, %d updated, %d deleted.\n", res.Created, res.Updated, res.Deleted)
-	return nil
+	if jsonOut {
+		if err := writeJSON(env.w, res); err != nil {
+			return err
+		}
+		return pushErr
+	}
+	fmt.Fprintf(env.w, "Pushed: %d created, %d updated, %d deleted.\n", res.Created, res.Updated, res.Deleted)
+	return pushErr
 }
 
 // cmdPull reconciles remote entries into the local store (LWW). With no project
@@ -763,20 +863,24 @@ func cmdPush(w io.Writer, st *store.Store, c *api.Client, now time.Time, jsonOut
 // The time window is the caller's: runPull defaults it to today and widens it
 // to the current month under --all/-a (see resolvePullSince). A window that
 // does not reach back to the watermark is partial too and leaves it untouched
-// (see sync.Pull).
-func cmdPull(w io.Writer, st *store.Store, c *api.Client, first bool, fragment string, since, now time.Time, jsonOut bool) error {
-	pid, err := resolvePullScope(st, fragment, first)
+// (see togglsync.Pull).
+func cmdPull(env *cmdEnv, first bool, fragment string, since time.Time, jsonOut bool) error {
+	c, err := env.client()
 	if err != nil {
 		return err
 	}
-	res, err := sync.Pull(st, c, pid, since, now)
+	pid, err := resolvePullScope(env.ctx, env.st, fragment, first)
+	if err != nil {
+		return err
+	}
+	res, err := togglsync.Pull(env.ctx, env.st, c, pid, since, env.now)
 	if err != nil {
 		return err
 	}
 	if jsonOut {
-		return writeJSON(w, res)
+		return writeJSON(env.w, res)
 	}
-	fmt.Fprintf(w, "Pulled: %d inserted, %d updated, %d deleted, %d skipped.\n",
+	fmt.Fprintf(env.w, "Pulled: %d inserted, %d updated, %d deleted, %d skipped.\n",
 		res.Inserted, res.Updated, res.Deleted, res.Skipped)
 	return nil
 }
@@ -798,8 +902,8 @@ const firstMatchHint = "pass -1 to use the first match"
 // two identically named tasks in different projects are disambiguated without
 // reaching for TOGGL_PROJECT_ID. No match is always an error, since there is
 // nothing to pick.
-func resolveTaskFragment(st *store.Store, fragment string, projectID *int64, first bool) (store.Task, error) {
-	tasks, err := st.FindTasksByFragment(fragment, projectID)
+func resolveTaskFragment(ctx context.Context, st *store.Store, fragment string, projectID *int64, first bool) (store.Task, error) {
+	tasks, err := st.FindTasksByFragment(ctx, fragment, projectID)
 	if err != nil {
 		return store.Task{}, err
 	}
@@ -810,7 +914,7 @@ func resolveTaskFragment(st *store.Store, fragment string, projectID *int64, fir
 		return tasks[0], nil
 	default:
 		return store.Task{}, fmt.Errorf("multiple tasks match %q:\n%s%s",
-			fragment, candidateList(labelCandidates(st, tasks)), firstMatchHint)
+			fragment, candidateList(labelCandidates(ctx, st, tasks)), firstMatchHint)
 	}
 }
 
@@ -820,14 +924,14 @@ func resolveTaskFragment(st *store.Store, fragment string, projectID *int64, fir
 // two tasks sharing a name — the case `-1` exists for. A lookup that fails is
 // ignored rather than replacing the ambiguity report with a database error: the
 // candidate then simply keeps its bare name.
-func labelCandidates(st *store.Store, tasks []store.Task) []store.Task {
+func labelCandidates(ctx context.Context, st *store.Store, tasks []store.Task) []store.Task {
 	out := make([]store.Task, len(tasks))
 	copy(out, tasks)
 	for i := range out {
 		if out[i].ProjectName != "" {
 			continue
 		}
-		if name, err := projectName(st, out[i].ProjectID); err == nil {
+		if name, err := projectName(ctx, st, out[i].ProjectID); err == nil {
 			out[i].ProjectName = name
 		}
 	}
@@ -843,7 +947,7 @@ func labelCandidates(st *store.Store, tasks []store.Task) []store.Task {
 // resolveTaskFragment does for tasks. This is the shared machinery that keeps
 // `add`, `pull`, and `update` scoped to a single project rather than the whole
 // workspace.
-func resolveCachedProject(st *store.Store, projectID *int64, fragment string, first bool, emptyErr error, noMatchHint string) (*int64, error) {
+func resolveCachedProject(ctx context.Context, st *store.Store, projectID *int64, fragment string, first bool, emptyErr error, noMatchHint string) (*int64, error) {
 	if projectID != nil {
 		return projectID, nil
 	}
@@ -851,7 +955,7 @@ func resolveCachedProject(st *store.Store, projectID *int64, fragment string, fi
 	if fragment == "" {
 		return nil, emptyErr
 	}
-	projects, err := st.FindProjectsByFragment(fragment)
+	projects, err := st.FindProjectsByFragment(ctx, fragment)
 	if err != nil {
 		return nil, err
 	}
@@ -873,19 +977,19 @@ func resolveCachedProject(st *store.Store, projectID *int64, fragment string, fi
 // consulted here, so pull spans every project unless a name is given
 // explicitly. Otherwise the pull is scoped to exactly one cached project (see
 // resolvePullProject), with first (`-1`) resolving an ambiguous name.
-func resolvePullScope(st *store.Store, fragment string, first bool) (*int64, error) {
+func resolvePullScope(ctx context.Context, st *store.Store, fragment string, first bool) (*int64, error) {
 	if strings.TrimSpace(fragment) == "" {
 		return nil, nil // no argument -> pull every project
 	}
-	return resolvePullProject(st, fragment, first)
+	return resolvePullProject(ctx, st, fragment, first)
 }
 
 // resolvePullProject resolves the single-project scope requested by `tg pull`'s
 // explicit project-name argument; see resolveCachedProject. The unscoped "pull
 // all projects" case is handled earlier by resolvePullScope. Unlike other
 // commands, pull never falls back to TOGGL_PROJECT_ID.
-func resolvePullProject(st *store.Store, fragment string, first bool) (*int64, error) {
-	return resolveCachedProject(st, nil, fragment, first,
+func resolvePullProject(ctx context.Context, st *store.Store, fragment string, first bool) (*int64, error) {
+	return resolveCachedProject(ctx, st, nil, fragment, first,
 		errors.New("pull requires a project-name argument"),
 		"; run `tg update` to refresh the catalog")
 }
@@ -894,8 +998,8 @@ func resolvePullProject(st *store.Store, fragment string, first bool) (*int64, e
 // TOGGL_PROJECT_ID is set it wins; otherwise the project-name argument must
 // uniquely match a cached project (or name several with `-1` set, which takes
 // the first). This keeps update from ever refreshing every project at once.
-func resolveUpdateProject(st *store.Store, projectID *int64, fragment string, first bool) (*int64, error) {
-	return resolveCachedProject(st, projectID, fragment, first,
+func resolveUpdateProject(ctx context.Context, st *store.Store, projectID *int64, fragment string, first bool) (*int64, error) {
+	return resolveCachedProject(ctx, st, projectID, fragment, first,
 		errors.New("update requires a project-name argument (or set TOGGL_PROJECT_ID)"),
 		"; set TOGGL_PROJECT_ID to its id to update a project not yet cached")
 }
@@ -905,15 +1009,15 @@ func resolveUpdateProject(st *store.Store, projectID *int64, fragment string, fi
 // project id, so the task search can be scoped to it. first (`-1`) applies to
 // this fragment as well as to the task one, so an ambiguous pair is resolved in
 // one go.
-func resolveAddProject(st *store.Store, fragment string, first bool) (*int64, error) {
-	return resolveCachedProject(st, nil, fragment, first,
+func resolveAddProject(ctx context.Context, st *store.Store, fragment string, first bool) (*int64, error) {
+	return resolveCachedProject(ctx, st, nil, fragment, first,
 		errors.New("usage: tg add <timesign> [project] <task-fragment>"),
 		"; run `tg update` to refresh the catalog")
 }
 
 // cmdAuth acquires a token (via tokenSource), verifies it against GET /me, and
 // on success writes config.json. Nothing is written on an invalid token.
-func cmdAuth(w io.Writer, tokenSource func() (string, error), newClient func(token string) *api.Client) error {
+func cmdAuth(ctx context.Context, w io.Writer, tokenSource func() (string, error), newClient func(token string) *api.Client) error {
 	token, err := tokenSource()
 	if err != nil {
 		return err
@@ -923,9 +1027,12 @@ func cmdAuth(w io.Writer, tokenSource func() (string, error), newClient func(tok
 		return errors.New("no API token provided")
 	}
 
-	me, err := newClient(token).Me()
+	me, err := newClient(token).Me(ctx)
 	if err != nil {
-		if errors.Is(err, api.ErrUnauthorized) {
+		// Toggl answers bad credentials with either status depending on the
+		// endpoint and the token's shape, so both mean "this token is no good"
+		// here even though they are distinct errors elsewhere.
+		if errors.Is(err, api.ErrUnauthorized) || errors.Is(err, api.ErrForbidden) {
 			return errors.New("authentication failed: invalid token (nothing written)")
 		}
 		return err
@@ -945,8 +1052,8 @@ func cmdAuth(w io.Writer, tokenSource func() (string, error), newClient func(tok
 
 // projectName returns the cached project's name, or "" when the project is not
 // in the local catalog yet (e.g. an id that has never been cached).
-func projectName(st *store.Store, projectID int64) (string, error) {
-	p, err := st.ProjectByID(projectID)
+func projectName(ctx context.Context, st *store.Store, projectID int64) (string, error) {
+	p, err := st.ProjectByID(ctx, projectID)
 	if err != nil {
 		return "", err
 	}
@@ -959,8 +1066,8 @@ func projectName(st *store.Store, projectID int64) (string, error) {
 // projectBillable reports whether the cached project is billable, defaulting to
 // false when the project is not in the local catalog yet (e.g. before the first
 // `tg update`).
-func projectBillable(st *store.Store, projectID int64) (bool, error) {
-	p, err := st.ProjectByID(projectID)
+func projectBillable(ctx context.Context, st *store.Store, projectID int64) (bool, error) {
+	p, err := st.ProjectByID(ctx, projectID)
 	if err != nil {
 		return false, err
 	}

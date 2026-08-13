@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -31,6 +32,9 @@ func newTestClientReports(t *testing.T, handler http.HandlerFunc) *Client {
 	return New("mytoken", WithReportsBaseURL(srv.URL), WithHTTPClient(srv.Client()))
 }
 
+// ctx is the context every client call in these tests runs under.
+var ctx = context.Background()
+
 func ptrInt(v int64) *int64 { return &v }
 
 func TestBasicAuthHeader(t *testing.T) {
@@ -39,7 +43,7 @@ func TestBasicAuthHeader(t *testing.T) {
 		gotAuth = r.Header.Get("Authorization")
 		w.Write([]byte(`{}`))
 	})
-	if _, err := c.Me(); err != nil {
+	if _, err := c.Me(ctx); err != nil {
 		t.Fatalf("Me: %v", err)
 	}
 	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("mytoken:api_token"))
@@ -55,7 +59,7 @@ func TestMeParsesDefaultWorkspace(t *testing.T) {
 		}
 		w.Write([]byte(`{"id":99,"default_workspace_id":12345,"fullname":"A B"}`))
 	})
-	me, err := c.Me()
+	me, err := c.Me(ctx)
 	if err != nil {
 		t.Fatalf("Me: %v", err)
 	}
@@ -71,7 +75,7 @@ func TestCurrentHandlesNull(t *testing.T) {
 		}
 		w.Write([]byte(`null`))
 	})
-	te, err := c.Current()
+	te, err := c.Current(ctx)
 	if err != nil {
 		t.Fatalf("Current: %v", err)
 	}
@@ -84,7 +88,7 @@ func TestCurrentReturnsEntry(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"id":7,"workspace_id":1,"duration":-1,"start":"2026-01-02T09:00:00Z"}`))
 	})
-	te, err := c.Current()
+	te, err := c.Current(ctx)
 	if err != nil {
 		t.Fatalf("Current: %v", err)
 	}
@@ -100,7 +104,7 @@ func TestListQuery(t *testing.T) {
 		w.Write([]byte(`[]`))
 	})
 	since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	if _, err := c.List(since); err != nil {
+	if _, err := c.List(ctx, since); err != nil {
 		t.Fatalf("List: %v", err)
 	}
 	if !strings.Contains(gotQuery, fmt.Sprintf("since=%d", since.Unix())) {
@@ -125,7 +129,7 @@ func TestCreateBody(t *testing.T) {
 		w.Write([]byte(`{"id":555,"workspace_id":1,"at":"2026-01-02T09:00:00Z"}`))
 	})
 
-	out, err := c.Create(TimeEntry{
+	out, err := c.Create(ctx, TimeEntry{
 		WorkspaceID: 1, ProjectID: ptrInt(20), TaskID: ptrInt(30),
 		Start: "2026-01-02T09:00:00Z", Duration: -1, Billable: true,
 	})
@@ -164,7 +168,7 @@ func TestUpdateMethodPath(t *testing.T) {
 		method, path = r.Method, r.URL.Path
 		w.Write([]byte(`{"id":42}`))
 	})
-	if _, err := c.Update(TimeEntry{ID: 42, WorkspaceID: 1, Start: "2026-01-02T09:00:00Z", Duration: 300}); err != nil {
+	if _, err := c.Update(ctx, TimeEntry{ID: 42, WorkspaceID: 1, Start: "2026-01-02T09:00:00Z", Duration: 300}); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 	if method != http.MethodPut || path != "/workspaces/1/time_entries/42" {
@@ -178,7 +182,7 @@ func TestStopMethodPath(t *testing.T) {
 		method, path = r.Method, r.URL.Path
 		w.Write([]byte(`{"id":42}`))
 	})
-	if _, err := c.Stop(1, 42); err != nil {
+	if _, err := c.Stop(ctx, 1, 42); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 	if method != http.MethodPatch || path != "/workspaces/1/time_entries/42/stop" {
@@ -192,7 +196,7 @@ func TestDeleteMethodPath(t *testing.T) {
 		method, path = r.Method, r.URL.Path
 		w.WriteHeader(http.StatusOK)
 	})
-	if err := c.Delete(1, 42); err != nil {
+	if err := c.Delete(ctx, 1, 42); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if method != http.MethodDelete || path != "/workspaces/1/time_entries/42" {
@@ -212,7 +216,7 @@ func TestProjectsPagination(t *testing.T) {
 		page := r.URL.Query().Get("page")
 		w.Write([]byte(pageProjects(page)))
 	})
-	projects, err := c.Projects(1, false)
+	projects, err := c.Projects(ctx, 1, false)
 	if err != nil {
 		t.Fatalf("Projects: %v", err)
 	}
@@ -235,7 +239,7 @@ func TestTasksActiveBoth(t *testing.T) {
 		// The tasks endpoint wraps results in a paginated envelope.
 		w.Write([]byte(`{"data":[{"id":1,"name":"T"}],"total_count":1,"per_page":200}`))
 	})
-	tasks, err := c.Tasks(1, true)
+	tasks, err := c.Tasks(ctx, 1, true)
 	if err != nil {
 		t.Fatalf("Tasks: %v", err)
 	}
@@ -256,7 +260,7 @@ func TestTasksPaginationEnvelope(t *testing.T) {
 		pages = append(pages, page)
 		w.Write([]byte(pageTasks(page)))
 	})
-	tasks, err := c.Tasks(1, false)
+	tasks, err := c.Tasks(ctx, 1, false)
 	if err != nil {
 		t.Fatalf("Tasks: %v", err)
 	}
@@ -275,7 +279,7 @@ func TestProjectByID(t *testing.T) {
 		}
 		w.Write([]byte(`{"id":42,"workspace_id":1,"name":"Payments","billable":true,"active":true}`))
 	})
-	p, err := c.Project(1, 42)
+	p, err := c.Project(ctx, 1, 42)
 	if err != nil {
 		t.Fatalf("Project: %v", err)
 	}
@@ -300,7 +304,7 @@ func TestProjectTasksBareArray(t *testing.T) {
 		gotPage = r.URL.Query().Get("page")
 		w.Write([]byte(projectTasksBare()))
 	})
-	tasks, err := c.ProjectTasks(1, 42, true)
+	tasks, err := c.ProjectTasks(ctx, 1, 42, true)
 	if err != nil {
 		t.Fatalf("ProjectTasks: %v", err)
 	}
@@ -325,7 +329,7 @@ func TestProjectTasksActiveFilter(t *testing.T) {
 		gotActive = r.URL.Query().Get("active")
 		w.Write([]byte(`[]`))
 	})
-	if _, err := c.ProjectTasks(1, 42, false); err != nil {
+	if _, err := c.ProjectTasks(ctx, 1, 42, false); err != nil {
 		t.Fatalf("ProjectTasks: %v", err)
 	}
 	if gotActive != "true" {
@@ -364,7 +368,7 @@ func TestSummaryByTask(t *testing.T) {
 		    {"id":10,"title":"Fix login bug","seconds":1800}]}]}`))
 	})
 
-	tasks, err := c.SummaryByTask(1, "", "2026-01-02")
+	tasks, err := c.SummaryByTask(ctx, 1, "", "2026-01-02")
 	if err != nil {
 		t.Fatalf("SummaryByTask: %v", err)
 	}
@@ -408,12 +412,39 @@ func TestSummaryByTask(t *testing.T) {
 }
 
 func TestErrorMapping(t *testing.T) {
+	// 401 and 403 are kept apart: only the former means "the token is no good".
+	t.Run("unauthorized", func(t *testing.T) {
+		c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`token expired`))
+		})
+		_, err := c.Me(ctx)
+		if !errors.Is(err, ErrUnauthorized) {
+			t.Errorf("err = %v, want ErrUnauthorized", err)
+		}
+		if errors.Is(err, ErrForbidden) {
+			t.Errorf("err = %v, should not be ErrForbidden", err)
+		}
+		// The server's own message is carried through so the failure is
+		// diagnosable rather than a bare sentinel.
+		if err == nil || !strings.Contains(err.Error(), "token expired") {
+			t.Errorf("err = %v, want the response body included", err)
+		}
+	})
 	t.Run("forbidden", func(t *testing.T) {
 		c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte(`no access to workspace`))
 		})
-		if _, err := c.Me(); !errors.Is(err, ErrUnauthorized) {
-			t.Errorf("err = %v, want ErrUnauthorized", err)
+		_, err := c.Me(ctx)
+		if !errors.Is(err, ErrForbidden) {
+			t.Errorf("err = %v, want ErrForbidden", err)
+		}
+		if errors.Is(err, ErrUnauthorized) {
+			t.Errorf("err = %v, should not be ErrUnauthorized", err)
+		}
+		if err == nil || !strings.Contains(err.Error(), "no access to workspace") {
+			t.Errorf("err = %v, want the response body included", err)
 		}
 	})
 	t.Run("server error", func(t *testing.T) {
@@ -421,7 +452,7 @@ func TestErrorMapping(t *testing.T) {
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(`{"error":"boom"}`))
 		})
-		_, err := c.Me()
+		_, err := c.Me(ctx)
 		if err == nil || !strings.Contains(err.Error(), "500") {
 			t.Errorf("err = %v, want status 500", err)
 		}
@@ -431,11 +462,151 @@ func TestErrorMapping(t *testing.T) {
 			w.WriteHeader(http.StatusBadGateway)
 			w.Write([]byte(`<html>down</html>`))
 		})
-		_, err := c.Me()
+		_, err := c.Me(ctx)
 		if err == nil || !strings.Contains(err.Error(), "down") {
 			t.Errorf("err = %v, want body text", err)
 		}
 	})
+}
+
+// TestRetriesRateLimit verifies a 429 is retried and that the retry can
+// succeed, so a brief brush with Toggl's limiter is invisible to the caller.
+func TestRetriesRateLimit(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Write([]byte(`{"id":99,"default_workspace_id":7}`))
+	}))
+	defer srv.Close()
+	c := New("mytoken", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()),
+		WithRetry(3, time.Millisecond))
+
+	me, err := c.Me(ctx)
+	if err != nil {
+		t.Fatalf("Me: %v", err)
+	}
+	if me.DefaultWorkspaceID != 7 {
+		t.Errorf("workspace = %d, want 7", me.DefaultWorkspaceID)
+	}
+	if calls != 2 {
+		t.Errorf("calls = %d, want 2 (one retry)", calls)
+	}
+}
+
+// TestRetryGivesUp verifies the retries are bounded and the final 429 is
+// reported with its body, rather than being retried forever.
+func TestRetryGivesUp(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`slow down`))
+	}))
+	defer srv.Close()
+	c := New("mytoken", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()),
+		WithRetry(3, time.Millisecond))
+
+	_, err := c.Me(ctx)
+	if err == nil || !strings.Contains(err.Error(), "429") || !strings.Contains(err.Error(), "slow down") {
+		t.Errorf("err = %v, want a 429 error carrying the body", err)
+	}
+	if calls != 3 {
+		t.Errorf("calls = %d, want 3 attempts", calls)
+	}
+}
+
+// TestRetryHonorsRetryAfter verifies the server's Retry-After is what shapes the
+// wait (and that it is capped): a 0-second header retries immediately.
+func TestRetryHonorsRetryAfter(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	// An hour of fixed backoff would hang the test if Retry-After were ignored.
+	c := New("mytoken", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()),
+		WithRetry(2, time.Hour))
+	if _, err := c.Me(ctx); err != nil {
+		t.Fatalf("Me: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("calls = %d, want 2", calls)
+	}
+}
+
+func TestRetryWait(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		header http.Header
+		want   time.Duration
+	}{
+		{"absent", http.Header{}, defaultBackoff},
+		{"nil", nil, defaultBackoff},
+		{"seconds", http.Header{"Retry-After": []string{"2"}}, 2 * time.Second},
+		{"capped", http.Header{"Retry-After": []string{"600"}}, maxBackoff},
+		{"http date is ignored", http.Header{"Retry-After": []string{"Wed, 21 Oct 2026 07:28:00 GMT"}}, defaultBackoff},
+		{"negative is ignored", http.Header{"Retry-After": []string{"-5"}}, defaultBackoff},
+	} {
+		if got := retryWait(tc.header, defaultBackoff); got != tc.want {
+			t.Errorf("%s: retryWait = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestContextCancelAbortsRequest verifies the context reaches the transport, so
+// a Ctrl-C during a slow call returns instead of waiting out the HTTP timeout.
+func TestContextCancelAbortsRequest(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	c := New("mytoken", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()))
+	cctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+	}()
+	if _, err := c.Me(cctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled", err)
+	}
+}
+
+// TestContextCancelAbortsBackoff verifies a cancelled context cuts the
+// rate-limit wait short instead of sleeping through it.
+func TestContextCancelAbortsBackoff(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	c := New("mytoken", WithBaseURL(srv.URL), WithHTTPClient(srv.Client()),
+		WithRetry(3, time.Hour))
+
+	cctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	if _, err := c.Me(cctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("waited %v, want the backoff cut short by the cancel", elapsed)
+	}
 }
 
 // pageProjects renders page 1 as a full batch and page 2 as a short final page.

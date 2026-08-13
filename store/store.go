@@ -5,6 +5,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -25,9 +26,51 @@ const (
 // reckons days in: it decides which day an entry's start belongs to, and hence
 // which per-day numbering (see Entry.Seq) it takes part in. It is time.Local
 // for the CLI and pinned explicitly by tests.
+//
+// ex is what every statement runs against: the *sql.DB normally, and the
+// *sql.Tx of the transaction in progress inside WithTx — which is the whole
+// trick that lets one method body serve both cases.
 type Store struct {
 	db  *sql.DB
+	ex  execer
 	loc *time.Location
+}
+
+// execer is the part of *sql.DB and *sql.Tx the store's statements use. Only the
+// context-taking variants are listed, so a cancelled context (Ctrl-C, see main)
+// stops a query rather than being ignored.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// WithTx runs fn inside a single transaction, committing when fn returns nil and
+// rolling back on any error, so a multi-statement write either lands whole or
+// not at all. fn receives a *Store bound to the transaction: every call it makes
+// on that store joins the transaction, and the receiver it was called on must
+// not be used inside fn (its statements would run outside).
+//
+// A nested call — a method that wraps itself in WithTx, invoked from inside
+// another WithTx — reuses the transaction already in progress rather than
+// starting one (SQLite has no nested transactions). That is what lets
+// UpdateFromRemote be atomic on its own and still take part in the larger
+// transaction a pull wraps around it, instead of committing halfway through it.
+func (s *Store) WithTx(ctx context.Context, fn func(tx *Store) error) error {
+	if _, ok := s.ex.(*sql.Tx); ok {
+		return fn(s)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if err := fn(&Store{db: s.db, ex: tx, loc: s.loc}); err != nil {
+		// The rollback's own error is subordinate to what actually went
+		// wrong, so fn's error is the one reported.
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 // Entry is a tracked time entry. RemoteID/ProjectID/TaskID/Stop/SyncedAt are
@@ -99,13 +142,17 @@ type Task struct {
 // Open opens (creating if needed) the SQLite database at path and applies the
 // schema, reckoning calendar days in time.Local. WAL + a busy timeout keep
 // concurrent CLI invocations well behaved.
-func Open(path string) (*Store, error) { return OpenIn(path, time.Local) }
+func Open(ctx context.Context, path string) (*Store, error) {
+	return OpenIn(ctx, path, time.Local)
+}
 
 // OpenIn is Open with an explicit calendar (see Store.loc): entry days — and
 // therefore the per-day numbering `tg ls` shows — are computed in loc. A nil
 // loc means time.Local. Callers must pass the same location they render with,
 // or a listing's numbers will not match the ones `mod`/`del` resolve.
-func OpenIn(path string, loc *time.Location) (*Store, error) {
+//
+// ctx bounds the schema migration run here; later calls carry their own.
+func OpenIn(ctx context.Context, path string, loc *time.Location) (*Store, error) {
 	if loc == nil {
 		loc = time.Local
 	}
@@ -114,8 +161,8 @@ func OpenIn(path string, loc *time.Location) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{db: db, loc: loc}
-	if err := s.migrate(); err != nil {
+	s := &Store{db: db, ex: db, loc: loc}
+	if err := s.migrate(ctx); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -224,9 +271,9 @@ func scanEntry(sc interface{ Scan(...any) error }) (Entry, error) {
 // Running returns the single running entry (see Entry.Running; deleted rows are
 // ignored) or nil. Should the store hold more than one — running rows only
 // arrive from pulls, which cannot rule that out — the newest by start wins.
-func (s *Store) Running() (*Entry, error) {
-	row := s.db.QueryRow(entrySelect +
-		" WHERE " + runningWhere + " AND e.deleted = 0 ORDER BY e.start DESC LIMIT 1")
+func (s *Store) Running(ctx context.Context) (*Entry, error) {
+	row := s.ex.QueryRowContext(ctx, entrySelect+
+		" WHERE "+runningWhere+" AND e.deleted = 0 ORDER BY e.start DESC LIMIT 1")
 	e, err := scanEntry(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -257,9 +304,9 @@ func (s *Store) Running() (*Entry, error) {
 //
 // A running entry is an ordinary candidate here (it started in the past);
 // `tg status` separately prefers one over a newer finished entry (see Running).
-func (s *Store) LastEntry(now time.Time) (*Entry, error) {
+func (s *Store) LastEntry(ctx context.Context, now time.Time) (*Entry, error) {
 	from := dayStart(now, s.Location())
-	row := s.db.QueryRow(entrySelect+`
+	row := s.ex.QueryRowContext(ctx, entrySelect+`
 WHERE e.deleted = 0 AND e.start >= ? AND e.start <= ?
 ORDER BY e.start DESC, e.id DESC LIMIT 1`, fmtTime(from), fmtTime(now))
 	e, err := scanEntry(row)
@@ -274,8 +321,8 @@ ORDER BY e.start DESC, e.id DESC LIMIT 1`, fmtTime(from), fmtTime(now))
 
 // EntriesBetween returns non-deleted entries with start in [from, to), ordered
 // by start ascending.
-func (s *Store) EntriesBetween(from, to time.Time) ([]Entry, error) {
-	rows, err := s.db.Query(entrySelect+
+func (s *Store) EntriesBetween(ctx context.Context, from, to time.Time) ([]Entry, error) {
+	rows, err := s.ex.QueryContext(ctx, entrySelect+
 		" WHERE e.deleted = 0 AND e.start >= ? AND e.start < ? ORDER BY e.start ASC",
 		fmtTime(from), fmtTime(to))
 	if err != nil {
@@ -293,16 +340,16 @@ func (s *Store) EntriesBetween(from, to time.Time) ([]Entry, error) {
 // overlap it (an entry ending exactly at start, or starting exactly at stop, is
 // fine). A running entry (see Entry.Running) has no end yet, so it is treated
 // as open-ended and overlaps whenever it began before stop.
-func (s *Store) FindOverlapping(start, stop time.Time) ([]Entry, error) {
-	return s.FindOverlappingExcluding(start, stop, 0)
+func (s *Store) FindOverlapping(ctx context.Context, start, stop time.Time) ([]Entry, error) {
+	return s.FindOverlappingExcluding(ctx, start, stop, 0)
 }
 
 // FindOverlappingExcluding is FindOverlapping with one entry left out of the
 // search by local id. It backs the overlap guard in `tg mod`, which must not
 // see the entry it is retiming as a conflict with itself. Ids start at 1, so
 // excludeID 0 excludes nothing (that is what FindOverlapping passes).
-func (s *Store) FindOverlappingExcluding(start, stop time.Time, excludeID int64) ([]Entry, error) {
-	rows, err := s.db.Query(entrySelect+`
+func (s *Store) FindOverlappingExcluding(ctx context.Context, start, stop time.Time, excludeID int64) ([]Entry, error) {
+	rows, err := s.ex.QueryContext(ctx, entrySelect+`
 WHERE e.deleted = 0
   AND e.id <> ?
   AND e.start < ?
@@ -317,8 +364,8 @@ ORDER BY e.start ASC`,
 }
 
 // DirtyEntries returns every entry with unsynced local changes, oldest first.
-func (s *Store) DirtyEntries() ([]Entry, error) {
-	rows, err := s.db.Query(entrySelect + " WHERE e.dirty = 1 ORDER BY e.start ASC")
+func (s *Store) DirtyEntries(ctx context.Context) ([]Entry, error) {
+	rows, err := s.ex.QueryContext(ctx, entrySelect+" WHERE e.dirty = 1 ORDER BY e.start ASC")
 	if err != nil {
 		return nil, err
 	}
@@ -327,8 +374,8 @@ func (s *Store) DirtyEntries() ([]Entry, error) {
 }
 
 // EntryByRemoteID returns the entry mirroring the given Toggl id, or nil.
-func (s *Store) EntryByRemoteID(remoteID int64) (*Entry, error) {
-	row := s.db.QueryRow(entrySelect+" WHERE e.remote_id = ?", remoteID)
+func (s *Store) EntryByRemoteID(ctx context.Context, remoteID int64) (*Entry, error) {
+	row := s.ex.QueryRowContext(ctx, entrySelect+" WHERE e.remote_id = ?", remoteID)
 	e, err := scanEntry(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -374,9 +421,9 @@ func dayBounds(t time.Time, loc *time.Location) (from, to time.Time) {
 // giving it the next free per-day number. It is used to back-fill pre-v4 rows
 // and to renumber an entry a remote update moved to another day; the row itself
 // is excluded from the maximum so it cannot bump itself.
-func (s *Store) assignSeq(id int64, start time.Time) error {
+func (s *Store) assignSeq(ctx context.Context, id int64, start time.Time) error {
 	from, to := dayBounds(start, s.Location())
-	_, err := s.db.Exec("UPDATE entries SET seq = "+nextSeqExpr+" WHERE id = ?",
+	_, err := s.ex.ExecContext(ctx, "UPDATE entries SET seq = "+nextSeqExpr+" WHERE id = ?",
 		fmtTime(from), fmtTime(to), id, id)
 	return err
 }
@@ -389,9 +436,9 @@ func (s *Store) assignSeq(id int64, start time.Time) error {
 // numbers reflect insertion order, restart at 1 every day, and are never reused
 // (see nextSeqExpr). Entries arriving from a pull are numbered the same way, in
 // the order the pull inserts them. Any Seq set on e is ignored.
-func (s *Store) CreateEntry(e Entry) (int64, error) {
+func (s *Store) CreateEntry(ctx context.Context, e Entry) (int64, error) {
 	from, to := dayBounds(e.Start, s.Location())
-	res, err := s.db.Exec(`
+	res, err := s.ex.ExecContext(ctx, `
 INSERT INTO entries
   (remote_id, workspace_id, project_id, task_id, description, start, stop,
    duration, billable, seq, updated_at, synced_at, dirty, deleted)
@@ -445,45 +492,52 @@ func dayStart(t time.Time, loc *time.Location) time.Time {
 // failsafe lives: the stored start and the incoming start are both checked
 // against now (in loc) and an entry from an earlier day is refused with an
 // error wrapping ErrEntryTooOld, before anything is written.
-func (s *Store) UpdateEntry(e Entry, now time.Time, loc *time.Location) error {
-	stored, err := s.entryStart(e.ID)
-	if err != nil {
-		return err
-	}
-	if err := CheckEditableDay(stored, now, loc); err != nil {
-		return err
-	}
-	if err := CheckEditableDay(e.Start, now, loc); err != nil {
-		return err
-	}
-	res, err := s.db.Exec(`
+//
+// The read of the stored start, the update and the possible renumbering run in
+// one transaction, so the row the day check was made against is the row that is
+// written, and a failure at the renumbering step cannot leave the entry retimed
+// but numbered into the day it just left.
+func (s *Store) UpdateEntry(ctx context.Context, e Entry, now time.Time, loc *time.Location) error {
+	return s.WithTx(ctx, func(tx *Store) error {
+		stored, err := tx.entryStart(ctx, e.ID)
+		if err != nil {
+			return err
+		}
+		if err := CheckEditableDay(stored, now, loc); err != nil {
+			return err
+		}
+		if err := CheckEditableDay(e.Start, now, loc); err != nil {
+			return err
+		}
+		res, err := tx.ex.ExecContext(ctx, `
 UPDATE entries SET description = ?, start = ?, stop = ?, duration = ?,
   updated_at = ?, dirty = 1 WHERE id = ?`,
-		e.Description, fmtTime(e.Start), nullTime(e.Stop), e.Duration,
-		fmtTime(e.UpdatedAt), e.ID)
-	if err != nil {
-		return err
-	}
-	if err := checkAffected(res, e.ID); err != nil {
-		return err
-	}
-	// Retiming keeps an entry on its own day today (a relative timesign keeps
-	// the start and an absolute one is resolved on the entry's day), so this
-	// is a failsafe rather than a routine path: should an edit ever land the
-	// entry on another day, it joins that day's numbering instead of keeping a
-	// number nothing on the new day would show.
-	if !sameDay(stored, e.Start, s.Location()) {
-		return s.assignSeq(e.ID, e.Start)
-	}
-	return nil
+			e.Description, fmtTime(e.Start), nullTime(e.Stop), e.Duration,
+			fmtTime(e.UpdatedAt), e.ID)
+		if err != nil {
+			return err
+		}
+		if err := checkAffected(res, e.ID); err != nil {
+			return err
+		}
+		// Retiming keeps an entry on its own day today (a relative timesign
+		// keeps the start and an absolute one is resolved on the entry's day),
+		// so this is a failsafe rather than a routine path: should an edit ever
+		// land the entry on another day, it joins that day's numbering instead
+		// of keeping a number nothing on the new day would show.
+		if !sameDay(stored, e.Start, tx.Location()) {
+			return tx.assignSeq(ctx, e.ID, e.Start)
+		}
+		return nil
+	})
 }
 
 // entryStart reads the persisted start of an entry by local id, so an edit can
 // be judged by where the entry actually sits rather than by the (possibly
 // already rewritten) copy the caller hands in. A missing id is an error.
-func (s *Store) entryStart(id int64) (time.Time, error) {
+func (s *Store) entryStart(ctx context.Context, id int64) (time.Time, error) {
 	var start string
-	err := s.db.QueryRow("SELECT start FROM entries WHERE id = ?", id).Scan(&start)
+	err := s.ex.QueryRowContext(ctx, "SELECT start FROM entries WHERE id = ?", id).Scan(&start)
 	if errors.Is(err, sql.ErrNoRows) {
 		return time.Time{}, fmt.Errorf("%w: no entry with id %d", ErrEntryNotFound, id)
 	}
@@ -494,12 +548,12 @@ func (s *Store) entryStart(id int64) (time.Time, error) {
 }
 
 // SoftDeleteEntry marks an entry deleted and dirty, keeping the row so the
-// deletion can be pushed: sync.Push DELETEs it remotely (when it has a remote
+// deletion can be pushed: togglsync.Push DELETEs it remotely (when it has a remote
 // id) and only then drops the row. Every read path filters deleted rows out, so
 // the entry disappears from listings immediately. It backs `tg del`; at becomes
 // the entry's LWW clock. A missing id is an error.
-func (s *Store) SoftDeleteEntry(id int64, at time.Time) error {
-	res, err := s.db.Exec(
+func (s *Store) SoftDeleteEntry(ctx context.Context, id int64, at time.Time) error {
+	res, err := s.ex.ExecContext(ctx,
 		"UPDATE entries SET deleted = 1, dirty = 1, updated_at = ? WHERE id = ?",
 		fmtTime(at), id)
 	if err != nil {
@@ -524,15 +578,15 @@ func checkAffected(res sql.Result, id int64) error {
 
 // MarkSynced records a successful push: stores the remote id, clears dirty, and
 // aligns updated_at/synced_at to the remote clock so a later pull is a no-op.
-func (s *Store) MarkSynced(id, remoteID int64, at time.Time) error {
-	_, err := s.db.Exec(`
+func (s *Store) MarkSynced(ctx context.Context, id, remoteID int64, at time.Time) error {
+	_, err := s.ex.ExecContext(ctx, `
 UPDATE entries SET remote_id = ?, synced_at = ?, updated_at = ?, dirty = 0 WHERE id = ?`,
 		remoteID, fmtTime(at), fmtTime(at), id)
 	return err
 }
 
 // ErrEntryNotFound reports that an entry a write was aimed at does not exist,
-// so the write matched nothing. Callers that can carry on (sync.Pull re-creates
+// so the write matched nothing. Callers that can carry on (togglsync.Pull re-creates
 // a mirror that vanished under it) should test for it with errors.Is; the point
 // of the sentinel is that a lookup miss fails loudly instead of passing for a
 // successful update.
@@ -548,40 +602,47 @@ var ErrEntryNotFound = errors.New("entry not found")
 // day, which would strand its number in the day it no longer belongs to, so the
 // entry is renumbered into its new day when that happens. An entry that stays
 // put keeps the number `tg ls` published for it.
-func (s *Store) UpdateFromRemote(e Entry) error {
-	id, oldStart, err := s.entryByRemote(e.RemoteID)
-	if err != nil {
-		return err
-	}
-	if id == 0 {
-		if e.RemoteID == nil {
-			return fmt.Errorf("%w: entry has no remote id", ErrEntryNotFound)
+//
+// The mirror lookup, the overwrite and the renumbering share one transaction
+// (joining the caller's when there is one, see WithTx), so the row that was
+// looked up is the row that is written and no half-applied update survives a
+// failure partway through.
+func (s *Store) UpdateFromRemote(ctx context.Context, e Entry) error {
+	return s.WithTx(ctx, func(tx *Store) error {
+		id, oldStart, err := tx.entryByRemote(ctx, e.RemoteID)
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("%w: no local entry mirrors remote id %d", ErrEntryNotFound, *e.RemoteID)
-	}
-	res, err := s.db.Exec(`
+		if id == 0 {
+			if e.RemoteID == nil {
+				return fmt.Errorf("%w: entry has no remote id", ErrEntryNotFound)
+			}
+			return fmt.Errorf("%w: no local entry mirrors remote id %d", ErrEntryNotFound, *e.RemoteID)
+		}
+		res, err := tx.ex.ExecContext(ctx, `
 UPDATE entries SET workspace_id = ?, project_id = ?, task_id = ?, description = ?,
   start = ?, stop = ?, duration = ?, billable = ?, updated_at = ?, synced_at = ?,
   dirty = 0, deleted = 0 WHERE id = ?`,
-		e.WorkspaceID, nullInt(e.ProjectID), nullInt(e.TaskID), e.Description,
-		fmtTime(e.Start), nullTime(e.Stop), e.Duration, boolToInt(e.Billable),
-		fmtTime(e.UpdatedAt), nullTime(e.SyncedAt), id)
-	if err != nil {
-		return err
-	}
-	if err := checkAffected(res, id); err != nil {
-		return err
-	}
-	if sameDay(oldStart, e.Start, s.Location()) {
-		return nil
-	}
-	return s.assignSeq(id, e.Start)
+			e.WorkspaceID, nullInt(e.ProjectID), nullInt(e.TaskID), e.Description,
+			fmtTime(e.Start), nullTime(e.Stop), e.Duration, boolToInt(e.Billable),
+			fmtTime(e.UpdatedAt), nullTime(e.SyncedAt), id)
+		if err != nil {
+			return err
+		}
+		if err := checkAffected(res, id); err != nil {
+			return err
+		}
+		if sameDay(oldStart, e.Start, tx.Location()) {
+			return nil
+		}
+		return tx.assignSeq(ctx, id, e.Start)
+	})
 }
 
 // entryByRemote reads the local id and stored start of the mirror of a remote
 // entry. A remote id that is unknown (or nil) yields id 0 and no error; it is
 // the caller's job to decide whether that is fatal (see UpdateFromRemote).
-func (s *Store) entryByRemote(remoteID *int64) (int64, time.Time, error) {
+func (s *Store) entryByRemote(ctx context.Context, remoteID *int64) (int64, time.Time, error) {
 	if remoteID == nil {
 		return 0, time.Time{}, nil
 	}
@@ -589,7 +650,7 @@ func (s *Store) entryByRemote(remoteID *int64) (int64, time.Time, error) {
 		id    int64
 		start string
 	)
-	err := s.db.QueryRow("SELECT id, start FROM entries WHERE remote_id = ?", *remoteID).
+	err := s.ex.QueryRowContext(ctx, "SELECT id, start FROM entries WHERE remote_id = ?", *remoteID).
 		Scan(&id, &start)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, time.Time{}, nil
@@ -610,14 +671,14 @@ func sameDay(a, b time.Time, loc *time.Location) bool {
 }
 
 // DeleteRow hard-deletes a local row (used after a remote delete is confirmed).
-func (s *Store) DeleteRow(id int64) error {
-	_, err := s.db.Exec("DELETE FROM entries WHERE id = ?", id)
+func (s *Store) DeleteRow(ctx context.Context, id int64) error {
+	_, err := s.ex.ExecContext(ctx, "DELETE FROM entries WHERE id = ?", id)
 	return err
 }
 
 // DeleteByRemoteID hard-deletes the local mirror of a remote-deleted entry.
-func (s *Store) DeleteByRemoteID(remoteID int64) error {
-	_, err := s.db.Exec("DELETE FROM entries WHERE remote_id = ?", remoteID)
+func (s *Store) DeleteByRemoteID(ctx context.Context, remoteID int64) error {
+	_, err := s.ex.ExecContext(ctx, "DELETE FROM entries WHERE remote_id = ?", remoteID)
 	return err
 }
 
@@ -635,9 +696,9 @@ var ErrNoEntryNum = errors.New("no such entry number")
 // numbers are persistent, so this keeps working across listings and is not
 // affected by anything deleted in between: an unused or freed number is an
 // error wrapping ErrNoEntryNum rather than a different entry.
-func (s *Store) EntryByNum(num int, day time.Time) (Entry, error) {
+func (s *Store) EntryByNum(ctx context.Context, num int, day time.Time) (Entry, error) {
 	from, to := dayBounds(day, s.Location())
-	row := s.db.QueryRow(entrySelect+`
+	row := s.ex.QueryRowContext(ctx, entrySelect+`
 WHERE e.deleted = 0 AND e.seq = ? AND e.start >= ? AND e.start < ?
 LIMIT 1`, num, fmtTime(from), fmtTime(to))
 	e, err := scanEntry(row)
@@ -654,77 +715,66 @@ LIMIT 1`, num, fmtTime(from), fmtTime(to))
 // --- catalog -----------------------------------------------------------------
 
 // ReplaceProjects atomically replaces the entire projects mirror.
-func (s *Store) ReplaceProjects(projects []Project) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec("DELETE FROM projects"); err != nil {
-		return err
-	}
-	for _, p := range projects {
-		if _, err := tx.Exec(`
-INSERT INTO projects (id, workspace_id, name, color, client_name, active, billable, at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			p.ID, p.WorkspaceID, p.Name, p.Color, p.ClientName,
-			boolToInt(p.Active), boolToInt(p.Billable), p.At); err != nil {
+func (s *Store) ReplaceProjects(ctx context.Context, projects []Project) error {
+	return s.WithTx(ctx, func(tx *Store) error {
+		if _, err := tx.ex.ExecContext(ctx, "DELETE FROM projects"); err != nil {
 			return err
 		}
-	}
-	return tx.Commit()
+		for _, p := range projects {
+			if _, err := tx.ex.ExecContext(ctx, `
+INSERT INTO projects (id, workspace_id, name, color, client_name, active, billable, at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				p.ID, p.WorkspaceID, p.Name, p.Color, p.ClientName,
+				boolToInt(p.Active), boolToInt(p.Billable), p.At); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // ReplaceProjectTasks atomically replaces the cached tasks of a single project,
 // leaving every other project's tasks untouched. It backs the project-scoped
 // `tg update`, which never refreshes the whole workspace.
-func (s *Store) ReplaceProjectTasks(projectID int64, tasks []Task) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec("DELETE FROM tasks WHERE project_id = ?", projectID); err != nil {
-		return err
-	}
-	for _, t := range tasks {
-		if _, err := tx.Exec(`
-INSERT INTO tasks (id, workspace_id, project_id, name, active, at)
-VALUES (?, ?, ?, ?, ?, ?)`,
-			t.ID, t.WorkspaceID, t.ProjectID, t.Name, boolToInt(t.Active), t.At); err != nil {
+func (s *Store) ReplaceProjectTasks(ctx context.Context, projectID int64, tasks []Task) error {
+	return s.WithTx(ctx, func(tx *Store) error {
+		if _, err := tx.ex.ExecContext(ctx, "DELETE FROM tasks WHERE project_id = ?", projectID); err != nil {
 			return err
 		}
-	}
-	return tx.Commit()
+		return tx.insertTasks(ctx, tasks)
+	})
 }
 
 // ReplaceTasks atomically replaces the entire tasks mirror.
-func (s *Store) ReplaceTasks(tasks []Task) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec("DELETE FROM tasks"); err != nil {
-		return err
-	}
+func (s *Store) ReplaceTasks(ctx context.Context, tasks []Task) error {
+	return s.WithTx(ctx, func(tx *Store) error {
+		if _, err := tx.ex.ExecContext(ctx, "DELETE FROM tasks"); err != nil {
+			return err
+		}
+		return tx.insertTasks(ctx, tasks)
+	})
+}
+
+// insertTasks inserts the given catalog tasks, assuming the rows they replace
+// have already been deleted by the caller (see ReplaceTasks).
+func (s *Store) insertTasks(ctx context.Context, tasks []Task) error {
 	for _, t := range tasks {
-		if _, err := tx.Exec(`
+		if _, err := s.ex.ExecContext(ctx, `
 INSERT INTO tasks (id, workspace_id, project_id, name, active, at)
 VALUES (?, ?, ?, ?, ?, ?)`,
 			t.ID, t.WorkspaceID, t.ProjectID, t.Name, boolToInt(t.Active), t.At); err != nil {
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // PutProject inserts or fully updates a single project row by id, refreshing
 // every display and state field (name, color, client, active, billable, at).
 // Unlike UpsertProject (which is a conservative self-heal from meta pulls),
 // this is authoritative and backs the project-scoped `tg update`.
-func (s *Store) PutProject(p Project) error {
-	_, err := s.db.Exec(`
+func (s *Store) PutProject(ctx context.Context, p Project) error {
+	_, err := s.ex.ExecContext(ctx, `
 INSERT INTO projects (id, workspace_id, name, color, client_name, active, billable, at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
@@ -743,8 +793,8 @@ ON CONFLICT(id) DO UPDATE SET
 // authoritative `tg update` is never downgraded. Color is only refreshed when a
 // non-empty value is supplied, so a meta payload lacking a color never clobbers
 // a color already stored by an authoritative update.
-func (s *Store) UpsertProject(p Project) error {
-	_, err := s.db.Exec(`
+func (s *Store) UpsertProject(ctx context.Context, p Project) error {
+	_, err := s.ex.ExecContext(ctx, `
 INSERT INTO projects (id, workspace_id, name, color, client_name, active, billable, at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
@@ -757,8 +807,8 @@ ON CONFLICT(id) DO UPDATE SET
 
 // UpsertTask inserts or updates a single task row by id, refreshing the display
 // fields (see UpsertProject for the rationale).
-func (s *Store) UpsertTask(t Task) error {
-	_, err := s.db.Exec(`
+func (s *Store) UpsertTask(ctx context.Context, t Task) error {
+	_, err := s.ex.ExecContext(ctx, `
 INSERT INTO tasks (id, workspace_id, project_id, name, active, at)
 VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
@@ -769,8 +819,8 @@ ON CONFLICT(id) DO UPDATE SET
 }
 
 // activeTasks loads every active task for matching.
-func (s *Store) activeTasks() ([]Task, error) {
-	rows, err := s.db.Query(
+func (s *Store) activeTasks(ctx context.Context) ([]Task, error) {
+	rows, err := s.ex.QueryContext(ctx,
 		"SELECT id, workspace_id, project_id, name, active, at FROM tasks WHERE active = 1")
 	if err != nil {
 		return nil, err
@@ -789,7 +839,7 @@ func (s *Store) activeTasks() ([]Task, error) {
 
 // ListProjects returns catalog projects for display, ordered by name. Inactive
 // projects are included only when includeInactive is set.
-func (s *Store) ListProjects(includeInactive bool) ([]Project, error) {
+func (s *Store) ListProjects(ctx context.Context, includeInactive bool) ([]Project, error) {
 	q := `
 SELECT id, workspace_id, name, COALESCE(color, ''), COALESCE(client_name, ''),
        active, billable, COALESCE(at, '')
@@ -799,7 +849,7 @@ FROM projects`
 	}
 	q += "\nORDER BY name"
 
-	rows, err := s.db.Query(q)
+	rows, err := s.ex.QueryContext(ctx, q)
 	if err != nil {
 		return nil, err
 	}
@@ -819,8 +869,8 @@ FROM projects`
 // ProjectByID returns the cached project with the given id, or nil if it is not
 // in the local catalog (e.g. before `tg update`). It is used to carry a
 // project's billable flag onto entries created against it.
-func (s *Store) ProjectByID(id int64) (*Project, error) {
-	row := s.db.QueryRow(`
+func (s *Store) ProjectByID(ctx context.Context, id int64) (*Project, error) {
+	row := s.ex.QueryRowContext(ctx, `
 SELECT id, workspace_id, name, COALESCE(color, ''), COALESCE(client_name, ''),
        active, billable, COALESCE(at, '')
 FROM projects WHERE id = ?`, id)
@@ -839,7 +889,7 @@ FROM projects WHERE id = ?`, id)
 // ListTasks returns catalog tasks for display, with the project name joined and
 // ordered by project then task name. Inactive tasks are included only when
 // includeInactive is set; a non-nil projectID scopes the listing to one project.
-func (s *Store) ListTasks(includeInactive bool, projectID *int64) ([]Task, error) {
+func (s *Store) ListTasks(ctx context.Context, includeInactive bool, projectID *int64) ([]Task, error) {
 	q := `
 SELECT t.id, t.workspace_id, t.project_id, t.name, t.active, COALESCE(t.at, ''),
        COALESCE(p.name, '')
@@ -859,7 +909,7 @@ LEFT JOIN projects p ON p.id = t.project_id`
 	}
 	q += "\nORDER BY p.name, t.name"
 
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.ex.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -878,8 +928,8 @@ LEFT JOIN projects p ON p.id = t.project_id`
 
 // FindTasksByFragment returns active tasks matching fragment (see matchTasks),
 // optionally scoped to a project.
-func (s *Store) FindTasksByFragment(fragment string, projectID *int64) ([]Task, error) {
-	tasks, err := s.activeTasks()
+func (s *Store) FindTasksByFragment(ctx context.Context, fragment string, projectID *int64) ([]Task, error) {
+	tasks, err := s.activeTasks(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -888,8 +938,8 @@ func (s *Store) FindTasksByFragment(fragment string, projectID *int64) ([]Task, 
 
 // FindProjectsByFragment returns active projects matching fragment (see
 // matchProjects).
-func (s *Store) FindProjectsByFragment(fragment string) ([]Project, error) {
-	projects, err := s.ListProjects(false)
+func (s *Store) FindProjectsByFragment(ctx context.Context, fragment string) ([]Project, error) {
+	projects, err := s.ListProjects(ctx, false)
 	if err != nil {
 		return nil, err
 	}
@@ -968,9 +1018,9 @@ func matchTasks(tasks []Task, fragment string, projectID *int64) []Task {
 // --- meta --------------------------------------------------------------------
 
 // GetMeta returns the value for key and whether it was present.
-func (s *Store) GetMeta(key string) (string, bool, error) {
+func (s *Store) GetMeta(ctx context.Context, key string) (string, bool, error) {
 	var v string
-	err := s.db.QueryRow("SELECT value FROM meta WHERE key = ?", key).Scan(&v)
+	err := s.ex.QueryRowContext(ctx, "SELECT value FROM meta WHERE key = ?", key).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
@@ -981,8 +1031,8 @@ func (s *Store) GetMeta(key string) (string, bool, error) {
 }
 
 // SetMeta upserts a meta key/value pair.
-func (s *Store) SetMeta(key, value string) error {
-	_, err := s.db.Exec(
+func (s *Store) SetMeta(ctx context.Context, key, value string) error {
+	_, err := s.ex.ExecContext(ctx,
 		"INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
 		key, value)
 	return err

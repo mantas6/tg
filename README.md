@@ -409,6 +409,12 @@ changed in the meantime is ever marked as reconciled.
 up in the Toggl web app immediately. If the network is unavailable, the entry
 stays local and dirty until the next `tg push`.
 
+An entry Toggl refuses is skipped rather than fatal: the rest of the dirty queue
+is still sent, the rejected entry stays dirty, and `tg push` reports it (and
+exits non-zero). One permanently rejected entry can therefore not block the
+entries behind it. Under `--json` the rejections are listed in the result's
+`failed` array.
+
 `tg update [project]` is the per-project refresh: it fetches the project's task
 list *and* pulls its recent time entries in one go. It does not sync the project
 catalog itself — use `tg projects update` for that.

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -42,18 +43,18 @@ func payloadFrom(e TimeEntry, withCreatedWith bool) entryPayload {
 
 // Me returns the authenticated user (used to verify the token and discover the
 // default workspace).
-func (c *Client) Me() (*Me, error) {
+func (c *Client) Me(ctx context.Context) (*Me, error) {
 	var me Me
-	if err := c.do("GET", "/me", nil, &me); err != nil {
+	if err := c.do(ctx, "GET", "/me", nil, &me); err != nil {
 		return nil, err
 	}
 	return &me, nil
 }
 
 // Current returns the running time entry, or nil if none is running.
-func (c *Client) Current() (*TimeEntry, error) {
+func (c *Client) Current(ctx context.Context) (*TimeEntry, error) {
 	var te *TimeEntry
-	if err := c.do("GET", "/me/time_entries/current", nil, &te); err != nil {
+	if err := c.do(ctx, "GET", "/me/time_entries/current", nil, &te); err != nil {
 		return nil, err
 	}
 	return te, nil
@@ -61,12 +62,12 @@ func (c *Client) Current() (*TimeEntry, error) {
 
 // List returns time entries modified at/after since, including remote
 // deletions (meta=true enriches the payload with project/task metadata).
-func (c *Client) List(since time.Time) ([]TimeEntry, error) {
+func (c *Client) List(ctx context.Context, since time.Time) ([]TimeEntry, error) {
 	q := url.Values{}
 	q.Set("since", strconv.FormatInt(since.UTC().Unix(), 10))
 	q.Set("meta", "true")
 	var entries []TimeEntry
-	if err := c.do("GET", "/me/time_entries?"+q.Encode(), nil, &entries); err != nil {
+	if err := c.do(ctx, "GET", "/me/time_entries?"+q.Encode(), nil, &entries); err != nil {
 		return nil, err
 	}
 	return entries, nil
@@ -74,37 +75,37 @@ func (c *Client) List(since time.Time) ([]TimeEntry, error) {
 
 // Create posts a new time entry (tagged created_with:"tg") and returns the
 // server's representation (with id and at).
-func (c *Client) Create(e TimeEntry) (*TimeEntry, error) {
+func (c *Client) Create(ctx context.Context, e TimeEntry) (*TimeEntry, error) {
 	var out TimeEntry
 	path := fmt.Sprintf("/workspaces/%d/time_entries", e.WorkspaceID)
-	if err := c.do("POST", path, payloadFrom(e, true), &out); err != nil {
+	if err := c.do(ctx, "POST", path, payloadFrom(e, true), &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
 // Update PUTs changes to an existing time entry.
-func (c *Client) Update(e TimeEntry) (*TimeEntry, error) {
+func (c *Client) Update(ctx context.Context, e TimeEntry) (*TimeEntry, error) {
 	var out TimeEntry
 	path := fmt.Sprintf("/workspaces/%d/time_entries/%d", e.WorkspaceID, e.ID)
-	if err := c.do("PUT", path, payloadFrom(e, false), &out); err != nil {
+	if err := c.do(ctx, "PUT", path, payloadFrom(e, false), &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
 // Stop PATCHes a running entry to stop it, returning the stopped entry.
-func (c *Client) Stop(workspaceID, id int64) (*TimeEntry, error) {
+func (c *Client) Stop(ctx context.Context, workspaceID, id int64) (*TimeEntry, error) {
 	var out TimeEntry
 	path := fmt.Sprintf("/workspaces/%d/time_entries/%d/stop", workspaceID, id)
-	if err := c.do("PATCH", path, nil, &out); err != nil {
+	if err := c.do(ctx, "PATCH", path, nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
 // Delete removes a time entry.
-func (c *Client) Delete(workspaceID, id int64) error {
+func (c *Client) Delete(ctx context.Context, workspaceID, id int64) error {
 	path := fmt.Sprintf("/workspaces/%d/time_entries/%d", workspaceID, id)
-	return c.do("DELETE", path, nil, nil)
+	return c.do(ctx, "DELETE", path, nil, nil)
 }

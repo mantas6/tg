@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +22,46 @@ import (
 	"github.com/mantas6/tg/store"
 )
 
+// ctx is the context the command and store calls in these tests run under. The
+// cancellation paths that need a live context build their own.
+var ctx = context.Background()
+
+// testWorkspaceID is the workspace the fixtures below belong to: the catalog
+// seeds it on every project and task, and env reports it as the configured one,
+// so a command files new entries under the same workspace a real authenticated
+// invocation would.
+const testWorkspaceID = 1
+
+// env builds the cmdEnv the cmd* functions take. A nil client is the offline
+// case (no credentials, or none needed): the local edit still applies and stays
+// dirty for a later push, and nothing is sent (see cmdEnv.offline).
+func env(w io.Writer, s *store.Store, c *api.Client, now time.Time, loc *time.Location) *cmdEnv {
+	return &cmdEnv{
+		ctx: ctx, w: w, st: s, c: c,
+		workspaceID: testWorkspaceID, now: now, loc: loc,
+	}
+}
+
+// localEnv is env for the commands that only read the local catalog (tasks,
+// grep, projects): they use neither the clock nor the client.
+func localEnv(w io.Writer, s *store.Store) *cmdEnv {
+	return env(w, s, nil, time.Time{}, time.UTC)
+}
+
+// apiEnv is env for the commands that need the client but no clock
+// (`tg projects update`).
+func apiEnv(w io.Writer, s *store.Store, c *api.Client) *cmdEnv {
+	return env(w, s, c, time.Time{}, time.UTC)
+}
+
+// unauthenticatedEnv is env as it looks before `tg auth`: no client and no
+// configured workspace, which is what the offline paths are checked against.
+func unauthenticatedEnv(w io.Writer, s *store.Store, now time.Time, loc *time.Location) *cmdEnv {
+	e := env(w, s, nil, now, loc)
+	e.workspaceID = 0
+	return e
+}
+
 // newStore opens a throwaway store pinned to UTC, matching the time.UTC the
 // command tests pass as the display location: the store reckons entry days (and
 // so the per-day numbering `tg ls` shows) in its own location, which a real
@@ -33,7 +75,7 @@ func newStore(t *testing.T) *store.Store {
 // reckon days somewhere other than UTC (see the DST window tests).
 func newStoreIn(t *testing.T, loc *time.Location) *store.Store {
 	t.Helper()
-	s, err := store.OpenIn(filepath.Join(t.TempDir(), "tg.db"), loc)
+	s, err := store.OpenIn(ctx, filepath.Join(t.TempDir(), "tg.db"), loc)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -43,13 +85,13 @@ func newStoreIn(t *testing.T, loc *time.Location) *store.Store {
 
 func seedCatalog(t *testing.T, s *store.Store) {
 	t.Helper()
-	if err := s.ReplaceProjects([]store.Project{
+	if err := s.ReplaceProjects(ctx, []store.Project{
 		{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true},
 		{ID: 2, WorkspaceID: 1, Name: "Payments", Active: true, Billable: true},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ReplaceTasks([]store.Task{
+	if err := s.ReplaceTasks(ctx, []store.Task{
 		{ID: 10, WorkspaceID: 1, ProjectID: 1, Name: "Fix login bug", Active: true},
 		{ID: 11, WorkspaceID: 1, ProjectID: 1, Name: "Fix", Active: true},
 		{ID: 12, WorkspaceID: 1, ProjectID: 1, Name: "Code review", Active: true},
@@ -69,7 +111,7 @@ var testStart = time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 // entries, but it must keep handling the ones it pulls.
 func seedRunning(t *testing.T, s *store.Store, taskID int64, start time.Time) {
 	t.Helper()
-	if _, err := s.CreateEntry(store.Entry{
+	if _, err := s.CreateEntry(ctx, store.Entry{
 		WorkspaceID: 1, ProjectID: p(1), TaskID: &taskID,
 		Start: start, Duration: -1, UpdatedAt: start,
 	}); err != nil {
@@ -119,7 +161,7 @@ func TestAddCreatesFinishedEntry(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, false, "9-:30", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "9-:30", "login", ""); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	out := buf.String()
@@ -129,7 +171,7 @@ func TestAddCreatesFinishedEntry(t *testing.T) {
 		}
 	}
 
-	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
@@ -161,7 +203,7 @@ func TestAddCreatesFinishedEntry(t *testing.T) {
 	if !e.Dirty {
 		t.Error("added entry should be dirty for a later push")
 	}
-	if r, _ := s.Running(); r != nil {
+	if r, _ := s.Running(ctx); r != nil {
 		t.Errorf("add must not create a running entry, got %+v", r)
 	}
 }
@@ -177,14 +219,14 @@ func TestAddAcceptsRelativeTimesign(t *testing.T) {
 	// 15:07 floors to 15:05, so "+:20" spans 14:45-15:05.
 	now := time.Date(2026, 1, 2, 15, 7, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, false, "+:20", "login", "", now, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, nil, now, time.UTC), nil, false, "+:20", "login", ""); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	if out := buf.String(); !strings.Contains(out, "14:45-15:05") {
 		t.Errorf("output = %q, want 14:45-15:05", out)
 	}
 
-	entries, _ := s.EntriesBetween(now.Add(-24*time.Hour), now.Add(24*time.Hour))
+	entries, _ := s.EntriesBetween(ctx, now.Add(-24*time.Hour), now.Add(24*time.Hour))
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
@@ -209,10 +251,10 @@ func TestAddRejectsInvalidRelativeTimesign(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, false, "+:00", "login", "", addNow, time.UTC); err == nil {
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "+:00", "login", ""); err == nil {
 		t.Fatal("add with +:00 = nil error, want an error")
 	}
-	if entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 0 {
+	if entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 0 {
 		t.Errorf("entries = %d, want 0", len(entries))
 	}
 }
@@ -227,18 +269,18 @@ func TestAddDurationStartsAtLastEntryEnd(t *testing.T) {
 	// The last entry today ends at 10:00, so "1:30" is 10:00-11:30 regardless
 	// of what time it is now (15:00).
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, false, "9-10", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "9-10", "login", ""); err != nil {
 		t.Fatalf("add first: %v", err)
 	}
 	buf.Reset()
-	if err := cmdAdd(&buf, s, nil, 1, nil, false, "1:30", "review", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "1:30", "review", ""); err != nil {
 		t.Fatalf("add duration: %v", err)
 	}
 	if out := buf.String(); !strings.Contains(out, "10:00-11:30") || !strings.Contains(out, "1h30m") {
 		t.Errorf("output = %q, want 10:00-11:30 (1h30m)", out)
 	}
 
-	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
 	if len(entries) != 2 {
 		t.Fatalf("entries = %d, want 2", len(entries))
 	}
@@ -260,7 +302,7 @@ func TestAddDurationStartsAtLastEntryEnd(t *testing.T) {
 
 	// A second bare duration chains off the one just added.
 	buf.Reset()
-	if err := cmdAdd(&buf, s, nil, 1, nil, false, ":30", "Fix", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, ":30", "Fix", ""); err != nil {
 		t.Fatalf("add chained duration: %v", err)
 	}
 	if out := buf.String(); !strings.Contains(out, "11:30-12:00") {
@@ -278,13 +320,12 @@ func TestAddDurationWithoutLastEntry(t *testing.T) {
 
 	// Yesterday's entry is history: LastEntry is today-only, so it must not
 	// become the anchor.
-	if err := cmdAdd(&bytes.Buffer{}, s, nil, 1, nil, false, "9-10", "login", "",
-		addNow.AddDate(0, 0, -1), time.UTC); err != nil {
+	if err := cmdAdd(env(&bytes.Buffer{}, s, nil, addNow.AddDate(0, 0, -1), time.UTC), nil, false, "9-10", "login", ""); err != nil {
 		t.Fatalf("seed yesterday: %v", err)
 	}
 
 	var buf bytes.Buffer
-	err := cmdAdd(&buf, s, nil, 1, nil, false, "1:30", "review", "", addNow, time.UTC)
+	err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "1:30", "review", "")
 	if err == nil {
 		t.Fatal("add 1:30 with no entry today = nil error, want an error")
 	}
@@ -297,7 +338,7 @@ func TestAddDurationWithoutLastEntry(t *testing.T) {
 		t.Errorf("output = %q, want nothing written", buf.String())
 	}
 	// Only yesterday's entry exists; nothing was created today.
-	entries, _ := s.EntriesBetween(addNow.AddDate(0, 0, -2), addNow.Add(24*time.Hour))
+	entries, _ := s.EntriesBetween(ctx, addNow.AddDate(0, 0, -2), addNow.Add(24*time.Hour))
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1 (yesterday's only)", len(entries))
 	}
@@ -313,14 +354,14 @@ func TestAddDurationWithRunningLastEntry(t *testing.T) {
 	seedRunning(t, s, 12, testStart)
 
 	var buf bytes.Buffer
-	err := cmdAdd(&buf, s, nil, 1, nil, false, "1:30", "login", "", addNow, time.UTC)
+	err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "1:30", "login", "")
 	if err == nil {
 		t.Fatal("add 1:30 after a running entry = nil error, want an error")
 	}
 	if !strings.Contains(err.Error(), "still running") {
 		t.Errorf("err = %v, want it to mention the running entry", err)
 	}
-	if entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 1 {
+	if entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1 (the running entry only)", len(entries))
 	}
 }
@@ -336,16 +377,16 @@ func TestAddDurationRejectsOverlap(t *testing.T) {
 	// It is 10:30. Tracked so far today: 09:00-10:00. Booked for later:
 	// 11:00-12:00, which starts after now and so is never the anchor.
 	now := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
-	if err := cmdAdd(&bytes.Buffer{}, s, nil, 1, nil, false, "9-10", "login", "", now, time.UTC); err != nil {
+	if err := cmdAdd(env(&bytes.Buffer{}, s, nil, now, time.UTC), nil, false, "9-10", "login", ""); err != nil {
 		t.Fatalf("add first: %v", err)
 	}
-	if err := cmdAdd(&bytes.Buffer{}, s, nil, 1, nil, false, "11-12", "Fix", "", now, time.UTC); err != nil {
+	if err := cmdAdd(env(&bytes.Buffer{}, s, nil, now, time.UTC), nil, false, "11-12", "Fix", ""); err != nil {
 		t.Fatalf("add later: %v", err)
 	}
 
 	var buf bytes.Buffer
 	// 10:00 + 1h30m = 11:30, which straddles the 11:00-12:00 entry.
-	err := cmdAdd(&buf, s, nil, 1, nil, false, "1:30", "review", "", now, time.UTC)
+	err := cmdAdd(env(&buf, s, nil, now, time.UTC), nil, false, "1:30", "review", "")
 	if err == nil {
 		t.Fatal("overlapping duration add = nil error, want an error")
 	}
@@ -354,13 +395,13 @@ func TestAddDurationRejectsOverlap(t *testing.T) {
 			t.Errorf("err = %v, want it to mention %q", err, want)
 		}
 	}
-	if entries, _ := s.EntriesBetween(now.Add(-24*time.Hour), now.Add(24*time.Hour)); len(entries) != 2 {
+	if entries, _ := s.EntriesBetween(ctx, now.Add(-24*time.Hour), now.Add(24*time.Hour)); len(entries) != 2 {
 		t.Fatalf("entries = %d, want 2", len(entries))
 	}
 
 	// Exactly filling the gap up to the booked entry is fine (back to back).
 	buf.Reset()
-	if err := cmdAdd(&buf, s, nil, 1, nil, false, "1", "review", "", now, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, nil, now, time.UTC), nil, false, "1", "review", ""); err != nil {
 		t.Fatalf("gap-filling add: %v", err)
 	}
 	if out := buf.String(); !strings.Contains(out, "10:00-11:00") {
@@ -374,17 +415,17 @@ func TestAddRejectsInvalidDuration(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	if err := cmdAdd(&bytes.Buffer{}, s, nil, 1, nil, false, "9-10", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(env(&bytes.Buffer{}, s, nil, addNow, time.UTC), nil, false, "9-10", "login", ""); err != nil {
 		t.Fatalf("add first: %v", err)
 	}
 	for _, ts := range []string{"0", ":00", "24", "1:60", "1:"} {
 		var buf bytes.Buffer
-		err := cmdAdd(&buf, s, nil, 1, nil, false, ts, "review", "", addNow, time.UTC)
+		err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, ts, "review", "")
 		if err == nil || !strings.Contains(err.Error(), "timesign") {
 			t.Errorf("add %q: err = %v, want a timesign parse error", ts, err)
 		}
 	}
-	if entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 1 {
+	if entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
 }
@@ -396,10 +437,10 @@ func TestAddWithDescription(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, false, "9-:30", "login", "reset password flow", addNow, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "9-:30", "login", "reset password flow"); err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
@@ -424,7 +465,7 @@ func TestAddDescriptionInPushPayload(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, c, 1, nil, false, "9-:30", "login", "reset password flow", addNow, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, c, addNow, time.UTC), nil, false, "9-:30", "login", "reset password flow"); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	if got, _ := body["description"].(string); got != "reset password flow" {
@@ -440,10 +481,10 @@ func TestAddExactWins(t *testing.T) {
 
 	var buf bytes.Buffer
 	// "Fix" exactly matches task 11 even though it is a substring of others.
-	if err := cmdAdd(&buf, s, nil, 1, nil, false, "9-10", "Fix", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "9-10", "Fix", ""); err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
@@ -460,10 +501,10 @@ func TestAddNonBillableProject(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, false, "9-10", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "9-10", "login", ""); err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
 	if len(entries) != 1 || entries[0].Billable {
 		t.Fatalf("entries = %+v, want a single non-billable entry", entries)
 	}
@@ -478,10 +519,10 @@ func TestAddKeepsRunningEntry(t *testing.T) {
 	// entry occupies everything from its start onwards.
 	seedRunning(t, s, 12, testStart)
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, false, "7-8", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "7-8", "login", ""); err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	r, _ := s.Running()
+	r, _ := s.Running(ctx)
 	if r == nil || r.TaskID == nil || *r.TaskID != 12 {
 		t.Fatalf("running entry = %+v, want Code review still running", r)
 	}
@@ -495,13 +536,13 @@ func TestAddRejectsOverlap(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, false, "9-10", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "9-10", "login", ""); err != nil {
 		t.Fatalf("add first: %v", err)
 	}
 
 	// 09:30-10:30 straddles the 09:00-10:00 entry.
 	buf.Reset()
-	err := cmdAdd(&buf, s, nil, 1, nil, false, "9:30-10:30", "review", "", addNow, time.UTC)
+	err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "9:30-10:30", "review", "")
 	if err == nil {
 		t.Fatal("overlapping add = nil error, want an error")
 	}
@@ -515,17 +556,17 @@ func TestAddRejectsOverlap(t *testing.T) {
 	}
 
 	// Only the first entry exists; the rejected one was never created.
-	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
 
 	// A back-to-back entry starting exactly when the first ends is fine.
 	buf.Reset()
-	if err := cmdAdd(&buf, s, nil, 1, nil, false, "10-11", "review", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "10-11", "review", ""); err != nil {
 		t.Fatalf("touching add: %v", err)
 	}
-	if entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 2 {
+	if entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 2 {
 		t.Fatalf("entries = %d, want 2", len(entries))
 	}
 }
@@ -539,7 +580,7 @@ func TestAddRejectsOverlapWithRunningEntry(t *testing.T) {
 	seedRunning(t, s, 12, testStart)
 
 	var buf bytes.Buffer
-	err := cmdAdd(&buf, s, nil, 1, nil, false, "8:30-9:30", "login", "", addNow, time.UTC)
+	err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "8:30-9:30", "login", "")
 	if err == nil {
 		t.Fatal("add over a running entry = nil error, want an error")
 	}
@@ -548,7 +589,7 @@ func TestAddRejectsOverlapWithRunningEntry(t *testing.T) {
 			t.Errorf("err = %v, want it to mention %q", err, want)
 		}
 	}
-	if entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 1 {
+	if entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1 (the running entry only)", len(entries))
 	}
 }
@@ -560,10 +601,10 @@ func TestAddProjectScopeViaEnvID(t *testing.T) {
 	// "fix" matches several tasks, but scoping to project 2 leaves only one.
 	pid := int64(2)
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, &pid, false, "10-11", "fix", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), &pid, false, "10-11", "fix", ""); err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
@@ -585,7 +626,7 @@ func TestAddAmbiguous(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	err := cmdAdd(&buf, s, nil, 1, nil, false, "10-11", "write", "", addNow, time.UTC)
+	err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "10-11", "write", "")
 	if err == nil {
 		t.Fatal("expected ambiguity error")
 	}
@@ -600,7 +641,7 @@ func TestAddAmbiguous(t *testing.T) {
 	if !strings.Contains(err.Error(), "pass -1") {
 		t.Errorf("error should point at -1: %v", err)
 	}
-	if entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 0 {
+	if entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 0 {
 		t.Errorf("no entry should be created on ambiguity, got %d", len(entries))
 	}
 }
@@ -614,24 +655,24 @@ func TestAddAmbiguousFirstMatchWins(t *testing.T) {
 	seedCatalog(t, s)
 	// The same task name in a second project; "Code review" is now an exact
 	// match for two tasks at once.
-	if err := s.UpsertTask(store.Task{
+	if err := s.UpsertTask(ctx, store.Task{
 		ID: 22, WorkspaceID: 1, ProjectID: 2, Name: "Code review", Active: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	var buf bytes.Buffer
-	err := cmdAdd(&buf, s, nil, 1, nil, false, "10-11", "code review", "", addNow, time.UTC)
+	err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "10-11", "code review", "")
 	if err == nil || !strings.Contains(err.Error(), "multiple tasks match") {
 		t.Fatalf("err = %v, want an ambiguity error without -1", err)
 	}
 
 	// Candidates are ordered by name then id, so the first one is task 12.
 	buf.Reset()
-	if err := cmdAdd(&buf, s, nil, 1, nil, true, "10-11", "code review", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, true, "10-11", "code review", ""); err != nil {
 		t.Fatalf("add -1: %v", err)
 	}
-	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
@@ -651,10 +692,10 @@ func TestAddFirstMatchIsNotNeededWhenUnique(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, nil, 1, nil, true, "9-:30", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, true, "9-:30", "login", ""); err != nil {
 		t.Fatalf("add -1: %v", err)
 	}
-	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
 	if len(entries) != 1 || entries[0].TaskID == nil || *entries[0].TaskID != 10 {
 		t.Errorf("entries = %+v, want one entry on task 10", entries)
 	}
@@ -667,7 +708,7 @@ func TestAddFirstMatchDoesNotInventAMatch(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	err := cmdAdd(&buf, s, nil, 1, nil, true, "10-11", "nonexistent", "", addNow, time.UTC)
+	err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, true, "10-11", "nonexistent", "")
 	if err == nil || !strings.Contains(err.Error(), "tg update") {
 		t.Errorf("err = %v, want the no-match error even with -1", err)
 	}
@@ -695,7 +736,7 @@ func TestResolveTaskFragment(t *testing.T) {
 		{name: "none with -1", fragment: "nonexistent", first: true, wantErr: "no task matches"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := resolveTaskFragment(s, tc.fragment, nil, tc.first)
+			got, err := resolveTaskFragment(ctx, s, tc.fragment, nil, tc.first)
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("err = %v, want it to contain %q", err, tc.wantErr)
@@ -717,7 +758,7 @@ func TestAddNoneSuggestsUpdate(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	err := cmdAdd(&buf, s, nil, 1, nil, false, "10-11", "nonexistent", "", addNow, time.UTC)
+	err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "10-11", "nonexistent", "")
 	if err == nil || !strings.Contains(err.Error(), "tg update") {
 		t.Errorf("err = %v, want suggestion to run `tg update`", err)
 	}
@@ -728,12 +769,12 @@ func TestAddInvalidTimesign(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	err := cmdAdd(&buf, s, nil, 1, nil, false, "nope", "login", "", addNow, time.UTC)
+	err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "nope", "login", "")
 	if err == nil || !strings.Contains(err.Error(), "timesign") {
 		t.Errorf("err = %v, want a timesign parse error", err)
 	}
 	// A bad timesign must be rejected before any task lookup or write.
-	if entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 0 {
+	if entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 0 {
 		t.Errorf("no entry should be created for a bad timesign, got %d", len(entries))
 	}
 }
@@ -754,7 +795,7 @@ func TestAddBestEffortPush(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, c, 1, nil, false, "9-:30", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, c, addNow, time.UTC), nil, false, "9-:30", "login", ""); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	if gotMethod != http.MethodPost {
@@ -767,7 +808,7 @@ func TestAddBestEffortPush(t *testing.T) {
 		t.Errorf("duration = %v, want 1800", body["duration"])
 	}
 	// A successful push marks the entry synced (remote id set, clean).
-	r, _ := s.EntryByRemoteID(9100)
+	r, _ := s.EntryByRemoteID(ctx, 9100)
 	if r == nil {
 		t.Fatal("expected the added entry to be synced with its remote id")
 	}
@@ -787,13 +828,13 @@ func TestAddSyncFailureIsNonFatal(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	if err := cmdAdd(&buf, s, c, 1, nil, false, "9-:30", "login", "", addNow, time.UTC); err != nil {
+	if err := cmdAdd(env(&buf, s, c, addNow, time.UTC), nil, false, "9-:30", "login", ""); err != nil {
 		t.Fatalf("add should not fail on a sync error: %v", err)
 	}
 	if !strings.Contains(buf.String(), "warning") {
 		t.Errorf("output = %q, want a sync warning", buf.String())
 	}
-	entries, _ := s.EntriesBetween(addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
@@ -822,21 +863,21 @@ func seedModDay(t *testing.T, s *store.Store) []store.Entry {
 	stop1 := testStart.Add(time.Hour)
 	start2 := stop1
 	stop2 := start2.Add(time.Hour)
-	if _, err := s.CreateEntry(store.Entry{
+	if _, err := s.CreateEntry(ctx, store.Entry{
 		RemoteID: p(9001), WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
 		Start: testStart, Stop: &stop1, Duration: 3600, UpdatedAt: stop1,
 		SyncedAt: &stop1,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CreateEntry(store.Entry{
+	if _, err := s.CreateEntry(ctx, store.Entry{
 		RemoteID: p(9002), WorkspaceID: 1, ProjectID: p(1), TaskID: p(12),
 		Start: start2, Stop: &stop2, Duration: 3600, UpdatedAt: stop2,
 		SyncedAt: &stop2,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	entries, err := s.EntriesBetween(testStart.Add(-24*time.Hour), testStart.Add(24*time.Hour))
+	entries, err := s.EntriesBetween(ctx, testStart.Add(-24*time.Hour), testStart.Add(24*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -856,7 +897,7 @@ func seedModDay(t *testing.T, s *store.Store) []store.Entry {
 // a mutation left behind.
 func entryByID(t *testing.T, s *store.Store, id int64) store.Entry {
 	t.Helper()
-	dirty, err := s.DirtyEntries()
+	dirty, err := s.DirtyEntries(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -865,7 +906,7 @@ func entryByID(t *testing.T, s *store.Store, id int64) store.Entry {
 			return e
 		}
 	}
-	entries, err := s.EntriesBetween(testStart.Add(-48*time.Hour), testStart.Add(48*time.Hour))
+	entries, err := s.EntriesBetween(ctx, testStart.Add(-48*time.Hour), testStart.Add(48*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -890,7 +931,7 @@ func TestModLastEntryRelativeTimesign(t *testing.T) {
 	last := entries[1] // 10:00-11:00 Code review
 
 	var buf bytes.Buffer
-	if err := cmdMod(&buf, s, nil, 0, "+:30", "", false, modNow, time.UTC); err != nil {
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 0, "+:30", "", false); err != nil {
 		t.Fatalf("mod: %v", err)
 	}
 	out := buf.String()
@@ -934,7 +975,7 @@ func TestModUnitlessRelativeUsesMinutes(t *testing.T) {
 	last := entries[1] // 10:00-11:00 Code review
 
 	var buf bytes.Buffer
-	if err := cmdMod(&buf, s, nil, 0, "+20", "", false, modNow, time.UTC); err != nil {
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 0, "+20", "", false); err != nil {
 		t.Fatalf("mod: %v", err)
 	}
 
@@ -957,11 +998,11 @@ func TestModRelativeAddsToTheEnd(t *testing.T) {
 	last := entries[1] // 10:00-11:00 Code review
 
 	var buf bytes.Buffer
-	if err := cmdMod(&buf, s, nil, 2, "+:30", "", false, modNow, time.UTC); err != nil {
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 2, "+:30", "", false); err != nil {
 		t.Fatalf("first mod: %v", err)
 	}
 	buf.Reset()
-	if err := cmdMod(&buf, s, nil, 2, "+1:15", "", false, modNow, time.UTC); err != nil {
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 2, "+1:15", "", false); err != nil {
 		t.Fatalf("second mod: %v", err)
 	}
 
@@ -986,7 +1027,7 @@ func TestModRelativeRefusesRunningEntry(t *testing.T) {
 	seedCatalog(t, s)
 
 	start := time.Date(2026, 1, 2, 14, 0, 0, 0, time.UTC)
-	id, err := s.CreateEntry(store.Entry{
+	id, err := s.CreateEntry(ctx, store.Entry{
 		WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
 		Start: start, Duration: -1, UpdatedAt: start,
 	})
@@ -995,7 +1036,7 @@ func TestModRelativeRefusesRunningEntry(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	err = cmdMod(&buf, s, nil, 0, "+:30", "", false, modNow, time.UTC)
+	err = cmdMod(env(&buf, s, nil, modNow, time.UTC), 0, "+:30", "", false)
 	if err == nil {
 		t.Fatal("mod +:30 on a running entry = nil error, want a refusal")
 	}
@@ -1011,7 +1052,7 @@ func TestModRelativeRefusesRunningEntry(t *testing.T) {
 
 	// An absolute timesign is still accepted and closes the entry.
 	buf.Reset()
-	if err := cmdMod(&buf, s, nil, 0, "14-14:30", "", false, modNow, time.UTC); err != nil {
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 0, "14-14:30", "", false); err != nil {
 		t.Fatalf("absolute mod on a running entry: %v", err)
 	}
 	if got := entryByID(t, s, id); got.Stop == nil || got.Duration != 1800 {
@@ -1030,7 +1071,7 @@ func TestModLastEntrySkipsFutureEntry(t *testing.T) {
 
 	future := modNow.Add(3 * time.Hour) // 18:07, same day
 	futureStop := future.Add(time.Hour)
-	futureID, err := s.CreateEntry(store.Entry{
+	futureID, err := s.CreateEntry(ctx, store.Entry{
 		WorkspaceID: 1, ProjectID: p(1), TaskID: p(13),
 		Start: future, Stop: &futureStop, Duration: 3600, UpdatedAt: modNow,
 	})
@@ -1039,7 +1080,7 @@ func TestModLastEntrySkipsFutureEntry(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := cmdMod(&buf, s, nil, 0, "+:30", "", false, modNow, time.UTC); err != nil {
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 0, "+:30", "", false); err != nil {
 		t.Fatalf("mod: %v", err)
 	}
 	if out := buf.String(); !strings.Contains(out, "Modified: Code review") {
@@ -1064,7 +1105,7 @@ func TestModEntryByNumber(t *testing.T) {
 	entries := seedModDay(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdMod(&buf, s, nil, 1, "8-9:30", "", false, modNow, time.UTC); err != nil {
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 1, "8-9:30", "", false); err != nil {
 		t.Fatalf("mod: %v", err)
 	}
 	if out := buf.String(); !strings.Contains(out, "Modified: Fix login bug") || !strings.Contains(out, "08:00-09:30") {
@@ -1125,7 +1166,7 @@ func TestModRefusesEntryOlderThanToday(t *testing.T) {
 	}
 	for _, tc := range cases {
 		var buf bytes.Buffer
-		err := cmdMod(&buf, s, c, tc.ref, tc.timesign, tc.desc, tc.setDesc, nextDay, time.UTC)
+		err := cmdMod(env(&buf, s, c, nextDay, time.UTC), tc.ref, tc.timesign, tc.desc, tc.setDesc)
 		if err == nil {
 			t.Errorf("%s: err = nil, want a refusal", tc.name)
 		} else if !strings.Contains(err.Error(), "today") {
@@ -1161,7 +1202,7 @@ func TestModNumberIsScopedToToday(t *testing.T) {
 
 	nextDay := modNow.AddDate(0, 0, 1)
 	var buf bytes.Buffer
-	err := cmdMod(&buf, s, nil, 1, "+:30", "", false, nextDay, time.UTC)
+	err := cmdMod(env(&buf, s, nil, nextDay, time.UTC), 1, "+:30", "", false)
 	if !errors.Is(err, store.ErrNoEntryNum) {
 		t.Fatalf("err = %v, want store.ErrNoEntryNum", err)
 	}
@@ -1177,7 +1218,7 @@ func TestModNumberIsScopedToToday(t *testing.T) {
 
 	// `del` resolves numbers the same way.
 	buf.Reset()
-	if err := cmdDel(&buf, s, nil, 1, nextDay, time.UTC); !errors.Is(err, store.ErrNoEntryNum) {
+	if err := cmdDel(env(&buf, s, nil, nextDay, time.UTC), 1); !errors.Is(err, store.ErrNoEntryNum) {
 		t.Errorf("del err = %v, want store.ErrNoEntryNum", err)
 	}
 }
@@ -1193,7 +1234,7 @@ func TestModAllowsTodaysEntryAtDayEnd(t *testing.T) {
 	var buf bytes.Buffer
 	// Entry 2 (10:00-11:00) is the one with room to grow; entry 1 butts
 	// straight into it (see TestModRejectsOverlap).
-	if err := cmdMod(&buf, s, nil, 2, "+:30", "", false, lateToday, time.UTC); err != nil {
+	if err := cmdMod(env(&buf, s, nil, lateToday, time.UTC), 2, "+:30", "", false); err != nil {
 		t.Fatalf("mod at 23:59 on the entry's own day: %v", err)
 	}
 	if got := entryByID(t, s, entries[1].ID); got.Duration != 5400 {
@@ -1210,7 +1251,7 @@ func TestModDescriptionOnly(t *testing.T) {
 	target := entries[0]
 
 	var buf bytes.Buffer
-	if err := cmdMod(&buf, s, nil, 1, "", "rebased onto main", true, modNow, time.UTC); err != nil {
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 1, "", "rebased onto main", true); err != nil {
 		t.Fatalf("mod: %v", err)
 	}
 	got := entryByID(t, s, target.ID)
@@ -1229,7 +1270,7 @@ func TestModDescriptionOnly(t *testing.T) {
 
 	// An explicitly empty --desc clears the description again.
 	buf.Reset()
-	if err := cmdMod(&buf, s, nil, 1, "", "", true, modNow, time.UTC); err != nil {
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 1, "", "", true); err != nil {
 		t.Fatalf("mod --desc \"\": %v", err)
 	}
 	if got := entryByID(t, s, target.ID); got.Description != "" {
@@ -1244,7 +1285,7 @@ func TestModTimesignAndDescription(t *testing.T) {
 	entries := seedModDay(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdMod(&buf, s, nil, 2, "+:45", "pairing", true, modNow, time.UTC); err != nil {
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 2, "+:45", "pairing", true); err != nil {
 		t.Fatalf("mod: %v", err)
 	}
 	got := entryByID(t, s, entries[1].ID)
@@ -1268,7 +1309,7 @@ func TestModRequiresAChange(t *testing.T) {
 	entries := seedModDay(t, s)
 
 	var buf bytes.Buffer
-	err := cmdMod(&buf, s, nil, 1, "", "", false, modNow, time.UTC)
+	err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 1, "", "", false)
 	if err == nil {
 		t.Fatal("mod with no changes = nil error, want a usage error")
 	}
@@ -1292,7 +1333,7 @@ func TestModRejectsOverlap(t *testing.T) {
 	// Entry 1 is 09:00-10:00 and entry 2 is 10:00-11:00, so pushing entry 1's
 	// end 90 minutes later would run into entry 2.
 	var buf bytes.Buffer
-	err := cmdMod(&buf, s, nil, 1, "+1:30", "", false, modNow, time.UTC)
+	err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 1, "+1:30", "", false)
 	if err == nil {
 		t.Fatal("overlapping mod = nil error, want an error")
 	}
@@ -1312,14 +1353,14 @@ func TestModRejectsOverlap(t *testing.T) {
 	// Shrink entry 1 to 09:00-09:30 so there is room to grow it back, which
 	// also shows the entry is not compared against its own old span.
 	buf.Reset()
-	if err := cmdMod(&buf, s, nil, 1, "9-9:30", "", false, modNow, time.UTC); err != nil {
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 1, "9-9:30", "", false); err != nil {
 		t.Fatalf("shrinking mod: %v", err)
 	}
 
 	// Extending it exactly up to the neighbour's start is allowed: the
 	// intervals are half-open, so 09:00-10:00 and 10:00-11:00 do not overlap.
 	buf.Reset()
-	if err := cmdMod(&buf, s, nil, 1, "+:30", "", false, modNow, time.UTC); err != nil {
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 1, "+:30", "", false); err != nil {
 		t.Fatalf("touching mod: %v", err)
 	}
 	if got := entryByID(t, s, entries[0].ID); got.Duration != 3600 {
@@ -1329,7 +1370,7 @@ func TestModRejectsOverlap(t *testing.T) {
 	// One more minute would collide, and a refused extension leaves the entry
 	// exactly as it was.
 	buf.Reset()
-	if err := cmdMod(&buf, s, nil, 1, "+:01", "", false, modNow, time.UTC); err == nil {
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 1, "+:01", "", false); err == nil {
 		t.Error("extending past the neighbour's start = nil error, want an overlap error")
 	}
 	if got := entryByID(t, s, entries[0].ID); got.Duration != 3600 {
@@ -1346,7 +1387,7 @@ func TestModStaleNumber(t *testing.T) {
 	seedModDay(t, s)
 
 	var buf bytes.Buffer
-	err := cmdMod(&buf, s, nil, 7, "+:30", "", false, modNow, time.UTC)
+	err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 7, "+:30", "", false)
 	if !errors.Is(err, store.ErrNoEntryNum) {
 		t.Fatalf("err = %v, want ErrNoEntryNum", err)
 	}
@@ -1365,7 +1406,7 @@ func TestModNoEntries(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdMod(&buf, s, nil, 0, "+:30", "", false, modNow, time.UTC); err == nil {
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 0, "+:30", "", false); err == nil {
 		t.Fatal("mod on an empty store = nil error, want an error")
 	}
 }
@@ -1378,7 +1419,7 @@ func TestModInvalidTimesign(t *testing.T) {
 
 	for _, sign := range []string{"+:00", "10-9", "nonsense"} {
 		var buf bytes.Buffer
-		if err := cmdMod(&buf, s, nil, 1, sign, "", false, modNow, time.UTC); err == nil {
+		if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 1, sign, "", false); err == nil {
 			t.Errorf("mod %q = nil error, want an error", sign)
 		}
 	}
@@ -1406,7 +1447,7 @@ func TestModPushesBestEffort(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	if err := cmdMod(&buf, s, c, 2, "+:30", "", false, modNow, time.UTC); err != nil {
+	if err := cmdMod(env(&buf, s, c, modNow, time.UTC), 2, "+:30", "", false); err != nil {
 		t.Fatalf("mod: %v", err)
 	}
 	if method != http.MethodPut {
@@ -1434,7 +1475,7 @@ func TestModSyncFailureIsNonFatal(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	if err := cmdMod(&buf, s, c, 2, "+:30", "", false, modNow, time.UTC); err != nil {
+	if err := cmdMod(env(&buf, s, c, modNow, time.UTC), 2, "+:30", "", false); err != nil {
 		t.Fatalf("mod should not fail on a sync error: %v", err)
 	}
 	if !strings.Contains(buf.String(), "warning") {
@@ -1454,7 +1495,7 @@ func TestDelRemovesEntry(t *testing.T) {
 	entries := seedModDay(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdDel(&buf, s, nil, 1, modNow, time.UTC); err != nil {
+	if err := cmdDel(env(&buf, s, nil, modNow, time.UTC), 1); err != nil {
 		t.Fatalf("del: %v", err)
 	}
 	out := buf.String()
@@ -1464,23 +1505,23 @@ func TestDelRemovesEntry(t *testing.T) {
 		}
 	}
 
-	left, _ := s.EntriesBetween(testStart.Add(-24*time.Hour), testStart.Add(24*time.Hour))
+	left, _ := s.EntriesBetween(ctx, testStart.Add(-24*time.Hour), testStart.Add(24*time.Hour))
 	if len(left) != 1 || left[0].ID != entries[1].ID {
 		t.Fatalf("remaining entries = %+v, want only entry 2", left)
 	}
 	// The number now resolves to nothing rather than to another entry: entry 2
 	// keeps being entry 2 instead of sliding into the freed slot.
-	if _, err := s.EntryByNum(1, modNow); !errors.Is(err, store.ErrNoEntryNum) {
+	if _, err := s.EntryByNum(ctx, 1, modNow); !errors.Is(err, store.ErrNoEntryNum) {
 		t.Errorf("EntryByNum(1) after del = %v, want ErrNoEntryNum", err)
 	}
-	if got, err := s.EntryByNum(2, modNow); err != nil || got.ID != entries[1].ID {
+	if got, err := s.EntryByNum(ctx, 2, modNow); err != nil || got.ID != entries[1].ID {
 		t.Errorf("EntryByNum(2) after del = %+v err=%v, want the surviving entry %d",
 			got, err, entries[1].ID)
 	}
 }
 
 // TestDelMarksDeletedAndDirty pins the soft delete: the row survives, flagged
-// deleted and dirty with a fresh LWW clock, so sync.Push can DELETE it remotely
+// deleted and dirty with a fresh LWW clock, so togglsync.Push can DELETE it remotely
 // before dropping it.
 func TestDelMarksDeletedAndDirty(t *testing.T) {
 	s := newStore(t)
@@ -1488,10 +1529,10 @@ func TestDelMarksDeletedAndDirty(t *testing.T) {
 	entries := seedModDay(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdDel(&buf, s, nil, 2, modNow, time.UTC); err != nil {
+	if err := cmdDel(env(&buf, s, nil, modNow, time.UTC), 2); err != nil {
 		t.Fatalf("del: %v", err)
 	}
-	dirty, err := s.DirtyEntries()
+	dirty, err := s.DirtyEntries(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1524,7 +1565,7 @@ func TestDelStaleNumber(t *testing.T) {
 	seedModDay(t, s)
 
 	var buf bytes.Buffer
-	err := cmdDel(&buf, s, nil, 9, modNow, time.UTC)
+	err := cmdDel(env(&buf, s, nil, modNow, time.UTC), 9)
 	if !errors.Is(err, store.ErrNoEntryNum) {
 		t.Fatalf("err = %v, want ErrNoEntryNum", err)
 	}
@@ -1534,16 +1575,16 @@ func TestDelStaleNumber(t *testing.T) {
 	if buf.Len() != 0 {
 		t.Errorf("output = %q, want nothing written", buf.String())
 	}
-	if left, _ := s.EntriesBetween(testStart.Add(-24*time.Hour), testStart.Add(24*time.Hour)); len(left) != 2 {
+	if left, _ := s.EntriesBetween(ctx, testStart.Add(-24*time.Hour), testStart.Add(24*time.Hour)); len(left) != 2 {
 		t.Errorf("entries = %d, want both kept", len(left))
 	}
 
 	// Deleting the same entry twice hits the same path: the first delete
 	// retires the number, and it is not handed to the surviving entry.
-	if err := cmdDel(&buf, s, nil, 1, modNow, time.UTC); err != nil {
+	if err := cmdDel(env(&buf, s, nil, modNow, time.UTC), 1); err != nil {
 		t.Fatalf("del: %v", err)
 	}
-	if err := cmdDel(&buf, s, nil, 1, modNow, time.UTC); !errors.Is(err, store.ErrNoEntryNum) {
+	if err := cmdDel(env(&buf, s, nil, modNow, time.UTC), 1); !errors.Is(err, store.ErrNoEntryNum) {
 		t.Errorf("second del error = %v, want ErrNoEntryNum", err)
 	}
 }
@@ -1555,7 +1596,7 @@ func TestDelRequiresNumber(t *testing.T) {
 	seedModDay(t, s)
 
 	var buf bytes.Buffer
-	err := cmdDel(&buf, s, nil, 0, modNow, time.UTC)
+	err := cmdDel(env(&buf, s, nil, modNow, time.UTC), 0)
 	if err == nil || !strings.Contains(err.Error(), "usage: tg del") {
 		t.Fatalf("err = %v, want a usage error", err)
 	}
@@ -1577,7 +1618,7 @@ func TestDelPushesBestEffort(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	if err := cmdDel(&buf, s, c, 1, modNow, time.UTC); err != nil {
+	if err := cmdDel(env(&buf, s, c, modNow, time.UTC), 1); err != nil {
 		t.Fatalf("del: %v", err)
 	}
 	if method != http.MethodDelete {
@@ -1586,7 +1627,7 @@ func TestDelPushesBestEffort(t *testing.T) {
 	if !strings.Contains(path, "9001") {
 		t.Errorf("path = %s, want the entry's remote id 9001", path)
 	}
-	if dirty, _ := s.DirtyEntries(); len(dirty) != 0 {
+	if dirty, _ := s.DirtyEntries(ctx); len(dirty) != 0 {
 		t.Errorf("dirty entries = %+v, want the row dropped after the remote delete", dirty)
 	}
 }
@@ -1731,7 +1772,7 @@ func TestTasksCommand(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdTasks(&buf, s, false, nil, false); err != nil {
+	if err := cmdTasks(localEnv(&buf, s), false, nil, false); err != nil {
 		t.Fatalf("tasks: %v", err)
 	}
 	out := buf.String()
@@ -1744,10 +1785,10 @@ func TestTasksCommand(t *testing.T) {
 
 func TestTasksCommandAllIncludesInactive(t *testing.T) {
 	s := newStore(t)
-	if err := s.ReplaceProjects([]store.Project{{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true}}); err != nil {
+	if err := s.ReplaceProjects(ctx, []store.Project{{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ReplaceTasks([]store.Task{
+	if err := s.ReplaceTasks(ctx, []store.Task{
 		{ID: 10, WorkspaceID: 1, ProjectID: 1, Name: "Active task", Active: true},
 		{ID: 11, WorkspaceID: 1, ProjectID: 1, Name: "Retired task", Active: false},
 	}); err != nil {
@@ -1755,7 +1796,7 @@ func TestTasksCommandAllIncludesInactive(t *testing.T) {
 	}
 
 	var active bytes.Buffer
-	if err := cmdTasks(&active, s, false, nil, false); err != nil {
+	if err := cmdTasks(localEnv(&active, s), false, nil, false); err != nil {
 		t.Fatalf("tasks: %v", err)
 	}
 	if strings.Contains(active.String(), "Retired task") {
@@ -1763,7 +1804,7 @@ func TestTasksCommandAllIncludesInactive(t *testing.T) {
 	}
 
 	var all bytes.Buffer
-	if err := cmdTasks(&all, s, true, nil, false); err != nil {
+	if err := cmdTasks(localEnv(&all, s), true, nil, false); err != nil {
 		t.Fatalf("tasks --all: %v", err)
 	}
 	if !strings.Contains(all.String(), "Retired task") {
@@ -1777,7 +1818,7 @@ func TestTasksCommandProjectScope(t *testing.T) {
 
 	pid := int64(2) // Payments
 	var buf bytes.Buffer
-	if err := cmdTasks(&buf, s, false, &pid, false); err != nil {
+	if err := cmdTasks(localEnv(&buf, s), false, &pid, false); err != nil {
 		t.Fatalf("tasks: %v", err)
 	}
 	out := buf.String()
@@ -1796,7 +1837,7 @@ func TestGrepListsMatches(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdGrep(&buf, s, false, nil, false, "write", false); err != nil {
+	if err := cmdGrep(localEnv(&buf, s), false, nil, false, "write", false); err != nil {
 		t.Fatalf("grep: %v", err)
 	}
 	out := buf.String()
@@ -1817,7 +1858,7 @@ func TestGrepCaseInsensitive(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdGrep(&buf, s, false, nil, false, "CODE REVIEW", false); err != nil {
+	if err := cmdGrep(localEnv(&buf, s), false, nil, false, "CODE REVIEW", false); err != nil {
 		t.Fatalf("grep: %v", err)
 	}
 	if !strings.Contains(buf.String(), "Code review") {
@@ -1835,7 +1876,7 @@ func TestGrepExactDoesNotWin(t *testing.T) {
 	var buf bytes.Buffer
 	// "Fix" is an exact task name in the catalog; "Fix login bug" and
 	// "Payment fix" merely contain it, and all three must be listed.
-	if err := cmdGrep(&buf, s, false, nil, false, "fix", false); err != nil {
+	if err := cmdGrep(localEnv(&buf, s), false, nil, false, "fix", false); err != nil {
 		t.Fatalf("grep: %v", err)
 	}
 	out := buf.String()
@@ -1857,7 +1898,7 @@ func TestGrepFirstListsOneMatch(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdGrep(&buf, s, false, nil, true, "write", false); err != nil {
+	if err := cmdGrep(localEnv(&buf, s), false, nil, true, "write", false); err != nil {
 		t.Fatalf("grep -1: %v", err)
 	}
 	out := buf.String()
@@ -1879,7 +1920,7 @@ func TestGrepFirstStillFailsWithoutAMatch(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	err := cmdGrep(&buf, s, false, nil, true, "nothing here", false)
+	err := cmdGrep(localEnv(&buf, s), false, nil, true, "nothing here", false)
 	if err == nil || !strings.Contains(err.Error(), "no task matches") {
 		t.Errorf("err = %v, want a no-match error even with -1", err)
 	}
@@ -1890,7 +1931,7 @@ func TestGrepJoinsFragment(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdGrep(&buf, s, false, nil, false, "code review", false); err != nil {
+	if err := cmdGrep(localEnv(&buf, s), false, nil, false, "code review", false); err != nil {
 		t.Fatalf("grep: %v", err)
 	}
 	if !strings.Contains(buf.String(), "Code review") {
@@ -1904,7 +1945,7 @@ func TestGrepProjectScope(t *testing.T) {
 
 	pid := int64(2) // Payments
 	var buf bytes.Buffer
-	if err := cmdGrep(&buf, s, false, &pid, false, "fix", false); err != nil {
+	if err := cmdGrep(localEnv(&buf, s), false, &pid, false, "fix", false); err != nil {
 		t.Fatalf("grep: %v", err)
 	}
 	out := buf.String()
@@ -1918,10 +1959,10 @@ func TestGrepProjectScope(t *testing.T) {
 
 func TestGrepAllIncludesInactive(t *testing.T) {
 	s := newStore(t)
-	if err := s.ReplaceProjects([]store.Project{{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true}}); err != nil {
+	if err := s.ReplaceProjects(ctx, []store.Project{{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ReplaceTasks([]store.Task{
+	if err := s.ReplaceTasks(ctx, []store.Task{
 		{ID: 10, WorkspaceID: 1, ProjectID: 1, Name: "Active task", Active: true},
 		{ID: 11, WorkspaceID: 1, ProjectID: 1, Name: "Retired task", Active: false},
 	}); err != nil {
@@ -1929,7 +1970,7 @@ func TestGrepAllIncludesInactive(t *testing.T) {
 	}
 
 	var active bytes.Buffer
-	if err := cmdGrep(&active, s, false, nil, false, "task", false); err != nil {
+	if err := cmdGrep(localEnv(&active, s), false, nil, false, "task", false); err != nil {
 		t.Fatalf("grep: %v", err)
 	}
 	if strings.Contains(active.String(), "Retired task") {
@@ -1937,7 +1978,7 @@ func TestGrepAllIncludesInactive(t *testing.T) {
 	}
 
 	var all bytes.Buffer
-	if err := cmdGrep(&all, s, true, nil, false, "task", false); err != nil {
+	if err := cmdGrep(localEnv(&all, s), true, nil, false, "task", false); err != nil {
 		t.Fatalf("grep --all: %v", err)
 	}
 	if !strings.Contains(all.String(), "Retired task") {
@@ -1950,7 +1991,7 @@ func TestGrepNoMatch(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	err := cmdGrep(&buf, s, false, nil, false, "nothing here", false)
+	err := cmdGrep(localEnv(&buf, s), false, nil, false, "nothing here", false)
 	if err == nil {
 		t.Fatal("expected an error when nothing matches")
 	}
@@ -1970,7 +2011,7 @@ func TestGrepRequiresFragment(t *testing.T) {
 	// `tg tasks`.
 	for _, frag := range []string{"", "   "} {
 		var buf bytes.Buffer
-		err := cmdGrep(&buf, s, false, nil, false, frag, false)
+		err := cmdGrep(localEnv(&buf, s), false, nil, false, frag, false)
 		if err == nil || !strings.Contains(err.Error(), "usage: tg grep") {
 			t.Errorf("grep %q: err = %v, want a usage error", frag, err)
 		}
@@ -1982,7 +2023,7 @@ func TestGrepJSON(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdGrep(&buf, s, false, nil, false, "write", true); err != nil {
+	if err := cmdGrep(localEnv(&buf, s), false, nil, false, "write", true); err != nil {
 		t.Fatalf("grep --json: %v", err)
 	}
 	var got []struct {
@@ -2027,7 +2068,7 @@ func TestResolvePullProjectRequiresFragment(t *testing.T) {
 
 	// pull ignores TOGGL_PROJECT_ID, so a blank argument is a hard error that
 	// must NOT suggest the env var as a fallback.
-	_, err := resolvePullProject(s, "  ", false)
+	_, err := resolvePullProject(ctx, s, "  ", false)
 	if err == nil || !strings.Contains(err.Error(), "project-name argument") {
 		t.Errorf("err = %v, want a required-argument error", err)
 	}
@@ -2040,7 +2081,7 @@ func TestResolvePullProjectUnique(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	got, err := resolvePullProject(s, "back", false)
+	got, err := resolvePullProject(ctx, s, "back", false)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -2051,14 +2092,14 @@ func TestResolvePullProjectUnique(t *testing.T) {
 
 func TestResolvePullProjectAmbiguous(t *testing.T) {
 	s := newStore(t)
-	if err := s.ReplaceProjects([]store.Project{
+	if err := s.ReplaceProjects(ctx, []store.Project{
 		{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true},
 		{ID: 2, WorkspaceID: 1, Name: "Back office", Active: true},
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	_, err := resolvePullProject(s, "back", false)
+	_, err := resolvePullProject(ctx, s, "back", false)
 	if err == nil {
 		t.Fatal("expected ambiguity error")
 	}
@@ -2071,7 +2112,7 @@ func TestResolvePullProjectAmbiguous(t *testing.T) {
 
 	// With -1 the first candidate is taken instead: candidates are ordered by
 	// name then id, so "Back office" (2) wins over "Backend" (1).
-	got, err := resolvePullProject(s, "back", true)
+	got, err := resolvePullProject(ctx, s, "back", true)
 	if err != nil {
 		t.Fatalf("resolve -1: %v", err)
 	}
@@ -2086,10 +2127,10 @@ func TestResolvePullProjectFirstNeedsAMatch(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	if _, err := resolvePullProject(s, "nonexistent", true); err == nil {
+	if _, err := resolvePullProject(ctx, s, "nonexistent", true); err == nil {
 		t.Error("expected a no-match error even with -1")
 	}
-	if _, err := resolvePullProject(s, "  ", true); err == nil {
+	if _, err := resolvePullProject(ctx, s, "  ", true); err == nil {
 		t.Error("expected a required-argument error even with -1")
 	}
 }
@@ -2098,7 +2139,7 @@ func TestResolvePullProjectNone(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	_, err := resolvePullProject(s, "nonexistent", false)
+	_, err := resolvePullProject(ctx, s, "nonexistent", false)
 	if err == nil || !strings.Contains(err.Error(), "tg update") {
 		t.Errorf("err = %v, want suggestion to run `tg update`", err)
 	}
@@ -2109,7 +2150,7 @@ func TestResolvePullScopeUnscopedMeansAll(t *testing.T) {
 	seedCatalog(t, s)
 
 	// A blank argument means "pull every project": nil scope.
-	got, err := resolvePullScope(s, "   ", false)
+	got, err := resolvePullScope(ctx, s, "   ", false)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -2126,7 +2167,7 @@ func TestResolvePullScopeIgnoresEnv(t *testing.T) {
 	seedCatalog(t, s)
 
 	t.Setenv("TOGGL_PROJECT_ID", "2")
-	got, err := resolvePullScope(s, "", false)
+	got, err := resolvePullScope(ctx, s, "", false)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -2139,12 +2180,237 @@ func TestResolvePullScopeFragment(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	got, err := resolvePullScope(s, "pay", false)
+	got, err := resolvePullScope(ctx, s, "pay", false)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
 	if got == nil || *got != 2 {
 		t.Errorf("resolved = %v, want 2 (Payments)", got)
+	}
+}
+
+// --- push --------------------------------------------------------------------
+
+// pushNow is the reference instant the push tests below run at.
+var pushNow = time.Date(2026, 1, 2, 18, 0, 0, 0, time.UTC)
+
+// seedDirty inserts a dirty, finished entry with the given description, an hour
+// apart per index so the day's entries do not overlap.
+func seedDirty(t *testing.T, s *store.Store, i int, desc string) int64 {
+	t.Helper()
+	start := testStart.Add(time.Duration(i) * time.Hour)
+	stop := start.Add(30 * time.Minute)
+	id, err := s.CreateEntry(ctx, store.Entry{
+		WorkspaceID: 1, TaskID: p(10), Description: desc,
+		Start: start, Stop: &stop, Duration: 1800, UpdatedAt: stop, Dirty: true,
+	})
+	if err != nil {
+		t.Fatalf("seed dirty entry: %v", err)
+	}
+	return id
+}
+
+// TestPushReportsRejectedEntry verifies `tg push` no longer stops at the first
+// entry Toggl refuses: the rest of the queue is still sent, the summary counts
+// what got through, and the rejection is reported as the command's error (so the
+// exit status is non-zero) while the entry stays dirty for a later attempt.
+func TestPushReportsRejectedEntry(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var created int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		raw, _ := io.ReadAll(r.Body)
+		json.Unmarshal(raw, &body)
+		if body["description"] == "poison" {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":"task not in project"}`))
+			return
+		}
+		created++
+		fmt.Fprintf(w, `{"id":%d,"at":"2026-01-02T18:00:00Z"}`, 9200+created)
+	}))
+	defer srv.Close()
+	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+
+	seedDirty(t, s, 0, "first")
+	poisoned := seedDirty(t, s, 1, "poison")
+	seedDirty(t, s, 2, "last")
+
+	var buf bytes.Buffer
+	err := cmdPush(env(&buf, s, c, pushNow, time.UTC), false)
+	if err == nil {
+		t.Fatal("push = nil error, want the rejection reported")
+	}
+	if !strings.Contains(err.Error(), "task not in project") {
+		t.Errorf("err = %v, want the server's complaint", err)
+	}
+	// The summary is still printed: two entries did land.
+	if !strings.Contains(buf.String(), "Pushed: 2 created") {
+		t.Errorf("output = %q, want the successful entries summarized", buf.String())
+	}
+	if created != 2 {
+		t.Errorf("created = %d, want 2 (the rejection must not block the queue)", created)
+	}
+	dirty, _ := s.DirtyEntries(ctx)
+	if len(dirty) != 1 || dirty[0].ID != poisoned {
+		t.Fatalf("dirty = %+v, want only the rejected entry %d", dirty, poisoned)
+	}
+}
+
+// TestPushJSONListsFailures verifies --json reports the rejected entries in the
+// result rather than only in the error text.
+func TestPushJSONListsFailures(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`nope`))
+	}))
+	defer srv.Close()
+	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+
+	id := seedDirty(t, s, 0, "first")
+
+	var buf bytes.Buffer
+	if err := cmdPush(env(&buf, s, c, pushNow, time.UTC), true); err == nil {
+		t.Fatal("push = nil error, want the rejection reported")
+	}
+	var got struct {
+		Created int `json:"created"`
+		Failed  []struct {
+			EntryID int64  `json:"entry_id"`
+			Err     string `json:"error"`
+		} `json:"failed"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("json: %v (%s)", err, buf.String())
+	}
+	if got.Created != 0 || len(got.Failed) != 1 {
+		t.Fatalf("json = %+v, want one failure and nothing created", got)
+	}
+	if got.Failed[0].EntryID != id || !strings.Contains(got.Failed[0].Err, "nope") {
+		t.Errorf("failure = %+v, want entry %d and the server's message", got.Failed[0], id)
+	}
+}
+
+// --- credentials -------------------------------------------------------------
+
+// TestAddWorksUnauthenticated pins the offline behavior `add` now shares with
+// `mod`/`del`: with no credentials the entry is still recorded locally (dirty,
+// for a later `tg push`) instead of the command refusing to run, and its
+// workspace comes from the task's own catalog row since no config names one.
+func TestAddWorksUnauthenticated(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdAdd(unauthenticatedEnv(&buf, s, addNow, time.UTC), nil, false, "9-:30", "login", ""); err != nil {
+		t.Fatalf("add while unauthenticated: %v", err)
+	}
+	if !strings.Contains(buf.String(), "Added: Fix login bug") {
+		t.Errorf("output = %q, want the entry added", buf.String())
+	}
+	if strings.Contains(buf.String(), "warning") {
+		t.Errorf("output = %q, want no sync warning with no credentials", buf.String())
+	}
+	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	if !entries[0].Dirty {
+		t.Error("entry should stay dirty for a later push")
+	}
+	if entries[0].WorkspaceID != 1 {
+		t.Errorf("workspace_id = %d, want 1 from the task's catalog row", entries[0].WorkspaceID)
+	}
+}
+
+// TestAddUnknownWorkspaceIsRefused covers the one case `add` cannot recover
+// from: neither a config nor the catalog knows a workspace, so the entry could
+// never be pushed and the command says to run `tg auth`.
+func TestAddUnknownWorkspaceIsRefused(t *testing.T) {
+	s := newStore(t)
+	// A catalog row with no workspace, as only a hand-edited database has.
+	if err := s.ReplaceProjects(ctx, []store.Project{{ID: 1, Name: "Backend", Active: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceTasks(ctx, []store.Task{{ID: 10, ProjectID: 1, Name: "Fix login bug", Active: true}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	err := cmdAdd(unauthenticatedEnv(&buf, s, addNow, time.UTC), nil, false, "9-:30", "login", "")
+	if !errors.Is(err, config.ErrNotConfigured) {
+		t.Fatalf("err = %v, want config.ErrNotConfigured", err)
+	}
+	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	if len(entries) != 0 {
+		t.Errorf("entries = %+v, want nothing recorded", entries)
+	}
+}
+
+// TestSyncCommandsRequireCredentials verifies the commands that cannot do
+// anything locally say so uniformly — with the same "run `tg auth`" error a
+// missing config always produced — instead of tripping over a nil client.
+func TestSyncCommandsRequireCredentials(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name string
+		run  func(env *cmdEnv) error
+	}{
+		{"push", func(e *cmdEnv) error { return cmdPush(e, false) }},
+		{"pull", func(e *cmdEnv) error { return cmdPull(e, false, "", since, false) }},
+		{"update", func(e *cmdEnv) error { return cmdUpdate(e, p(1), false, "", since, false, false) }},
+		{"projects update", func(e *cmdEnv) error { return cmdUpdateProjects(e, false, false) }},
+		{"total", func(e *cmdEnv) error { return cmdTotal(e, false, "", since, false) }},
+	} {
+		var buf bytes.Buffer
+		err := tc.run(unauthenticatedEnv(&buf, s, pushNow, time.UTC))
+		if !errors.Is(err, config.ErrNotConfigured) {
+			t.Errorf("%s: err = %v, want config.ErrNotConfigured", tc.name, err)
+		}
+		if buf.Len() != 0 {
+			t.Errorf("%s: output = %q, want nothing written", tc.name, buf.String())
+		}
+	}
+}
+
+// TestLocalCommandsWorkUnauthenticated verifies the read-only and edit commands
+// keep working with no credentials, which is what local-first means here.
+func TestLocalCommandsWorkUnauthenticated(t *testing.T) {
+	s := newStore(t)
+	seedCatalog(t, s)
+	seedDirty(t, s, 0, "work")
+
+	for _, tc := range []struct {
+		name string
+		run  func(env *cmdEnv) error
+	}{
+		{"current", func(e *cmdEnv) error { return cmdCurrent(e, false) }},
+		{"today", func(e *cmdEnv) error { return cmdToday(e, 1, false, false) }},
+		{"daily", func(e *cmdEnv) error { return cmdDaily(e, dailyDefaultTarget, false, false) }},
+		{"tasks", func(e *cmdEnv) error { return cmdTasks(e, false, nil, false) }},
+		{"grep", func(e *cmdEnv) error { return cmdGrep(e, false, nil, false, "login", false) }},
+		{"projects", func(e *cmdEnv) error { return cmdProjects(e, false, false) }},
+		{"mod", func(e *cmdEnv) error { return cmdMod(e, 1, "", "renamed", true) }},
+		{"del", func(e *cmdEnv) error { return cmdDel(e, 1) }},
+	} {
+		var buf bytes.Buffer
+		// The fixture entry sits on testStart's day, so `now` must too for the
+		// per-day resolution mod/del use.
+		now := testStart.Add(6 * time.Hour)
+		if err := tc.run(unauthenticatedEnv(&buf, s, now, time.UTC)); err != nil {
+			t.Errorf("%s: err = %v, want it to work offline", tc.name, err)
+		}
+		if strings.Contains(buf.String(), "warning") {
+			t.Errorf("%s: output = %q, want no sync warning", tc.name, buf.String())
+		}
 	}
 }
 
@@ -2170,20 +2436,20 @@ func TestPullAllProjectsUnscoped(t *testing.T) {
 	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
 	// empty argument => pull every project.
-	if err := cmdPull(&buf, s, c, false, "", since, now, false); err != nil {
+	if err := cmdPull(env(&buf, s, c, now, time.UTC), false, "", since, false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	if !strings.Contains(buf.String(), "2 inserted") {
 		t.Errorf("output = %q, want 2 inserted", buf.String())
 	}
-	if got, _ := s.EntryByRemoteID(1); got == nil {
+	if got, _ := s.EntryByRemoteID(ctx, 1); got == nil {
 		t.Error("project 1 entry should be inserted")
 	}
-	if got, _ := s.EntryByRemoteID(2); got == nil {
+	if got, _ := s.EntryByRemoteID(ctx, 2); got == nil {
 		t.Error("project 2 entry should be inserted")
 	}
 	// A full (unscoped) pull advances the watermark.
-	if _, ok, _ := s.GetMeta(store.MetaLastPull); !ok {
+	if _, ok, _ := s.GetMeta(ctx, store.MetaLastPull); !ok {
 		t.Error("unscoped pull should advance last_pull")
 	}
 }
@@ -2210,17 +2476,17 @@ func TestPullScopedByFragment(t *testing.T) {
 	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
 	// "back" resolves to Backend (project 1); only its entry is reconciled.
-	if err := cmdPull(&buf, s, c, false, "back", since, now, false); err != nil {
+	if err := cmdPull(env(&buf, s, c, now, time.UTC), false, "back", since, false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
-	if got, _ := s.EntryByRemoteID(1); got == nil {
+	if got, _ := s.EntryByRemoteID(ctx, 1); got == nil {
 		t.Error("backend entry should be inserted")
 	}
-	if got, _ := s.EntryByRemoteID(2); got != nil {
+	if got, _ := s.EntryByRemoteID(ctx, 2); got != nil {
 		t.Error("payments entry should be ignored under a backend-scoped pull")
 	}
 	// A scoped pull is partial and must not advance the watermark.
-	if _, ok, _ := s.GetMeta(store.MetaLastPull); ok {
+	if _, ok, _ := s.GetMeta(ctx, store.MetaLastPull); ok {
 		t.Error("scoped pull should not advance last_pull")
 	}
 }
@@ -2252,22 +2518,22 @@ func TestPullIgnoresProjectEnv(t *testing.T) {
 	since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdPull(&buf, s, c, false, "", since, now, false); err != nil {
+	if err := cmdPull(env(&buf, s, c, now, time.UTC), false, "", since, false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	if !strings.Contains(buf.String(), "2 inserted") {
 		t.Errorf("output = %q, want 2 inserted (all projects)", buf.String())
 	}
 	// The env project's entry is pulled...
-	if got, _ := s.EntryByRemoteID(1); got == nil {
+	if got, _ := s.EntryByRemoteID(ctx, 1); got == nil {
 		t.Error("project 1 entry should be inserted")
 	}
 	// ...and so is the entry for a project other than TOGGL_PROJECT_ID.
-	if got, _ := s.EntryByRemoteID(2); got == nil {
+	if got, _ := s.EntryByRemoteID(ctx, 2); got == nil {
 		t.Error("project 2 entry should be inserted despite TOGGL_PROJECT_ID=1")
 	}
 	// Ignoring the env means this is a full pull: the watermark advances.
-	if _, ok, _ := s.GetMeta(store.MetaLastPull); !ok {
+	if _, ok, _ := s.GetMeta(ctx, store.MetaLastPull); !ok {
 		t.Error("pull ignoring env should be a full pull and advance last_pull")
 	}
 }
@@ -2320,7 +2586,7 @@ func TestTotalMatchesLocalCatalogByID(t *testing.T) {
 	c, body := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, s, c, 1, false, "login", totalSince, totalNow, time.UTC, false); err != nil {
+	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "login", totalSince, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	out := buf.String()
@@ -2353,7 +2619,7 @@ func TestTotalJoinsFragment(t *testing.T) {
 
 	var buf bytes.Buffer
 	// runTotal joins the positionals with a space before calling cmdTotal.
-	if err := cmdTotal(&buf, s, c, 1, false, strings.Join([]string{"write", "docs"}, " "), totalSince, totalNow, time.UTC, false); err != nil {
+	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, strings.Join([]string{"write", "docs"}, " "), totalSince, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	out := buf.String()
@@ -2375,7 +2641,7 @@ func TestTotalSinceOverridesStart(t *testing.T) {
 
 	since := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, s, c, 1, false, "login", since, totalNow, time.UTC, false); err != nil {
+	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "login", since, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	if (*body)["start_date"] != "2025-01-01" {
@@ -2394,7 +2660,7 @@ func TestTotalFragmentMatchingMany(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, s, c, 1, false, "write", totalSince, totalNow, time.UTC, false); err != nil {
+	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "write", totalSince, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	out := buf.String()
@@ -2415,7 +2681,7 @@ func TestTotalFirstMatchOnly(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, s, c, 1, true, "write", totalSince, totalNow, time.UTC, false); err != nil {
+	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), true, "write", totalSince, false); err != nil {
 		t.Fatalf("total -1: %v", err)
 	}
 	out := buf.String()
@@ -2441,7 +2707,7 @@ func TestTotalExactNameWins(t *testing.T) {
 	var buf bytes.Buffer
 	// Task 11 ("Fix") has no tracked time in the report, so the exact match
 	// winning is what makes this an empty result rather than "Fix login bug".
-	err := cmdTotal(&buf, s, c, 1, false, "fix", totalSince, totalNow, time.UTC, false)
+	err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "fix", totalSince, false)
 	if err == nil || !strings.Contains(err.Error(), "no tracked time") {
 		t.Errorf("err = %v, want a no-tracked-time error for the exact match", err)
 	}
@@ -2456,7 +2722,7 @@ func TestTotalNoFragmentListsAll(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, s, c, 1, false, "", totalSince, totalNow, time.UTC, false); err != nil {
+	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "", totalSince, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	out := buf.String()
@@ -2480,7 +2746,7 @@ func TestTotalUncataloguedNotMatchable(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	err := cmdTotal(&buf, s, c, 1, false, "legacy", totalSince, totalNow, time.UTC, false)
+	err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "legacy", totalSince, false)
 	if err == nil || !strings.Contains(err.Error(), "no task matches") {
 		t.Errorf("err = %v, want a no-match error for an API-only title", err)
 	}
@@ -2492,7 +2758,7 @@ func TestTotalNoMatches(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	err := cmdTotal(&buf, s, c, 1, false, "nonexistent", totalSince, totalNow, time.UTC, false)
+	err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "nonexistent", totalSince, false)
 	if err == nil || !strings.Contains(err.Error(), "no task matches") {
 		t.Errorf("err = %v, want a no-match error", err)
 	}
@@ -2510,7 +2776,7 @@ func TestTotalMatchedButUntracked(t *testing.T) {
 
 	var buf bytes.Buffer
 	// "payment" matches task 20, which the report does not mention.
-	err := cmdTotal(&buf, s, c, 1, false, "payment", totalSince, totalNow, time.UTC, false)
+	err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "payment", totalSince, false)
 	if err == nil || !strings.Contains(err.Error(), "no tracked time") {
 		t.Errorf("err = %v, want a no-tracked-time error", err)
 	}
@@ -2522,7 +2788,7 @@ func TestTotalJSON(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(&buf, s, c, 1, false, "write", totalSince, totalNow, time.UTC, true); err != nil {
+	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "write", totalSince, true); err != nil {
 		t.Fatalf("total --json: %v", err)
 	}
 	var got struct {
@@ -2591,7 +2857,7 @@ func TestResolveAddProjectUnique(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	got, err := resolveAddProject(s, "pay", false)
+	got, err := resolveAddProject(ctx, s, "pay", false)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -2604,7 +2870,7 @@ func TestResolveAddProjectNone(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	_, err := resolveAddProject(s, "nonexistent", false)
+	_, err := resolveAddProject(ctx, s, "nonexistent", false)
 	if err == nil || !strings.Contains(err.Error(), "tg update") {
 		t.Errorf("err = %v, want suggestion to run `tg update`", err)
 	}
@@ -2615,7 +2881,7 @@ func TestResolveUpdateProjectEnvWins(t *testing.T) {
 	seedCatalog(t, s)
 
 	pid := int64(2)
-	got, err := resolveUpdateProject(s, &pid, "backend", false)
+	got, err := resolveUpdateProject(ctx, s, &pid, "backend", false)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -2628,7 +2894,7 @@ func TestResolveUpdateProjectRequiresScope(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	_, err := resolveUpdateProject(s, nil, "  ", false)
+	_, err := resolveUpdateProject(ctx, s, nil, "  ", false)
 	if err == nil || !strings.Contains(err.Error(), "TOGGL_PROJECT_ID") {
 		t.Errorf("err = %v, want required-argument error mentioning TOGGL_PROJECT_ID", err)
 	}
@@ -2675,7 +2941,7 @@ func TestUpdateScopedToOneProject(t *testing.T) {
 
 	pid := int64(2)
 	var buf bytes.Buffer
-	if err := cmdUpdate(&buf, s, c, 1, &pid, false, "", updateSince, updateNow, false, false); err != nil {
+	if err := cmdUpdate(env(&buf, s, c, updateNow, time.UTC), &pid, false, "", updateSince, false, false); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	// update is quiet: no progress or summary lines in human mode.
@@ -2695,13 +2961,13 @@ func TestUpdateScopedToOneProject(t *testing.T) {
 
 	// Project 2's tasks were replaced with the fetched one...
 	p2 := int64(2)
-	scoped, _ := s.ListTasks(false, &p2)
+	scoped, _ := s.ListTasks(ctx, false, &p2)
 	if len(scoped) != 1 || scoped[0].ID != 21 {
 		t.Errorf("project 2 tasks = %+v, want only id 21", scoped)
 	}
 	// ...while project 1's cached tasks are untouched.
 	p1 := int64(1)
-	backend, _ := s.ListTasks(false, &p1)
+	backend, _ := s.ListTasks(ctx, false, &p1)
 	if len(backend) == 0 {
 		t.Error("project 1 tasks should be untouched by a project-2 update")
 	}
@@ -2733,7 +2999,7 @@ func TestUpdatePullsRecentEntries(t *testing.T) {
 
 	pid := int64(2)
 	var buf bytes.Buffer
-	if err := cmdUpdate(&buf, s, c, 1, &pid, false, "", updateSince, updateNow, false, false); err != nil {
+	if err := cmdUpdate(env(&buf, s, c, updateNow, time.UTC), &pid, false, "", updateSince, false, false); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 
@@ -2742,14 +3008,14 @@ func TestUpdatePullsRecentEntries(t *testing.T) {
 		t.Errorf("since = %q, want %q", gotSince, want)
 	}
 	// Only the scoped project's entry landed locally.
-	if got, _ := s.EntryByRemoteID(2); got == nil {
+	if got, _ := s.EntryByRemoteID(ctx, 2); got == nil {
 		t.Error("payments entry should be inserted by a project-2 update")
 	}
-	if got, _ := s.EntryByRemoteID(1); got != nil {
+	if got, _ := s.EntryByRemoteID(ctx, 1); got != nil {
 		t.Error("backend entry should be ignored by a project-2 update")
 	}
 	// A scoped pull is partial: the watermark must stay untouched.
-	if _, ok, _ := s.GetMeta(store.MetaLastPull); ok {
+	if _, ok, _ := s.GetMeta(ctx, store.MetaLastPull); ok {
 		t.Error("update should not advance last_pull (it is a scoped pull)")
 	}
 }
@@ -2774,7 +3040,7 @@ func TestUpdateJSONStillReports(t *testing.T) {
 
 	pid := int64(2)
 	var buf bytes.Buffer
-	if err := cmdUpdate(&buf, s, c, 1, &pid, false, "", updateSince, updateNow, false, true); err != nil {
+	if err := cmdUpdate(env(&buf, s, c, updateNow, time.UTC), &pid, false, "", updateSince, false, true); err != nil {
 		t.Fatalf("update --json: %v", err)
 	}
 	out := buf.String()
@@ -2962,7 +3228,7 @@ func TestUpdateResolvesProjectByFragment(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	if err := cmdUpdate(&buf, s, c, 1, nil, false, "pay", updateSince, updateNow, false, false); err != nil {
+	if err := cmdUpdate(env(&buf, s, c, updateNow, time.UTC), nil, false, "pay", updateSince, false, false); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	for _, p := range paths {
@@ -2971,15 +3237,15 @@ func TestUpdateResolvesProjectByFragment(t *testing.T) {
 		}
 	}
 	p2 := int64(2)
-	scoped, _ := s.ListTasks(false, &p2)
+	scoped, _ := s.ListTasks(ctx, false, &p2)
 	if len(scoped) != 1 || scoped[0].ID != 21 {
 		t.Errorf("project 2 tasks = %+v, want only id 21", scoped)
 	}
 	// The entry pull was scoped to the resolved project too.
-	if got, _ := s.EntryByRemoteID(2); got == nil {
+	if got, _ := s.EntryByRemoteID(ctx, 2); got == nil {
 		t.Error("payments entry should be inserted")
 	}
-	if got, _ := s.EntryByRemoteID(1); got != nil {
+	if got, _ := s.EntryByRemoteID(ctx, 1); got != nil {
 		t.Error("backend entry should be ignored by a payments-scoped update")
 	}
 }
@@ -2990,7 +3256,7 @@ func TestUpdateResolvesProjectByFragment(t *testing.T) {
 func TestUpdateAmbiguousProjectFragment(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
-	if err := s.PutProject(store.Project{
+	if err := s.PutProject(ctx, store.Project{
 		ID: 3, WorkspaceID: 1, Name: "Backend API", Active: true,
 	}); err != nil {
 		t.Fatal(err)
@@ -3004,7 +3270,7 @@ func TestUpdateAmbiguousProjectFragment(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	err := cmdUpdate(&buf, s, c, 1, nil, false, "back", updateSince, updateNow, false, false)
+	err := cmdUpdate(env(&buf, s, c, updateNow, time.UTC), nil, false, "back", updateSince, false, false)
 	if err == nil {
 		t.Fatal("update: expected an ambiguous-fragment error")
 	}
@@ -3015,7 +3281,7 @@ func TestUpdateAmbiguousProjectFragment(t *testing.T) {
 	}
 	// An exact (case-insensitive) name still wins over the substring matches,
 	// so the ambiguity is escapable without reaching for TOGGL_PROJECT_ID.
-	got, err := resolveUpdateProject(s, nil, "backend", false)
+	got, err := resolveUpdateProject(ctx, s, nil, "backend", false)
 	if err != nil {
 		t.Fatalf("resolve exact name: %v", err)
 	}
@@ -3030,7 +3296,7 @@ func TestUpdateAmbiguousProjectFragment(t *testing.T) {
 func TestUpdateAmbiguousProjectFragmentFirst(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
-	if err := s.PutProject(store.Project{
+	if err := s.PutProject(ctx, store.Project{
 		ID: 3, WorkspaceID: 1, Name: "Backend API", Active: true,
 	}); err != nil {
 		t.Fatal(err)
@@ -3053,14 +3319,14 @@ func TestUpdateAmbiguousProjectFragmentFirst(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	if err := cmdUpdate(&buf, s, c, 1, nil, true, "back", updateSince, updateNow, false, false); err != nil {
+	if err := cmdUpdate(env(&buf, s, c, updateNow, time.UTC), nil, true, "back", updateSince, false, false); err != nil {
 		t.Fatalf("update -1: %v", err)
 	}
 	if len(paths) == 0 {
 		t.Fatal("update -1 made no requests")
 	}
 	p1 := int64(1)
-	tasks, _ := s.ListTasks(false, &p1)
+	tasks, _ := s.ListTasks(ctx, false, &p1)
 	if len(tasks) != 1 || tasks[0].ID != 15 {
 		t.Errorf("project 1 tasks = %+v, want only id 15 (Backend was refreshed)", tasks)
 	}
@@ -3186,7 +3452,7 @@ func TestPullAllFlagAliases(t *testing.T) {
 func TestPullTodayWindowKeepsStaleWatermark(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
-	if err := s.SetMeta(store.MetaLastPull, "2026-01-01T09:00:00Z"); err != nil {
+	if err := s.SetMeta(ctx, store.MetaLastPull, "2026-01-01T09:00:00Z"); err != nil {
 		t.Fatalf("seed watermark: %v", err)
 	}
 
@@ -3199,10 +3465,10 @@ func TestPullTodayWindowKeepsStaleWatermark(t *testing.T) {
 	now := time.Date(2026, 1, 5, 12, 0, 0, 0, time.UTC)
 	since := startOfDay(now, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdPull(&buf, s, c, false, "", since, now, false); err != nil {
+	if err := cmdPull(env(&buf, s, c, now, time.UTC), false, "", since, false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
-	v, _, _ := s.GetMeta(store.MetaLastPull)
+	v, _, _ := s.GetMeta(ctx, store.MetaLastPull)
 	if v != "2026-01-01T09:00:00Z" {
 		t.Errorf("last_pull = %q, want the untouched watermark", v)
 	}
@@ -3229,7 +3495,7 @@ func TestProjectsUpdateSyncsWholeWorkspace(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	if err := cmdUpdateProjects(&buf, s, c, 1, false, false); err != nil {
+	if err := cmdUpdateProjects(apiEnv(&buf, s, c), false, false); err != nil {
 		t.Fatalf("projects update: %v", err)
 	}
 	if !strings.Contains(buf.String(), "2 projects") {
@@ -3245,7 +3511,7 @@ func TestProjectsUpdateSyncsWholeWorkspace(t *testing.T) {
 
 	// The fetched project was added and the pre-existing project 1 (Backend,
 	// not in the response) is left untouched by the upsert.
-	projects, _ := s.ListProjects(false)
+	projects, _ := s.ListProjects(ctx, false)
 	names := map[string]bool{}
 	for _, p := range projects {
 		names[p.Name] = true
@@ -3258,7 +3524,7 @@ func TestProjectsUpdateSyncsWholeWorkspace(t *testing.T) {
 
 	// Cached tasks are untouched: projects update never syncs tasks.
 	p1 := int64(1)
-	backend, _ := s.ListTasks(false, &p1)
+	backend, _ := s.ListTasks(ctx, false, &p1)
 	if len(backend) == 0 {
 		t.Error("project 1 tasks should be untouched by projects update")
 	}
@@ -3274,7 +3540,7 @@ func TestProjectsUpdateJSON(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	if err := cmdUpdateProjects(&buf, s, c, 1, false, true); err != nil {
+	if err := cmdUpdateProjects(apiEnv(&buf, s, c), false, true); err != nil {
 		t.Fatalf("projects update --json: %v", err)
 	}
 	if !strings.Contains(buf.String(), `"projects":1`) {
@@ -3287,7 +3553,7 @@ func TestProjectsCommand(t *testing.T) {
 	seedCatalog(t, s)
 
 	var buf bytes.Buffer
-	if err := cmdProjects(&buf, s, false, false); err != nil {
+	if err := cmdProjects(localEnv(&buf, s), false, false); err != nil {
 		t.Fatalf("projects: %v", err)
 	}
 	out := buf.String()
@@ -3301,10 +3567,10 @@ func TestProjectsCommand(t *testing.T) {
 // seedSampleDay mirrors the fixture behind today.txt / current.txt goldens.
 func seedSampleDay(t *testing.T, s *store.Store) (now time.Time, loc *time.Location) {
 	t.Helper()
-	if err := s.ReplaceProjects([]store.Project{{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true}}); err != nil {
+	if err := s.ReplaceProjects(ctx, []store.Project{{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ReplaceTasks([]store.Task{
+	if err := s.ReplaceTasks(ctx, []store.Task{
 		{ID: 10, WorkspaceID: 1, ProjectID: 1, Name: "Fix login bug", Active: true},
 		{ID: 12, WorkspaceID: 1, ProjectID: 1, Name: "Code review", Active: true},
 	}); err != nil {
@@ -3313,13 +3579,13 @@ func seedSampleDay(t *testing.T, s *store.Store) (now time.Time, loc *time.Locat
 	start1 := time.Date(2026, 1, 2, 9, 15, 0, 0, time.UTC)
 	stop1 := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
 	start2 := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
-	if _, err := s.CreateEntry(store.Entry{
+	if _, err := s.CreateEntry(ctx, store.Entry{
 		WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
 		Start: start1, Stop: &stop1, Duration: 4500, UpdatedAt: stop1,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CreateEntry(store.Entry{
+	if _, err := s.CreateEntry(ctx, store.Entry{
 		WorkspaceID: 1, ProjectID: p(1), TaskID: p(12),
 		Start: start2, Duration: -1, UpdatedAt: start2,
 	}); err != nil {
@@ -3334,7 +3600,7 @@ func TestTodayCommandGolden(t *testing.T) {
 	s := newStore(t)
 	now, loc := seedSampleDay(t, s)
 	var buf bytes.Buffer
-	if err := cmdToday(&buf, s, now, loc, 1, false, false); err != nil {
+	if err := cmdToday(env(&buf, s, nil, now, loc), 1, false, false); err != nil {
 		t.Fatalf("today: %v", err)
 	}
 	assertGolden(t, "today.txt", buf.String())
@@ -3348,7 +3614,7 @@ func TestTodayCommandNumbers(t *testing.T) {
 	s := newStore(t)
 	now, loc := seedSampleDay(t, s)
 
-	entries, err := s.EntriesBetween(startOfDay(now, loc), startOfDay(now, loc).Add(24*time.Hour))
+	entries, err := s.EntriesBetween(ctx, startOfDay(now, loc), startOfDay(now, loc).Add(24*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3357,11 +3623,11 @@ func TestTodayCommandNumbers(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := cmdToday(&buf, s, now, loc, 1, false, false); err != nil {
+	if err := cmdToday(env(&buf, s, nil, now, loc), 1, false, false); err != nil {
 		t.Fatalf("today: %v", err)
 	}
 	for i, e := range entries {
-		got, err := s.EntryByNum(i+1, now)
+		got, err := s.EntryByNum(ctx, i+1, now)
 		if err != nil {
 			t.Fatalf("EntryByNum(%d): %v", i+1, err)
 		}
@@ -3369,7 +3635,7 @@ func TestTodayCommandNumbers(t *testing.T) {
 			t.Errorf("EntryByNum(%d).ID = %d, want %d", i+1, got.ID, e.ID)
 		}
 	}
-	if _, err := s.EntryByNum(3, now); !errors.Is(err, store.ErrNoEntryNum) {
+	if _, err := s.EntryByNum(ctx, 3, now); !errors.Is(err, store.ErrNoEntryNum) {
 		t.Errorf("EntryByNum(3) error = %v, want ErrNoEntryNum", err)
 	}
 
@@ -3378,7 +3644,7 @@ func TestTodayCommandNumbers(t *testing.T) {
 		t.Errorf("listing missing leading entry numbers:\n%s", buf.String())
 	}
 	buf.Reset()
-	if err := cmdToday(&buf, s, now, loc, 1, true, false); err != nil {
+	if err := cmdToday(env(&buf, s, nil, now, loc), 1, true, false); err != nil {
 		t.Fatalf("today --json: %v", err)
 	}
 	if !strings.Contains(buf.String(), `"num":1`) || !strings.Contains(buf.String(), `"num":2`) {
@@ -3387,11 +3653,11 @@ func TestTodayCommandNumbers(t *testing.T) {
 
 	// Deleting the first entry leaves the second one addressable as 2: the
 	// listing shows the surviving numbers, gap and all.
-	if err := cmdDel(io.Discard, s, nil, 1, now, loc); err != nil {
+	if err := cmdDel(env(io.Discard, s, nil, now, loc), 1); err != nil {
 		t.Fatalf("del: %v", err)
 	}
 	buf.Reset()
-	if err := cmdToday(&buf, s, now, loc, 1, false, false); err != nil {
+	if err := cmdToday(env(&buf, s, nil, now, loc), 1, false, false); err != nil {
 		t.Fatalf("today after del: %v", err)
 	}
 	if !strings.Contains(buf.String(), "2  10:30-") {
@@ -3402,13 +3668,13 @@ func TestTodayCommandNumbers(t *testing.T) {
 	// make another day's numbers resolve.
 	empty := now.AddDate(0, 0, 1)
 	buf.Reset()
-	if err := cmdToday(&buf, s, empty, loc, 1, false, false); err != nil {
+	if err := cmdToday(env(&buf, s, nil, empty, loc), 1, false, false); err != nil {
 		t.Fatalf("today (empty day): %v", err)
 	}
-	if _, err := s.EntryByNum(2, empty); !errors.Is(err, store.ErrNoEntryNum) {
+	if _, err := s.EntryByNum(ctx, 2, empty); !errors.Is(err, store.ErrNoEntryNum) {
 		t.Errorf("EntryByNum(2) on an empty day = %v, want ErrNoEntryNum", err)
 	}
-	if got, err := s.EntryByNum(2, now); err != nil || got.ID != entries[1].ID {
+	if got, err := s.EntryByNum(ctx, 2, now); err != nil || got.ID != entries[1].ID {
 		t.Errorf("EntryByNum(2) = %+v err=%v, want the number still live on its own day", got, err)
 	}
 }
@@ -3422,7 +3688,7 @@ func TestTodayCommandMultiDayGrouping(t *testing.T) {
 
 	mk := func(start time.Time) {
 		stop := start.Add(time.Hour)
-		if _, err := s.CreateEntry(store.Entry{
+		if _, err := s.CreateEntry(ctx, store.Entry{
 			WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
 			Start: start, Stop: &stop, Duration: 3600, UpdatedAt: stop,
 		}); err != nil {
@@ -3437,7 +3703,7 @@ func TestTodayCommandMultiDayGrouping(t *testing.T) {
 
 	now := today.Add(3 * time.Hour)
 	var buf bytes.Buffer
-	if err := cmdToday(&buf, s, now, time.UTC, 2, false, false); err != nil {
+	if err := cmdToday(env(&buf, s, nil, now, time.UTC), 2, false, false); err != nil {
 		t.Fatalf("today --days 2: %v", err)
 	}
 	got := buf.String()
@@ -3451,7 +3717,7 @@ func TestTodayCommandMultiDayGrouping(t *testing.T) {
 	if strings.Count(got, "1  09:00-10:00") != 2 {
 		t.Errorf("want each day to start numbering at 1:\n%s", got)
 	}
-	if e, err := s.EntryByNum(1, now); err != nil || !e.Start.Equal(today) {
+	if e, err := s.EntryByNum(ctx, 1, now); err != nil || !e.Start.Equal(today) {
 		t.Errorf("EntryByNum(1, today) = %+v err=%v, want today's entry", e, err)
 	}
 }
@@ -3465,7 +3731,7 @@ func TestTodayCommandTrailingGap(t *testing.T) {
 
 	start := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	stop := time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)
-	if _, err := s.CreateEntry(store.Entry{
+	if _, err := s.CreateEntry(ctx, store.Entry{
 		WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
 		Start: start, Stop: &stop, Duration: 3600, UpdatedAt: stop,
 	}); err != nil {
@@ -3474,7 +3740,7 @@ func TestTodayCommandTrailingGap(t *testing.T) {
 
 	now := time.Date(2026, 1, 2, 10, 25, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdToday(&buf, s, now, time.UTC, 1, false, false); err != nil {
+	if err := cmdToday(env(&buf, s, nil, now, time.UTC), 1, false, false); err != nil {
 		t.Fatalf("today: %v", err)
 	}
 	want := "1  09:00-10:00 1h00m  Fix login bug     [Backend]\n" +
@@ -3494,7 +3760,7 @@ func seedDailyMonth(t *testing.T, s *store.Store, days map[int]time.Duration) {
 	for day, d := range days {
 		start := time.Date(2026, 1, day, 9, 0, 0, 0, time.UTC)
 		stop := start.Add(d)
-		if _, err := s.CreateEntry(store.Entry{
+		if _, err := s.CreateEntry(ctx, store.Entry{
 			WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
 			Start: start, Stop: &stop, Duration: int64(d / time.Second), UpdatedAt: stop,
 		}); err != nil {
@@ -3514,7 +3780,7 @@ func TestDailySumsPerDay(t *testing.T) {
 	// Two entries on 2026-01-05 (8h30m together) and one on 2026-01-06 (7h15m).
 	mk := func(start time.Time, d time.Duration) {
 		stop := start.Add(d)
-		if _, err := s.CreateEntry(store.Entry{
+		if _, err := s.CreateEntry(ctx, store.Entry{
 			WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
 			Start: start, Stop: &stop, Duration: int64(d / time.Second), UpdatedAt: stop,
 		}); err != nil {
@@ -3527,7 +3793,7 @@ func TestDailySumsPerDay(t *testing.T) {
 
 	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false, false); err != nil {
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, false); err != nil {
 		t.Fatalf("daily: %v", err)
 	}
 	want := "Mon 2026-01-05  8h30m   +0:30\n" +
@@ -3548,7 +3814,7 @@ func TestDailyCoversWholeMonth(t *testing.T) {
 
 	mk := func(day time.Time) {
 		stop := day.Add(time.Hour)
-		if _, err := s.CreateEntry(store.Entry{
+		if _, err := s.CreateEntry(ctx, store.Entry{
 			WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
 			Start: day, Stop: &stop, Duration: 3600, UpdatedAt: stop,
 		}); err != nil {
@@ -3562,7 +3828,7 @@ func TestDailyCoversWholeMonth(t *testing.T) {
 
 	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false, false); err != nil {
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, false); err != nil {
 		t.Fatalf("daily: %v", err)
 	}
 	got := buf.String()
@@ -3592,7 +3858,7 @@ func TestDailyGreysUpcomingDays(t *testing.T) {
 	now := time.Date(2026, 1, 20, 18, 0, 0, 0, time.UTC)
 
 	var buf bytes.Buffer
-	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false, true); err != nil {
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, true); err != nil {
 		t.Fatalf("daily: %v", err)
 	}
 	want := "Mon 2026-01-19  8h00m   +0:00\n" +
@@ -3606,7 +3872,7 @@ func TestDailyGreysUpcomingDays(t *testing.T) {
 
 	// --json is a data shape, so it stays free of escapes even on a terminal.
 	buf.Reset()
-	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, true, true); err != nil {
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, true, true); err != nil {
 		t.Fatalf("daily --json: %v", err)
 	}
 	if strings.Contains(buf.String(), "\x1b") {
@@ -3633,7 +3899,7 @@ func TestDailyTargetFlag(t *testing.T) {
 	}
 	for _, c := range cases {
 		var buf bytes.Buffer
-		if err := cmdDaily(&buf, s, now, time.UTC, c.target, false, false); err != nil {
+		if err := cmdDaily(env(&buf, s, nil, now, time.UTC), c.target, false, false); err != nil {
 			t.Fatalf("daily -t %v: %v", c.target, err)
 		}
 		got := buf.String()
@@ -3656,7 +3922,7 @@ func TestDailyRejectsNegativeTarget(t *testing.T) {
 	seedDailyMonth(t, s, map[int]time.Duration{5: 8 * time.Hour})
 	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	err := cmdDaily(&buf, s, now, time.UTC, -1, false, false)
+	err := cmdDaily(env(&buf, s, nil, now, time.UTC), -1, false, false)
 	if err == nil {
 		t.Fatalf("daily -t -1: expected an error, got %q", buf.String())
 	}
@@ -3672,7 +3938,7 @@ func TestDailyCountsRunningEntryLive(t *testing.T) {
 	s := newStore(t)
 	seedCatalog(t, s)
 	start := time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC)
-	if _, err := s.CreateEntry(store.Entry{
+	if _, err := s.CreateEntry(ctx, store.Entry{
 		WorkspaceID: 1, ProjectID: p(1), TaskID: p(12),
 		Start: start, Duration: -1, UpdatedAt: start,
 	}); err != nil {
@@ -3680,7 +3946,7 @@ func TestDailyCountsRunningEntryLive(t *testing.T) {
 	}
 	now := time.Date(2026, 1, 5, 11, 30, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false, false); err != nil {
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, false); err != nil {
 		t.Fatalf("daily: %v", err)
 	}
 	want := "Mon 2026-01-05  2h30m*  -5:30\n" +
@@ -3700,11 +3966,11 @@ func TestDailySkipsDeletedEntries(t *testing.T) {
 	now := time.Date(2026, 1, 6, 20, 0, 0, 0, time.UTC)
 
 	// Entry 1 of 2026-01-06 is today's only entry, so `tg del 1` removes it.
-	if err := cmdDel(io.Discard, s, nil, 1, now, time.UTC); err != nil {
+	if err := cmdDel(env(io.Discard, s, nil, now, time.UTC), 1); err != nil {
 		t.Fatalf("del: %v", err)
 	}
 	var buf bytes.Buffer
-	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false, false); err != nil {
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, false); err != nil {
 		t.Fatalf("daily: %v", err)
 	}
 	got := buf.String()
@@ -3723,7 +3989,7 @@ func TestDailyEmptyMonth(t *testing.T) {
 	seedCatalog(t, s)
 	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, false, false); err != nil {
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, false); err != nil {
 		t.Fatalf("daily: %v", err)
 	}
 	if got := buf.String(); got != "No entries this month.\n" {
@@ -3742,7 +4008,7 @@ func TestDailyJSON(t *testing.T) {
 	})
 	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdDaily(&buf, s, now, time.UTC, dailyDefaultTarget, true, false); err != nil {
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, true, false); err != nil {
 		t.Fatalf("daily --json: %v", err)
 	}
 	var got dailyJSON
@@ -3796,7 +4062,7 @@ func TestCurrentCommandGolden(t *testing.T) {
 	s := newStore(t)
 	now, loc := seedSampleDay(t, s)
 	var buf bytes.Buffer
-	if err := cmdCurrent(&buf, s, now, loc, false); err != nil {
+	if err := cmdCurrent(env(&buf, s, nil, now, loc), false); err != nil {
 		t.Fatalf("current: %v", err)
 	}
 	assertGolden(t, "current.txt", buf.String())
@@ -3817,14 +4083,14 @@ func TestCurrentCommandLastEntryAndGap(t *testing.T) {
 		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(10), Start: first, Stop: &firstStop, Duration: 4500, UpdatedAt: firstStop},
 		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(12), Start: last, Stop: &lastStop, Duration: 1800, UpdatedAt: lastStop},
 	} {
-		if _, err := s.CreateEntry(e); err != nil {
+		if _, err := s.CreateEntry(ctx, e); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	now := time.Date(2026, 1, 2, 11, 25, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdCurrent(&buf, s, now, time.UTC, false); err != nil {
+	if err := cmdCurrent(env(&buf, s, nil, now, time.UTC), false); err != nil {
 		t.Fatalf("current: %v", err)
 	}
 	want := "Code review [Backend] 10:30-11:00 (gap 0h25m) Today: 1h45m\n"
@@ -3834,7 +4100,7 @@ func TestCurrentCommandLastEntryAndGap(t *testing.T) {
 
 	// The JSON shape carries the same facts.
 	buf.Reset()
-	if err := cmdCurrent(&buf, s, now, time.UTC, true); err != nil {
+	if err := cmdCurrent(env(&buf, s, nil, now, time.UTC), true); err != nil {
 		t.Fatalf("current --json: %v", err)
 	}
 	for _, want := range []string{
@@ -3863,14 +4129,14 @@ func TestCurrentCommandIgnoresFutureEntry(t *testing.T) {
 		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(10), Start: start, Stop: &stop, Duration: 4500, UpdatedAt: stop},
 		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(12), Start: future, Stop: &futureStop, Duration: 3600, UpdatedAt: stop},
 	} {
-		if _, err := s.CreateEntry(e); err != nil {
+		if _, err := s.CreateEntry(ctx, e); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	now := time.Date(2026, 1, 2, 11, 25, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdCurrent(&buf, s, now, time.UTC, false); err != nil {
+	if err := cmdCurrent(env(&buf, s, nil, now, time.UTC), false); err != nil {
 		t.Fatalf("current: %v", err)
 	}
 	want := "Fix login bug [Backend] 09:15-10:30 (gap 0h55m) Today: 2h15m\n"
@@ -3888,7 +4154,7 @@ func TestCurrentCommandIgnoresYesterday(t *testing.T) {
 
 	start := time.Date(2026, 1, 1, 16, 0, 0, 0, time.UTC)
 	stop := time.Date(2026, 1, 1, 17, 0, 0, 0, time.UTC)
-	if _, err := s.CreateEntry(store.Entry{
+	if _, err := s.CreateEntry(ctx, store.Entry{
 		WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
 		Start: start, Stop: &stop, Duration: 3600, UpdatedAt: stop,
 	}); err != nil {
@@ -3897,7 +4163,7 @@ func TestCurrentCommandIgnoresYesterday(t *testing.T) {
 
 	now := time.Date(2026, 1, 2, 9, 30, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdCurrent(&buf, s, now, time.UTC, false); err != nil {
+	if err := cmdCurrent(env(&buf, s, nil, now, time.UTC), false); err != nil {
 		t.Fatalf("current: %v", err)
 	}
 	if want := "No entries. Today: 0h00m\n"; buf.String() != want {
@@ -3910,7 +4176,7 @@ func TestCurrentCommandIgnoresYesterday(t *testing.T) {
 func TestCurrentCommandEmptyStore(t *testing.T) {
 	s := newStore(t)
 	var buf bytes.Buffer
-	if err := cmdCurrent(&buf, s, testStart, time.UTC, false); err != nil {
+	if err := cmdCurrent(env(&buf, s, nil, testStart, time.UTC), false); err != nil {
 		t.Fatalf("current: %v", err)
 	}
 	if want := "No entries. Today: 0h00m\n"; buf.String() != want {
@@ -3927,7 +4193,7 @@ func TestCurrentCommandRunningWinsOverNewerEntry(t *testing.T) {
 	seedRunning(t, s, 12, testStart) // 09:00, still running
 	later := testStart.Add(-2 * time.Hour)
 	laterStop := testStart.Add(-time.Hour)
-	if _, err := s.CreateEntry(store.Entry{
+	if _, err := s.CreateEntry(ctx, store.Entry{
 		WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
 		Start: later, Stop: &laterStop, Duration: 3600, UpdatedAt: laterStop,
 	}); err != nil {
@@ -3936,7 +4202,7 @@ func TestCurrentCommandRunningWinsOverNewerEntry(t *testing.T) {
 
 	var buf bytes.Buffer
 	now := testStart.Add(30 * time.Minute)
-	if err := cmdCurrent(&buf, s, now, time.UTC, false); err != nil {
+	if err := cmdCurrent(env(&buf, s, nil, now, time.UTC), false); err != nil {
 		t.Fatalf("current: %v", err)
 	}
 	want := "run Code review [Backend] (0h30m) Today: 1h30m\n"
@@ -3975,14 +4241,14 @@ func TestDayWindowSpringForward(t *testing.T) {
 		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(10), Start: today, Stop: &todayStop, Duration: 3600, UpdatedAt: todayStop},
 		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(12), Start: tomorrow, Stop: &tomorrowStop, Duration: 1800, UpdatedAt: tomorrowStop},
 	} {
-		if _, err := s.CreateEntry(e); err != nil {
+		if _, err := s.CreateEntry(ctx, e); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	now := time.Date(2026, 3, 29, 12, 0, 0, 0, loc)
 	var buf bytes.Buffer
-	if err := cmdToday(&buf, s, now, loc, 1, true, false); err != nil {
+	if err := cmdToday(env(&buf, s, nil, now, loc), 1, true, false); err != nil {
 		t.Fatalf("today: %v", err)
 	}
 	var listing todayJSON
@@ -3997,7 +4263,7 @@ func TestDayWindowSpringForward(t *testing.T) {
 	}
 
 	buf.Reset()
-	if err := cmdCurrent(&buf, s, now, loc, true); err != nil {
+	if err := cmdCurrent(env(&buf, s, nil, now, loc), true); err != nil {
 		t.Fatalf("current: %v", err)
 	}
 	if !strings.Contains(buf.String(), `"day_total_seconds":3600`) {
@@ -4016,7 +4282,7 @@ func TestDayWindowFallBack(t *testing.T) {
 
 	late := time.Date(2026, 10, 25, 23, 15, 0, 0, loc)
 	lateStop := late.Add(30 * time.Minute)
-	if _, err := s.CreateEntry(store.Entry{
+	if _, err := s.CreateEntry(ctx, store.Entry{
 		WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
 		Start: late, Stop: &lateStop, Duration: 1800, UpdatedAt: lateStop,
 	}); err != nil {
@@ -4025,7 +4291,7 @@ func TestDayWindowFallBack(t *testing.T) {
 
 	now := time.Date(2026, 10, 25, 23, 50, 0, 0, loc)
 	var buf bytes.Buffer
-	if err := cmdToday(&buf, s, now, loc, 1, true, false); err != nil {
+	if err := cmdToday(env(&buf, s, nil, now, loc), 1, true, false); err != nil {
 		t.Fatalf("today: %v", err)
 	}
 	var listing todayJSON
@@ -4037,7 +4303,7 @@ func TestDayWindowFallBack(t *testing.T) {
 	}
 
 	buf.Reset()
-	if err := cmdCurrent(&buf, s, now, loc, true); err != nil {
+	if err := cmdCurrent(env(&buf, s, nil, now, loc), true); err != nil {
 		t.Fatalf("current: %v", err)
 	}
 	if !strings.Contains(buf.String(), `"day_total_seconds":1800`) {
@@ -4060,11 +4326,9 @@ func TestAuthSuccessWritesConfig(t *testing.T) {
 	defer srv.Close()
 
 	var buf bytes.Buffer
-	err := cmdAuth(&buf,
-		func() (string, error) { return "tok123", nil },
-		func(token string) *api.Client {
-			return api.New(token, api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
-		})
+	err := cmdAuth(ctx, &buf, func() (string, error) { return "tok123", nil }, func(token string) *api.Client {
+		return api.New(token, api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+	})
 	if err != nil {
 		t.Fatalf("auth: %v", err)
 	}
@@ -4097,11 +4361,9 @@ func TestAuthForbiddenWritesNothing(t *testing.T) {
 	defer srv.Close()
 
 	var buf bytes.Buffer
-	err := cmdAuth(&buf,
-		func() (string, error) { return "bad", nil },
-		func(token string) *api.Client {
-			return api.New(token, api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
-		})
+	err := cmdAuth(ctx, &buf, func() (string, error) { return "bad", nil }, func(token string) *api.Client {
+		return api.New(token, api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+	})
 	if err == nil {
 		t.Fatal("expected an error for 403")
 	}

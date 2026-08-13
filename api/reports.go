@@ -1,6 +1,9 @@
 package api
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // reportAllTimeStart is the earliest date the Reports API accepts (its allowed
 // range starts at 2006-01-01), used as the default "all time" lower bound when
@@ -54,7 +57,7 @@ type summaryResponse struct {
 // KEPT with an empty Name: the endpoint frequently omits titles, and dropping
 // those rows used to make every `tg total` fragment match nothing. Resolving
 // names is the caller's job.
-func (c *Client) SummaryByTask(workspaceID int64, startDate, endDate string) ([]SummaryTask, error) {
+func (c *Client) SummaryByTask(ctx context.Context, workspaceID int64, startDate, endDate string) ([]SummaryTask, error) {
 	if startDate == "" {
 		startDate = reportAllTimeStart
 	}
@@ -66,7 +69,7 @@ func (c *Client) SummaryByTask(workspaceID int64, startDate, endDate string) ([]
 	}
 	var resp summaryResponse
 	path := fmt.Sprintf("/workspace/%d/summary/time_entries", workspaceID)
-	if err := c.doReports("POST", path, req, &resp); err != nil {
+	if err := c.doReports(ctx, "POST", path, req, &resp); err != nil {
 		return nil, err
 	}
 
