@@ -38,17 +38,19 @@ func mustCreate(t *testing.T, s *Store, e Entry) int64 {
 }
 
 func TestMigrateIdempotent(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	// Re-running migrate must not error or wipe data.
 	if err := s.migrate(ctx); err != nil {
 		t.Fatalf("second migrate: %v", err)
 	}
-	if v, ok, _ := s.Meta(ctx, MetaSchemaVersion); !ok || v != schemaVersion {
+	if v, ok := mustMeta(t, s, MetaSchemaVersion); !ok || v != schemaVersion {
 		t.Fatalf("schema_version = %q ok=%v, want %q", v, ok, schemaVersion)
 	}
 }
 
 func TestMigrateAddsBillableColumns(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "tg.db")
 
 	// Seed a pre-v2 database whose entries/projects tables predate billable.
@@ -87,7 +89,7 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);`); err != nil {
 			t.Errorf("%s.billable missing after migrate", tbl)
 		}
 	}
-	if v, ok, _ := s.Meta(ctx, MetaSchemaVersion); !ok || v != schemaVersion {
+	if v, ok := mustMeta(t, s, MetaSchemaVersion); !ok || v != schemaVersion {
 		t.Errorf("schema_version = %q ok=%v, want %q", v, ok, schemaVersion)
 	}
 
@@ -104,6 +106,7 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);`); err != nil {
 }
 
 func TestEntryBillableRoundTrip(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	start := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	mustCreate(t, s, Entry{
@@ -120,6 +123,7 @@ func TestEntryBillableRoundTrip(t *testing.T) {
 }
 
 func TestProjectByIDMissing(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	got, err := s.ProjectByID(ctx, 999)
 	if err != nil {
@@ -134,6 +138,7 @@ func TestProjectByIDMissing(t *testing.T) {
 // entries itself, so running rows arrive from pulls and the store can end up
 // holding more than one. The newest by start wins, and deleted rows are ignored.
 func TestRunningPicksNewest(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	base := time.Date(2026, 1, 2, 8, 0, 0, 0, time.UTC)
 	mustCreate(t, s, Entry{WorkspaceID: 1, TaskID: ptrInt(7), Start: base, Duration: -1, UpdatedAt: base})
@@ -167,6 +172,7 @@ func TestRunningPicksNewest(t *testing.T) {
 // pulled row carrying only Toggl's negative-duration marker was invisible to
 // `tg status` yet open-ended to `tg add`'s overlap check.
 func TestRunningPredicateIsUnified(t *testing.T) {
+	t.Parallel()
 	start := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		name string
@@ -184,6 +190,7 @@ func TestRunningPredicateIsUnified(t *testing.T) {
 		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			s := openTest(t)
 			id := mustCreate(t, s, tc.e)
 
@@ -216,6 +223,7 @@ func TestRunningPredicateIsUnified(t *testing.T) {
 // an error wrapping ErrEntryNotFound, not a silent no-op: sync counts the result
 // of this call, so an UPDATE that matched no row must not pass for an update.
 func TestUpdateFromRemoteUnknownRemoteID(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	start := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	remote := Entry{
@@ -259,6 +267,7 @@ func TestUpdateFromRemoteUnknownRemoteID(t *testing.T) {
 }
 
 func TestEntriesBetweenOrdering(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
 	mk := func(h int) {
@@ -289,6 +298,7 @@ func TestEntriesBetweenOrdering(t *testing.T) {
 // `tg mod`: the newest already-started entry of now's day wins, deleted entries
 // are skipped, and an empty store yields nil.
 func TestLastEntry(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 
 	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
@@ -338,6 +348,7 @@ func TestLastEntry(t *testing.T) {
 // no last entry at all (rather than reaching back into history, which `tg mod`
 // may not edit anyway).
 func TestLastEntryIsTodayOnly(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 
 	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
@@ -385,6 +396,7 @@ func TestLastEntryIsTodayOnly(t *testing.T) {
 // the entry before it is still the last one. An entry starting exactly at now
 // has begun and counts.
 func TestLastEntryIgnoresFutureStarts(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 
 	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
@@ -424,6 +436,7 @@ func TestLastEntryIgnoresFutureStarts(t *testing.T) {
 // day, and EntryByNum resolves a number back to its entry (with the catalog
 // joins intact) on the day it was given out on.
 func TestEntrySeqPerDay(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	if err := s.ReplaceProjects(ctx, []Project{{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true}}); err != nil {
 		t.Fatal(err)
@@ -492,6 +505,7 @@ func TestEntrySeqPerDay(t *testing.T) {
 // deleting an entry retires its number instead of sliding the later entries
 // down, and the number is not hand out again to the next insert.
 func TestEntrySeqSurvivesDeletion(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
 	mk := func(h int) int64 {
@@ -541,6 +555,7 @@ func TestEntrySeqSurvivesDeletion(t *testing.T) {
 // TestEntryByNumIgnoresOtherDays keeps a number from reaching across days: the
 // same number exists on both days and each resolves to its own entry.
 func TestEntryByNumIgnoresOtherDays(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	day := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	older := day.AddDate(0, 0, -1)
@@ -578,6 +593,7 @@ func TestEntryByNumIgnoresOtherDays(t *testing.T) {
 // entry to another calendar day: it must join the new day's numbering instead
 // of keeping a number that day never handed out.
 func TestUpdateFromRemoteRenumbersOnDayChange(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	day := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	next := day.AddDate(0, 0, 1)
@@ -626,6 +642,7 @@ func TestUpdateFromRemoteRenumbersOnDayChange(t *testing.T) {
 // (id) order, restarting per calendar day, so numbering works without a reset.
 // The retired entry_refs table is dropped.
 func TestMigrateBackfillsSeq(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "tg.db")
 
 	// Seed a v3 database: entries + entry_refs + meta, but no seq column. Two
@@ -661,7 +678,7 @@ INSERT INTO meta (key, value) VALUES ('schema_version', '3');`); err != nil {
 	}
 	t.Cleanup(func() { s.Close() })
 
-	if v, ok, _ := s.Meta(ctx, MetaSchemaVersion); !ok || v != schemaVersion {
+	if v, ok := mustMeta(t, s, MetaSchemaVersion); !ok || v != schemaVersion {
 		t.Errorf("schema_version = %q ok=%v, want %q", v, ok, schemaVersion)
 	}
 	has, err := s.hasColumn(ctx, "entries", "seq")
@@ -712,6 +729,7 @@ INSERT INTO meta (key, value) VALUES ('schema_version', '3');`); err != nil {
 // against a single stored 10:00-11:00 entry: intersecting ranges match, and
 // ranges that only touch an endpoint do not.
 func TestFindOverlapping(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
 	at := func(h, m int) time.Time { return day.Add(time.Duration(h)*time.Hour + time.Duration(m)*time.Minute) }
@@ -737,6 +755,7 @@ func TestFindOverlapping(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got, err := s.FindOverlapping(ctx, tc.start, tc.stop)
 			if err != nil {
 				t.Fatalf("FindOverlapping: %v", err)
@@ -755,6 +774,7 @@ func TestFindOverlapping(t *testing.T) {
 // TestFindOverlappingIgnoresDeleted keeps soft-deleted entries from blocking a
 // range they no longer occupy.
 func TestFindOverlappingIgnoresDeleted(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	start := time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)
 	mustCreate(t, s, Entry{
@@ -775,6 +795,7 @@ func TestFindOverlappingIgnoresDeleted(t *testing.T) {
 // entry: it blocks anything reaching past its start, but not a range that ends
 // at or before it.
 func TestFindOverlappingRunningEntry(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	start := time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)
 	id := mustCreate(t, s, Entry{
@@ -812,6 +833,7 @@ func TestFindOverlappingRunningEntry(t *testing.T) {
 // invisible to the search (so retiming an entry never conflicts with itself)
 // while every other entry still blocks the range.
 func TestFindOverlappingExcluding(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
 	at := func(h, m int) time.Time { return day.Add(time.Duration(h)*time.Hour + time.Duration(m)*time.Minute) }
@@ -856,6 +878,7 @@ func TestFindOverlappingExcluding(t *testing.T) {
 // clock advances, the row is marked dirty, and the remote identity (remote_id,
 // synced_at) is preserved so the push is an update rather than a re-create.
 func TestUpdateEntry(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	at := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	stop := at.Add(time.Hour)
@@ -875,10 +898,7 @@ func TestUpdateEntry(t *testing.T) {
 		t.Fatalf("UpdateEntry: %v", err)
 	}
 
-	dirty, err := s.DirtyEntries(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	dirty := mustDirty(t, s)
 	if len(dirty) != 1 {
 		t.Fatalf("dirty entries = %d, want 1", len(dirty))
 	}
@@ -912,6 +932,7 @@ func TestUpdateEntry(t *testing.T) {
 // TestUpdateEntryMissing verifies an update against an unknown id fails loudly
 // instead of silently matching no row.
 func TestUpdateEntryMissing(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	at := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	err := s.UpdateEntry(ctx, Entry{ID: 999, Start: at, Duration: 60, UpdatedAt: at}, at, time.UTC)
@@ -927,6 +948,7 @@ func TestUpdateEntryMissing(t *testing.T) {
 // the store itself refuses to rewrite an entry that sits on an earlier calendar
 // day, no matter what the caller asks for, and leaves the row untouched.
 func TestUpdateEntryRefusesOlderThanToday(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	at := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	stop := at.Add(time.Hour)
@@ -947,10 +969,7 @@ func TestUpdateEntryRefusesOlderThanToday(t *testing.T) {
 		t.Fatalf("err = %v, want ErrEntryTooOld", err)
 	}
 
-	dirty, err := s.DirtyEntries(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	dirty := mustDirty(t, s)
 	if len(dirty) != 0 {
 		t.Errorf("dirty entries = %d, want 0 (nothing written)", len(dirty))
 	}
@@ -966,6 +985,7 @@ func TestUpdateEntryRefusesOlderThanToday(t *testing.T) {
 // TestUpdateEntryRefusesMoveIntoThePast covers the other half of the failsafe:
 // today's entry may be edited, but not dragged back onto an earlier day.
 func TestUpdateEntryRefusesMoveIntoThePast(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	now := time.Date(2026, 1, 3, 10, 0, 0, 0, time.UTC)
 	at := time.Date(2026, 1, 3, 9, 0, 0, 0, time.UTC)
@@ -997,6 +1017,7 @@ func TestUpdateEntryRefusesMoveIntoThePast(t *testing.T) {
 // supplied location, not UTC: just after local midnight, an entry from a few
 // hours earlier is already yesterday's and is refused.
 func TestCheckEditableDayLocalMidnight(t *testing.T) {
+	t.Parallel()
 	loc := time.FixedZone("UTC+3", 3*60*60)
 	now := time.Date(2026, 1, 3, 0, 30, 0, 0, loc)
 
@@ -1018,6 +1039,7 @@ func TestCheckEditableDayLocalMidnight(t *testing.T) {
 // and dirty (so the deletion can be pushed) while dropping out of every read
 // path immediately.
 func TestSoftDeleteEntry(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	at := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	stop := at.Add(time.Hour)
@@ -1031,10 +1053,7 @@ func TestSoftDeleteEntry(t *testing.T) {
 		t.Fatalf("SoftDeleteEntry: %v", err)
 	}
 
-	dirty, err := s.DirtyEntries(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	dirty := mustDirty(t, s)
 	if len(dirty) != 1 || dirty[0].ID != id {
 		t.Fatalf("dirty entries = %v, want the pending deletion of %d", dirty, id)
 	}
@@ -1062,6 +1081,7 @@ func TestSoftDeleteEntry(t *testing.T) {
 
 // TestSoftDeleteEntryMissing verifies deleting an unknown id is an error.
 func TestSoftDeleteEntryMissing(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	err := s.SoftDeleteEntry(ctx, 999, time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC))
 	if err == nil {
@@ -1073,6 +1093,7 @@ func TestSoftDeleteEntryMissing(t *testing.T) {
 }
 
 func TestEntryJoinsProjectColor(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	if err := s.ReplaceProjects(ctx, []Project{
 		{ID: 1, WorkspaceID: 1, Name: "Backend", Color: "#0B83D9", Active: true},
@@ -1096,21 +1117,20 @@ func TestEntryJoinsProjectColor(t *testing.T) {
 }
 
 func TestDirtyEntriesAndMarkSynced(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	at := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	id := mustCreate(t, s, Entry{WorkspaceID: 1, Start: at, Duration: 3600, UpdatedAt: at, Dirty: true})
 
-	dirty, err := s.DirtyEntries(ctx)
-	if err != nil || len(dirty) != 1 {
-		t.Fatalf("dirty = %v err=%v, want 1", dirty, err)
+	if dirty := mustDirty(t, s); len(dirty) != 1 {
+		t.Fatalf("dirty = %v, want 1", dirty)
 	}
 
 	syncedAt := at.Add(time.Minute)
 	if err := s.MarkSynced(ctx, id, 999, syncedAt); err != nil {
 		t.Fatalf("mark synced: %v", err)
 	}
-	dirty, _ = s.DirtyEntries(ctx)
-	if len(dirty) != 0 {
+	if dirty := mustDirty(t, s); len(dirty) != 0 {
 		t.Fatalf("dirty after sync = %d, want 0", len(dirty))
 	}
 	got, err := s.EntryByRemoteID(ctx, 999)
@@ -1129,6 +1149,7 @@ func TestDirtyEntriesAndMarkSynced(t *testing.T) {
 }
 
 func TestCatalogFullReplace(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	if err := s.ReplaceProjects(ctx, []Project{{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true}}); err != nil {
 		t.Fatalf("replace projects: %v", err)
@@ -1154,6 +1175,7 @@ func TestCatalogFullReplace(t *testing.T) {
 }
 
 func TestReplaceProjectTasksScoped(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	if err := s.ReplaceTasks(ctx, []Task{
 		{ID: 10, WorkspaceID: 1, ProjectID: 1, Name: "Backend A", Active: true},
@@ -1184,6 +1206,7 @@ func TestReplaceProjectTasksScoped(t *testing.T) {
 }
 
 func TestPutProjectFullUpsert(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	if err := s.PutProject(ctx, Project{ID: 5, WorkspaceID: 1, Name: "Old", Active: true, Billable: false}); err != nil {
 		t.Fatalf("put project: %v", err)
@@ -1205,6 +1228,7 @@ func TestPutProjectFullUpsert(t *testing.T) {
 // populate the color on first insert, keep an authoritative color when a later
 // meta payload carries none (no clobber), and refresh it when a color is given.
 func TestUpsertProjectColor(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 
 	// First heal (from a meta pull) inserts the project with its color.
@@ -1223,7 +1247,7 @@ func TestUpsertProjectColor(t *testing.T) {
 	if err := s.UpsertProject(ctx, Project{ID: 7, WorkspaceID: 1, Name: "Backend", Color: "", Active: true}); err != nil {
 		t.Fatalf("upsert empty color: %v", err)
 	}
-	p, _ = s.ProjectByID(ctx, 7)
+	p = mustProjectByID(t, s, 7)
 	if p.Color != "#0B83D9" {
 		t.Fatalf("color after empty upsert = %q, want preserved %q", p.Color, "#0B83D9")
 	}
@@ -1232,13 +1256,14 @@ func TestUpsertProjectColor(t *testing.T) {
 	if err := s.UpsertProject(ctx, Project{ID: 7, WorkspaceID: 1, Name: "Backend", Color: "#E36A00", Active: true}); err != nil {
 		t.Fatalf("upsert new color: %v", err)
 	}
-	p, _ = s.ProjectByID(ctx, 7)
+	p = mustProjectByID(t, s, 7)
 	if p.Color != "#E36A00" {
 		t.Fatalf("color after new upsert = %q, want %q", p.Color, "#E36A00")
 	}
 }
 
 func TestFindTasksByFragment(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	tasks := []Task{
 		{ID: 1, WorkspaceID: 1, ProjectID: 100, Name: "Fix login bug", Active: true},
@@ -1252,31 +1277,32 @@ func TestFindTasksByFragment(t *testing.T) {
 
 	// Substring: matches across projects, excludes inactive, sorted by name.
 	// "Fi" is a substring of every active "Fix…" task but exactly equals none.
-	got, _ := s.FindTasksByFragment(ctx, "Fi", nil)
+	got := mustFindTasks(t, s, "Fi", nil)
 	if names := taskNames(got); !equal(names, []string{"Fix", "Fix login bug", "Fix payment"}) {
 		t.Fatalf("substring match = %v", names)
 	}
 
 	// Exact title precedence: "Fix" wins over the broader substrings.
-	got, _ = s.FindTasksByFragment(ctx, "Fix", nil)
+	got = mustFindTasks(t, s, "Fix", nil)
 	if names := taskNames(got); !equal(names, []string{"Fix"}) {
 		t.Fatalf("exact match = %v", names)
 	}
 
 	// Project scoping restricts candidates.
 	pid := int64(200)
-	got, _ = s.FindTasksByFragment(ctx, "fix", &pid)
+	got = mustFindTasks(t, s, "fix", &pid)
 	if names := taskNames(got); !equal(names, []string{"Fix payment"}) {
 		t.Fatalf("scoped match = %v", names)
 	}
 
 	// No match.
-	if got, _ := s.FindTasksByFragment(ctx, "nonexistent", nil); len(got) != 0 {
+	if got = mustFindTasks(t, s, "nonexistent", nil); len(got) != 0 {
 		t.Fatalf("expected no matches, got %v", taskNames(got))
 	}
 }
 
 func TestListProjects(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	if err := s.ReplaceProjects(ctx, []Project{
 		{ID: 2, WorkspaceID: 1, Name: "Payments", Active: true},
@@ -1306,6 +1332,7 @@ func TestListProjects(t *testing.T) {
 }
 
 func TestListTasksProjectScope(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	if err := s.ReplaceProjects(ctx, []Project{
 		{ID: 100, WorkspaceID: 1, Name: "Backend", Active: true},
@@ -1342,6 +1369,7 @@ func TestListTasksProjectScope(t *testing.T) {
 }
 
 func TestFindProjectsByFragment(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	if err := s.ReplaceProjects(ctx, []Project{
 		{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true},
@@ -1354,32 +1382,33 @@ func TestFindProjectsByFragment(t *testing.T) {
 
 	// Substring: matches active projects across the catalog, sorted by name,
 	// excluding the inactive "Backup".
-	got, _ := s.FindProjectsByFragment(ctx, "back")
+	got := mustFindProjects(t, s, "back")
 	if names := projectNames(got); !equal(names, []string{"Back office", "Backend"}) {
 		t.Fatalf("substring match = %v", names)
 	}
 
 	// Exact full-name precedence over broader substrings.
-	got, _ = s.FindProjectsByFragment(ctx, "Backend")
+	got = mustFindProjects(t, s, "Backend")
 	if names := projectNames(got); !equal(names, []string{"Backend"}) {
 		t.Fatalf("exact match = %v", names)
 	}
 
 	// Unique fragment.
-	got, _ = s.FindProjectsByFragment(ctx, "pay")
+	got = mustFindProjects(t, s, "pay")
 	if len(got) != 1 || got[0].ID != 3 {
 		t.Fatalf("unique match = %+v, want project 3", got)
 	}
 
 	// No match.
-	if got, _ := s.FindProjectsByFragment(ctx, "nonexistent"); len(got) != 0 {
+	if got = mustFindProjects(t, s, "nonexistent"); len(got) != 0 {
 		t.Fatalf("expected no matches, got %v", projectNames(got))
 	}
 }
 
 func TestMetaRoundTrip(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
-	if _, ok, _ := s.Meta(ctx, MetaLastPull); ok {
+	if _, ok := mustMeta(t, s, MetaLastPull); ok {
 		t.Fatal("last_pull should be absent initially")
 	}
 	if err := s.SetMeta(ctx, MetaLastPull, "2026-01-01T00:00:00Z"); err != nil {
@@ -1395,6 +1424,57 @@ func TestMetaRoundTrip(t *testing.T) {
 }
 
 // --- helpers ---
+
+// --- checked reads -----------------------------------------------------------
+//
+// The must* helpers wrap the reads the assertions below are made against, which
+// used to drop their errors: a failing query then looks like an empty result and
+// the assertion blames the code under test instead of the read that broke.
+
+func mustMeta(t *testing.T, s *Store, key string) (string, bool) {
+	t.Helper()
+	v, ok, err := s.Meta(ctx, key)
+	if err != nil {
+		t.Fatalf("Meta(%q): %v", key, err)
+	}
+	return v, ok
+}
+
+func mustProjectByID(t *testing.T, s *Store, id int64) *Project {
+	t.Helper()
+	p, err := s.ProjectByID(ctx, id)
+	if err != nil {
+		t.Fatalf("ProjectByID(%d): %v", id, err)
+	}
+	return p
+}
+
+func mustDirty(t *testing.T, s *Store) []Entry {
+	t.Helper()
+	dirty, err := s.DirtyEntries(ctx)
+	if err != nil {
+		t.Fatalf("DirtyEntries: %v", err)
+	}
+	return dirty
+}
+
+func mustFindTasks(t *testing.T, s *Store, fragment string, projectID *int64) []Task {
+	t.Helper()
+	tasks, err := s.FindTasksByFragment(ctx, fragment, projectID)
+	if err != nil {
+		t.Fatalf("FindTasksByFragment(%q): %v", fragment, err)
+	}
+	return tasks
+}
+
+func mustFindProjects(t *testing.T, s *Store, fragment string) []Project {
+	t.Helper()
+	projects, err := s.FindProjectsByFragment(ctx, fragment)
+	if err != nil {
+		t.Fatalf("FindProjectsByFragment(%q): %v", fragment, err)
+	}
+	return projects
+}
 
 func ptrTime(t time.Time) *time.Time { return &t }
 
@@ -1431,6 +1511,7 @@ func equal(a, b []string) bool {
 // TestWithTxCommits verifies the writes made through the transaction store are
 // visible afterwards.
 func TestWithTxCommits(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	at := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	if err := s.WithTx(ctx, func(tx *Store) error {
@@ -1447,7 +1528,7 @@ func TestWithTxCommits(t *testing.T) {
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("entries = %+v err=%v, want the committed entry", entries, err)
 	}
-	if p, _ := s.ProjectByID(ctx, 5); p == nil {
+	if p := mustProjectByID(t, s, 5); p == nil {
 		t.Error("project should have been committed")
 	}
 }
@@ -1456,6 +1537,7 @@ func TestWithTxCommits(t *testing.T) {
 // the transaction wrote: that is what keeps a half-applied multi-statement write
 // (a pull dying mid-loop, say) out of the database.
 func TestWithTxRollsBack(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	at := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	boom := errors.New("boom")
@@ -1480,7 +1562,7 @@ func TestWithTxRollsBack(t *testing.T) {
 	if len(entries) != 0 {
 		t.Errorf("entries = %+v, want none (rolled back)", entries)
 	}
-	if p, _ := s.ProjectByID(ctx, 5); p != nil {
+	if p := mustProjectByID(t, s, 5); p != nil {
 		t.Errorf("project = %+v, want none (rolled back)", p)
 	}
 }
@@ -1490,6 +1572,7 @@ func TestWithTxRollsBack(t *testing.T) {
 // the outer one. That is what lets UpdateEntry/UpdateFromRemote be atomic on
 // their own and still compose into a pull's transaction.
 func TestWithTxNests(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	at := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	stop := at.Add(time.Hour)
@@ -1524,6 +1607,7 @@ func TestWithTxNests(t *testing.T) {
 // TestWithTxRollsBackRefusedUpdate verifies UpdateEntry's own transaction: an
 // edit refused by the day failsafe after the row was read leaves nothing behind.
 func TestWithTxRollsBackRefusedUpdate(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	at := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	stop := at.Add(time.Hour)
@@ -1553,6 +1637,7 @@ func TestWithTxRollsBackRefusedUpdate(t *testing.T) {
 // rather than being accepted and ignored: with it already cancelled (a Ctrl-C
 // mid-command, in practice) reads and writes fail instead of running.
 func TestCancelledContextStopsWork(t *testing.T) {
+	t.Parallel()
 	s := openTest(t)
 	at := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	cancelled, cancel := context.WithCancel(context.Background())

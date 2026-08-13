@@ -37,7 +37,28 @@ var ctx = context.Background()
 
 func ptrInt(v int64) *int64 { return &v }
 
+// decodeBody unmarshals a JSON request body captured by one of the stub handlers
+// above. It is called from the server's goroutine, so it reports failures with
+// t.Errorf rather than t.Fatalf (which may only be called from the test's own
+// goroutine) — a malformed body then fails the test instead of quietly leaving
+// the captured map empty and every assertion on it comparing against nil.
+func decodeBody(t *testing.T, r *http.Request) map[string]any {
+	t.Helper()
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Errorf("read request body: %v", err)
+		return nil
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Errorf("decode request body %q: %v", raw, err)
+		return nil
+	}
+	return body
+}
+
 func TestBasicAuthHeader(t *testing.T) {
+	t.Parallel()
 	var gotAuth string
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
@@ -53,6 +74,7 @@ func TestBasicAuthHeader(t *testing.T) {
 }
 
 func TestMeParsesDefaultWorkspace(t *testing.T) {
+	t.Parallel()
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/me" {
 			t.Errorf("path = %q, want /me", r.URL.Path)
@@ -69,6 +91,7 @@ func TestMeParsesDefaultWorkspace(t *testing.T) {
 }
 
 func TestCurrentHandlesNull(t *testing.T) {
+	t.Parallel()
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/me/time_entries/current" {
 			t.Errorf("path = %q", r.URL.Path)
@@ -85,6 +108,7 @@ func TestCurrentHandlesNull(t *testing.T) {
 }
 
 func TestCurrentReturnsEntry(t *testing.T) {
+	t.Parallel()
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"id":7,"workspace_id":1,"duration":-1,"start":"2026-01-02T09:00:00Z"}`))
 	})
@@ -98,6 +122,7 @@ func TestCurrentReturnsEntry(t *testing.T) {
 }
 
 func TestListQuery(t *testing.T) {
+	t.Parallel()
 	var gotQuery string
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		gotQuery = r.URL.RawQuery
@@ -116,6 +141,7 @@ func TestListQuery(t *testing.T) {
 }
 
 func TestCreateBody(t *testing.T) {
+	t.Parallel()
 	var body map[string]any
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -124,8 +150,7 @@ func TestCreateBody(t *testing.T) {
 		if r.URL.Path != "/workspaces/1/time_entries" {
 			t.Errorf("path = %q", r.URL.Path)
 		}
-		raw, _ := io.ReadAll(r.Body)
-		json.Unmarshal(raw, &body)
+		body = decodeBody(t, r)
 		w.Write([]byte(`{"id":555,"workspace_id":1,"at":"2026-01-02T09:00:00Z"}`))
 	})
 
@@ -163,6 +188,7 @@ func TestCreateBody(t *testing.T) {
 }
 
 func TestUpdateMethodPath(t *testing.T) {
+	t.Parallel()
 	var method, path string
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		method, path = r.Method, r.URL.Path
@@ -177,6 +203,7 @@ func TestUpdateMethodPath(t *testing.T) {
 }
 
 func TestStopMethodPath(t *testing.T) {
+	t.Parallel()
 	var method, path string
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		method, path = r.Method, r.URL.Path
@@ -191,6 +218,7 @@ func TestStopMethodPath(t *testing.T) {
 }
 
 func TestDeleteMethodPath(t *testing.T) {
+	t.Parallel()
 	var method, path string
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		method, path = r.Method, r.URL.Path
@@ -205,6 +233,7 @@ func TestDeleteMethodPath(t *testing.T) {
 }
 
 func TestProjectsPagination(t *testing.T) {
+	t.Parallel()
 	// First page returns a full batch (perPage items); second page is short,
 	// terminating the loop.
 	var pages []string
@@ -229,6 +258,7 @@ func TestProjectsPagination(t *testing.T) {
 }
 
 func TestTasksActiveBoth(t *testing.T) {
+	t.Parallel()
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if got := r.URL.Query().Get("active"); got != "both" {
 			t.Errorf("active = %q, want both", got)
@@ -252,6 +282,7 @@ func TestTasksActiveBoth(t *testing.T) {
 }
 
 func TestTasksPaginationEnvelope(t *testing.T) {
+	t.Parallel()
 	// First page is a full batch (perPage items) inside the envelope; the
 	// second page is short, terminating the walk.
 	var pages []string
@@ -273,6 +304,7 @@ func TestTasksPaginationEnvelope(t *testing.T) {
 }
 
 func TestProjectByID(t *testing.T) {
+	t.Parallel()
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/workspaces/1/projects/42" {
 			t.Errorf("path = %q, want /workspaces/1/projects/42", r.URL.Path)
@@ -289,6 +321,7 @@ func TestProjectByID(t *testing.T) {
 }
 
 func TestProjectTasksBareArray(t *testing.T) {
+	t.Parallel()
 	// The project-scoped tasks endpoint is NOT paginated: it returns every task
 	// as a single bare JSON array. ProjectTasks must issue exactly one request
 	// and must not send page/per_page (walking pages would loop forever, since
@@ -324,6 +357,7 @@ func TestProjectTasksBareArray(t *testing.T) {
 }
 
 func TestProjectTasksActiveFilter(t *testing.T) {
+	t.Parallel()
 	var gotActive string
 	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		gotActive = r.URL.Query().Get("active")
@@ -349,12 +383,12 @@ func projectTasksBare() string {
 }
 
 func TestSummaryByTask(t *testing.T) {
+	t.Parallel()
 	var gotMethod, gotPath string
 	var body map[string]any
 	c := newTestClientReports(t, func(w http.ResponseWriter, r *http.Request) {
 		gotMethod, gotPath = r.Method, r.URL.Path
-		raw, _ := io.ReadAll(r.Body)
-		json.Unmarshal(raw, &body)
+		body = decodeBody(t, r)
 		// Two projects; the second repeats task 10, whose seconds must be summed
 		// across groups. A sub-group without a task id is dropped, but one that
 		// has an id and no title (what the endpoint usually sends) is kept.
@@ -412,8 +446,10 @@ func TestSummaryByTask(t *testing.T) {
 }
 
 func TestErrorMapping(t *testing.T) {
+	t.Parallel()
 	// 401 and 403 are kept apart: only the former means "the token is no good".
 	t.Run("unauthorized", func(t *testing.T) {
+		t.Parallel()
 		c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusUnauthorized)
 			w.Write([]byte(`token expired`))
@@ -432,6 +468,7 @@ func TestErrorMapping(t *testing.T) {
 		}
 	})
 	t.Run("forbidden", func(t *testing.T) {
+		t.Parallel()
 		c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusForbidden)
 			w.Write([]byte(`no access to workspace`))
@@ -448,6 +485,7 @@ func TestErrorMapping(t *testing.T) {
 		}
 	})
 	t.Run("server error", func(t *testing.T) {
+		t.Parallel()
 		c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(`{"error":"boom"}`))
@@ -458,6 +496,7 @@ func TestErrorMapping(t *testing.T) {
 		}
 	})
 	t.Run("non-json body", func(t *testing.T) {
+		t.Parallel()
 		c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusBadGateway)
 			w.Write([]byte(`<html>down</html>`))
@@ -472,6 +511,7 @@ func TestErrorMapping(t *testing.T) {
 // TestRetriesRateLimit verifies a 429 is retried and that the retry can
 // succeed, so a brief brush with Toggl's limiter is invisible to the caller.
 func TestRetriesRateLimit(t *testing.T) {
+	t.Parallel()
 	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -500,6 +540,7 @@ func TestRetriesRateLimit(t *testing.T) {
 // TestRetryGivesUp verifies the retries are bounded and the final 429 is
 // reported with its body, rather than being retried forever.
 func TestRetryGivesUp(t *testing.T) {
+	t.Parallel()
 	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -522,6 +563,7 @@ func TestRetryGivesUp(t *testing.T) {
 // TestRetryHonorsRetryAfter verifies the server's Retry-After is what shapes the
 // wait (and that it is capped): a 0-second header retries immediately.
 func TestRetryHonorsRetryAfter(t *testing.T) {
+	t.Parallel()
 	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -545,6 +587,7 @@ func TestRetryHonorsRetryAfter(t *testing.T) {
 }
 
 func TestRetryWait(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		header http.Header
@@ -566,6 +609,7 @@ func TestRetryWait(t *testing.T) {
 // TestContextCancelAbortsRequest verifies the context reaches the transport, so
 // a Ctrl-C during a slow call returns instead of waiting out the HTTP timeout.
 func TestContextCancelAbortsRequest(t *testing.T) {
+	t.Parallel()
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-release
@@ -588,6 +632,7 @@ func TestContextCancelAbortsRequest(t *testing.T) {
 // TestContextCancelAbortsBackoff verifies a cancelled context cuts the
 // rate-limit wait short instead of sleeping through it.
 func TestContextCancelAbortsBackoff(t *testing.T) {
+	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
 	}))

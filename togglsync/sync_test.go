@@ -24,12 +24,77 @@ func ptrInt(v int64) *int64 { return &v }
 
 func ptrTime(v time.Time) *time.Time { return &v }
 
-func ts(s string) time.Time {
-	t, err := time.Parse(time.RFC3339, s)
+// ts parses a fixture timestamp. It takes the test rather than panicking on a
+// malformed one, so a typo in a fixture is reported as the test failure it is
+// instead of taking the whole package's run down with a panic.
+func ts(t *testing.T, s string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339, s)
 	if err != nil {
-		panic(err)
+		t.Fatalf("parse fixture timestamp %q: %v", s, err)
 	}
-	return t
+	return parsed
+}
+
+// mustCreate inserts a fixture entry and returns its local id.
+func mustCreate(t *testing.T, st *store.Store, e store.Entry) int64 {
+	t.Helper()
+	id, err := st.CreateEntry(ctx, e)
+	if err != nil {
+		t.Fatalf("create entry: %v", err)
+	}
+	return id
+}
+
+// --- checked store reads ------------------------------------------------------
+//
+// These wrap the reads the assertions are made against: dropping their errors
+// (as these tests used to) turns a failing query into a nil entry, and the
+// assertion then blames the sync logic instead of the read that broke.
+
+func mustEntryByRemoteID(t *testing.T, st *store.Store, remoteID int64) *store.Entry {
+	t.Helper()
+	e, err := st.EntryByRemoteID(ctx, remoteID)
+	if err != nil {
+		t.Fatalf("EntryByRemoteID(%d): %v", remoteID, err)
+	}
+	return e
+}
+
+func mustDirty(t *testing.T, st *store.Store) []store.Entry {
+	t.Helper()
+	dirty, err := st.DirtyEntries(ctx)
+	if err != nil {
+		t.Fatalf("DirtyEntries: %v", err)
+	}
+	return dirty
+}
+
+func mustMeta(t *testing.T, st *store.Store, key string) (string, bool) {
+	t.Helper()
+	v, ok, err := st.Meta(ctx, key)
+	if err != nil {
+		t.Fatalf("Meta(%q): %v", key, err)
+	}
+	return v, ok
+}
+
+// decodeBody unmarshals a JSON request body captured by a stub handler. It runs
+// on the server's goroutine, so it reports a malformed body with t.Errorf
+// (t.Fatalf may only be called from the test's own goroutine).
+func decodeBody(t *testing.T, r *http.Request) map[string]any {
+	t.Helper()
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Errorf("read request body: %v", err)
+		return nil
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Errorf("decode request body %q: %v", raw, err)
+		return nil
+	}
+	return body
 }
 
 // setup opens a throwaway store pinned to UTC (so the per-day entry numbering
@@ -49,15 +114,16 @@ func setup(t *testing.T, handler http.HandlerFunc) (*store.Store, *api.Client) {
 }
 
 func TestPushCreate(t *testing.T) {
+	t.Parallel()
 	var gotMethod string
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
 		w.Write([]byte(`{"id":555,"at":"2026-01-02T10:00:00Z"}`))
 	})
 
-	start := ts("2026-01-02T09:00:00Z")
+	start := ts(t, "2026-01-02T09:00:00Z")
 	stop := start.Add(5 * time.Minute)
-	id, _ := st.CreateEntry(ctx, store.Entry{
+	id := mustCreate(t, st, store.Entry{
 		WorkspaceID: 1, TaskID: ptrInt(7), Start: start, Stop: &stop,
 		Duration: 300, UpdatedAt: stop, Dirty: true,
 	})
@@ -72,7 +138,7 @@ func TestPushCreate(t *testing.T) {
 	if res.Created != 1 {
 		t.Errorf("created = %d, want 1", res.Created)
 	}
-	got, _ := st.EntryByRemoteID(ctx, 555)
+	got := mustEntryByRemoteID(t, st, 555)
 	if got == nil || got.ID != id || got.Dirty {
 		t.Fatalf("after create: %+v", got)
 	}
@@ -82,14 +148,15 @@ func TestPushCreate(t *testing.T) {
 }
 
 func TestPushUpdate(t *testing.T) {
+	t.Parallel()
 	var gotMethod, gotPath string
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		gotMethod, gotPath = r.Method, r.URL.Path
 		w.Write([]byte(`{"id":555,"at":"2026-01-02T11:00:00Z"}`))
 	})
 
-	start := ts("2026-01-02T09:00:00Z")
-	st.CreateEntry(ctx, store.Entry{
+	start := ts(t, "2026-01-02T09:00:00Z")
+	mustCreate(t, st, store.Entry{
 		RemoteID: ptrInt(555), WorkspaceID: 1, Start: start,
 		Duration: 600, UpdatedAt: start.Add(time.Hour), Dirty: true,
 	})
@@ -107,14 +174,15 @@ func TestPushUpdate(t *testing.T) {
 }
 
 func TestPushDelete(t *testing.T) {
+	t.Parallel()
 	var gotMethod string
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
 		w.WriteHeader(http.StatusOK)
 	})
 
-	start := ts("2026-01-02T09:00:00Z")
-	st.CreateEntry(ctx, store.Entry{
+	start := ts(t, "2026-01-02T09:00:00Z")
+	mustCreate(t, st, store.Entry{
 		RemoteID: ptrInt(777), WorkspaceID: 1, Start: start,
 		Duration: 300, UpdatedAt: start, Dirty: true, Deleted: true,
 	})
@@ -129,19 +197,20 @@ func TestPushDelete(t *testing.T) {
 	if res.Deleted != 1 {
 		t.Errorf("deleted = %d, want 1", res.Deleted)
 	}
-	if got, _ := st.EntryByRemoteID(ctx, 777); got != nil {
+	if got := mustEntryByRemoteID(t, st, 777); got != nil {
 		t.Errorf("row should be gone, got %+v", got)
 	}
 }
 
 func TestPushDeleteNeverPushed(t *testing.T) {
+	t.Parallel()
 	called := false
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		w.WriteHeader(http.StatusOK)
 	})
-	start := ts("2026-01-02T09:00:00Z")
-	id, _ := st.CreateEntry(ctx, store.Entry{
+	start := ts(t, "2026-01-02T09:00:00Z")
+	id := mustCreate(t, st, store.Entry{
 		WorkspaceID: 1, Start: start, Duration: 300, UpdatedAt: start, Dirty: true, Deleted: true,
 	})
 	if _, err := Push(ctx, st, c, time.Now()); err != nil {
@@ -150,11 +219,11 @@ func TestPushDeleteNeverPushed(t *testing.T) {
 	if called {
 		t.Error("should not call API for a never-pushed deletion")
 	}
-	if got, _ := st.EntryByRemoteID(ctx, 0); got != nil {
+	if got := mustEntryByRemoteID(t, st, 0); got != nil {
 		t.Error("row should be dropped")
 	}
 	// And the local row by id is gone.
-	dirty, _ := st.DirtyEntries(ctx)
+	dirty := mustDirty(t, st)
 	for _, e := range dirty {
 		if e.ID == id {
 			t.Error("deleted row still present")
@@ -163,20 +232,21 @@ func TestPushDeleteNeverPushed(t *testing.T) {
 }
 
 func TestPullInsert(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`[{"id":900,"workspace_id":1,"description":"Imported",
 		  "start":"2026-01-02T09:00:00Z","stop":"2026-01-02T09:30:00Z",
 		  "duration":1800,"at":"2026-01-02T09:30:00Z"}]`))
 	})
-	now := ts("2026-01-02T12:00:00Z")
-	res, err := Pull(ctx, st, c, nil, ts("2026-01-01T00:00:00Z"), now)
+	now := ts(t, "2026-01-02T12:00:00Z")
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), now)
 	if err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	if res.Inserted != 1 {
 		t.Errorf("inserted = %d, want 1", res.Inserted)
 	}
-	got, _ := st.EntryByRemoteID(ctx, 900)
+	got := mustEntryByRemoteID(t, st, 900)
 	if got == nil || got.Description != "Imported" || got.Dirty {
 		t.Fatalf("inserted entry = %+v", got)
 	}
@@ -188,6 +258,7 @@ func TestPullInsert(t *testing.T) {
 // written first keeps the number it already had, so a pull never renumbers what
 // `tg ls` has already shown.
 func TestPullNumbersInsertedEntries(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		// Deliberately not in start order: insertion order is what numbers them.
 		w.Write([]byte(`[{"id":901,"workspace_id":1,"description":"second",
@@ -202,7 +273,7 @@ func TestPullNumbersInsertedEntries(t *testing.T) {
 	})
 
 	// A purely local entry already occupies number 1 on 2026-01-02.
-	local := ts("2026-01-02T09:00:00Z")
+	local := ts(t, "2026-01-02T09:00:00Z")
 	localStop := local.Add(time.Hour)
 	if _, err := st.CreateEntry(ctx, store.Entry{
 		WorkspaceID: 1, Start: local, Stop: &localStop,
@@ -211,7 +282,7 @@ func TestPullNumbersInsertedEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := Pull(ctx, st, c, nil, ts("2026-01-01T00:00:00Z"), ts("2026-01-03T12:00:00Z")); err != nil {
+	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-03T12:00:00Z")); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 
@@ -229,37 +300,38 @@ func TestPullNumbersInsertedEntries(t *testing.T) {
 	}
 
 	// Numbers address the entries they were given to.
-	got, err := st.EntryByNum(ctx, 2, ts("2026-01-02T20:00:00Z"))
+	got, err := st.EntryByNum(ctx, 2, ts(t, "2026-01-02T20:00:00Z"))
 	if err != nil || got.Description != "second" {
 		t.Errorf("EntryByNum(2) = %+v err=%v, want the first pulled entry", got, err)
 	}
 }
 
 func TestPullMapsBillable(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`[{"id":910,"workspace_id":1,"description":"Billed",
 		  "start":"2026-01-02T09:00:00Z","stop":"2026-01-02T09:30:00Z",
 		  "duration":1800,"billable":true,"at":"2026-01-02T09:30:00Z"}]`))
 	})
-	if _, err := Pull(ctx, st, c, nil, ts("2026-01-01T00:00:00Z"), ts("2026-01-02T12:00:00Z")); err != nil {
+	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z")); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
-	got, _ := st.EntryByRemoteID(ctx, 910)
+	got := mustEntryByRemoteID(t, st, 910)
 	if got == nil || !got.Billable {
 		t.Fatalf("entry = %+v, want Billable=true", got)
 	}
 }
 
 func TestPushSendsBillable(t *testing.T) {
+	t.Parallel()
 	var body map[string]any
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
-		raw, _ := io.ReadAll(r.Body)
-		json.Unmarshal(raw, &body)
+		body = decodeBody(t, r)
 		w.Write([]byte(`{"id":556,"at":"2026-01-02T10:00:00Z"}`))
 	})
-	start := ts("2026-01-02T09:00:00Z")
+	start := ts(t, "2026-01-02T09:00:00Z")
 	stop := start.Add(5 * time.Minute)
-	st.CreateEntry(ctx, store.Entry{
+	mustCreate(t, st, store.Entry{
 		WorkspaceID: 1, ProjectID: ptrInt(3), Start: start, Stop: &stop,
 		Duration: 300, Billable: true, UpdatedAt: stop, Dirty: true,
 	})
@@ -272,48 +344,50 @@ func TestPushSendsBillable(t *testing.T) {
 }
 
 func TestPullLWWRemoteNewer(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`[{"id":900,"workspace_id":1,"description":"new",
 		  "start":"2026-01-02T09:00:00Z","duration":-1,"at":"2026-01-02T10:00:00Z"}]`))
 	})
-	st.CreateEntry(ctx, store.Entry{
+	mustCreate(t, st, store.Entry{
 		RemoteID: ptrInt(900), WorkspaceID: 1, Description: "old",
-		Start: ts("2026-01-02T09:00:00Z"), Duration: -1,
-		UpdatedAt: ts("2026-01-02T09:00:00Z"), Dirty: false,
+		Start: ts(t, "2026-01-02T09:00:00Z"), Duration: -1,
+		UpdatedAt: ts(t, "2026-01-02T09:00:00Z"), Dirty: false,
 	})
 
-	res, err := Pull(ctx, st, c, nil, ts("2026-01-01T00:00:00Z"), ts("2026-01-02T12:00:00Z"))
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"))
 	if err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	if res.Updated != 1 {
 		t.Errorf("updated = %d, want 1", res.Updated)
 	}
-	got, _ := st.EntryByRemoteID(ctx, 900)
+	got := mustEntryByRemoteID(t, st, 900)
 	if got.Description != "new" {
 		t.Errorf("description = %q, want new", got.Description)
 	}
 }
 
 func TestPullLWWLocalNewer(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`[{"id":901,"workspace_id":1,"description":"remote",
 		  "start":"2026-01-02T09:00:00Z","duration":-1,"at":"2026-01-02T10:00:00Z"}]`))
 	})
-	st.CreateEntry(ctx, store.Entry{
+	mustCreate(t, st, store.Entry{
 		RemoteID: ptrInt(901), WorkspaceID: 1, Description: "local",
-		Start: ts("2026-01-02T09:00:00Z"), Duration: -1,
-		UpdatedAt: ts("2026-01-02T11:00:00Z"), Dirty: true,
+		Start: ts(t, "2026-01-02T09:00:00Z"), Duration: -1,
+		UpdatedAt: ts(t, "2026-01-02T11:00:00Z"), Dirty: true,
 	})
 
-	res, err := Pull(ctx, st, c, nil, ts("2026-01-01T00:00:00Z"), ts("2026-01-02T12:00:00Z"))
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"))
 	if err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	if res.Skipped != 1 {
 		t.Errorf("skipped = %d, want 1", res.Skipped)
 	}
-	got, _ := st.EntryByRemoteID(ctx, 901)
+	got := mustEntryByRemoteID(t, st, 901)
 	if got.Description != "local" {
 		t.Errorf("description = %q, want local (kept)", got.Description)
 	}
@@ -325,26 +399,27 @@ func TestPullLWWLocalNewer(t *testing.T) {
 // it) and the local entry has unsynced changes. The remote used to win the tie
 // and drop the edit before `tg push` ever ran.
 func TestPullLWWTieKeepsDirtyLocal(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`[{"id":905,"workspace_id":1,"description":"remote",
 		  "start":"2026-01-02T09:00:00Z","stop":"2026-01-02T09:30:00Z",
 		  "duration":1800,"at":"2026-01-02T10:00:00Z"}]`))
 	})
-	at := ts("2026-01-02T10:00:00Z")
-	st.CreateEntry(ctx, store.Entry{
+	at := ts(t, "2026-01-02T10:00:00Z")
+	mustCreate(t, st, store.Entry{
 		RemoteID: ptrInt(905), WorkspaceID: 1, Description: "local edit",
-		Start: ts("2026-01-02T09:00:00Z"), Stop: ptrTime(ts("2026-01-02T09:45:00Z")),
+		Start: ts(t, "2026-01-02T09:00:00Z"), Stop: ptrTime(ts(t, "2026-01-02T09:45:00Z")),
 		Duration: 2700, UpdatedAt: at, SyncedAt: &at, Dirty: true,
 	})
 
-	res, err := Pull(ctx, st, c, nil, ts("2026-01-01T00:00:00Z"), ts("2026-01-02T12:00:00Z"))
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"))
 	if err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	if res.Updated != 0 || res.Skipped != 1 {
 		t.Errorf("res = %+v, want the dirty entry skipped, not updated", res)
 	}
-	got, _ := st.EntryByRemoteID(ctx, 905)
+	got := mustEntryByRemoteID(t, st, 905)
 	if got == nil || got.Description != "local edit" || got.Duration != 2700 {
 		t.Fatalf("entry = %+v, want the local edit kept", got)
 	}
@@ -359,59 +434,62 @@ func TestPullLWWTieKeepsDirtyLocal(t *testing.T) {
 // That is what keeps `tg pull` right after `tg push` idempotent instead of
 // leaving the entry looking locally newer forever.
 func TestPullLWWTieOverwritesCleanLocal(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`[{"id":906,"workspace_id":1,"description":"remote",
 		  "start":"2026-01-02T09:00:00Z","stop":"2026-01-02T09:30:00Z",
 		  "duration":1800,"at":"2026-01-02T10:00:00Z"}]`))
 	})
-	at := ts("2026-01-02T10:00:00Z")
-	st.CreateEntry(ctx, store.Entry{
+	at := ts(t, "2026-01-02T10:00:00Z")
+	mustCreate(t, st, store.Entry{
 		RemoteID: ptrInt(906), WorkspaceID: 1, Description: "stale",
-		Start: ts("2026-01-02T09:00:00Z"), Stop: ptrTime(ts("2026-01-02T09:30:00Z")),
+		Start: ts(t, "2026-01-02T09:00:00Z"), Stop: ptrTime(ts(t, "2026-01-02T09:30:00Z")),
 		Duration: 1800, UpdatedAt: at, SyncedAt: &at, Dirty: false,
 	})
 
-	res, err := Pull(ctx, st, c, nil, ts("2026-01-01T00:00:00Z"), ts("2026-01-02T12:00:00Z"))
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"))
 	if err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	if res.Updated != 1 {
 		t.Errorf("res = %+v, want the clean entry updated", res)
 	}
-	if got, _ := st.EntryByRemoteID(ctx, 906); got == nil || got.Description != "remote" {
+	if got := mustEntryByRemoteID(t, st, 906); got == nil || got.Description != "remote" {
 		t.Errorf("entry = %+v, want remote state", got)
 	}
 }
 
 func TestPullRemoteDeleted(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`[{"id":902,"workspace_id":1,"start":"2026-01-02T09:00:00Z",
 		  "duration":300,"at":"2026-01-02T10:00:00Z","server_deleted_at":"2026-01-02T10:00:00Z"}]`))
 	})
-	st.CreateEntry(ctx, store.Entry{
+	mustCreate(t, st, store.Entry{
 		RemoteID: ptrInt(902), WorkspaceID: 1,
-		Start: ts("2026-01-02T09:00:00Z"), Duration: 300,
-		UpdatedAt: ts("2026-01-02T09:00:00Z"),
+		Start: ts(t, "2026-01-02T09:00:00Z"), Duration: 300,
+		UpdatedAt: ts(t, "2026-01-02T09:00:00Z"),
 	})
 
-	res, err := Pull(ctx, st, c, nil, ts("2026-01-01T00:00:00Z"), ts("2026-01-02T12:00:00Z"))
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"))
 	if err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	if res.Deleted != 1 {
 		t.Errorf("deleted = %d, want 1", res.Deleted)
 	}
-	if got, _ := st.EntryByRemoteID(ctx, 902); got != nil {
+	if got := mustEntryByRemoteID(t, st, 902); got != nil {
 		t.Errorf("entry should be deleted, got %+v", got)
 	}
 }
 
 func TestPullSkipsRemoteDeletedWithNoLocal(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`[{"id":903,"workspace_id":1,"start":"2026-01-02T09:00:00Z",
 		  "duration":300,"at":"2026-01-02T10:00:00Z","server_deleted_at":"2026-01-02T10:00:00Z"}]`))
 	})
-	res, err := Pull(ctx, st, c, nil, ts("2026-01-01T00:00:00Z"), ts("2026-01-02T12:00:00Z"))
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"))
 	if err != nil {
 		t.Fatalf("pull: %v", err)
 	}
@@ -424,6 +502,7 @@ func TestPullSkipsRemoteDeletedWithNoLocal(t *testing.T) {
 // its project/task titles via the catalog even when nothing was seeded, by
 // self-healing from the meta=true names in the payload.
 func TestPullSelfHealsCatalog(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`[{"id":950,"workspace_id":1,"project_id":5,"task_id":7,
 		  "project_name":"Backend","project_color":"#0B83D9",
@@ -432,11 +511,11 @@ func TestPullSelfHealsCatalog(t *testing.T) {
 		  "duration":1800,"at":"2026-01-02T09:30:00Z"}]`))
 	})
 
-	if _, err := Pull(ctx, st, c, nil, ts("2026-01-01T00:00:00Z"), ts("2026-01-02T12:00:00Z")); err != nil {
+	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z")); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 
-	entries, err := st.EntriesBetween(ctx, ts("2026-01-02T00:00:00Z"), ts("2026-01-03T00:00:00Z"))
+	entries, err := st.EntriesBetween(ctx, ts(t, "2026-01-02T00:00:00Z"), ts(t, "2026-01-03T00:00:00Z"))
 	if err != nil {
 		t.Fatalf("entries: %v", err)
 	}
@@ -467,6 +546,7 @@ func TestPullSelfHealsCatalog(t *testing.T) {
 // TestPullProjectScope verifies a project-scoped pull only reconciles entries
 // for that project and, being partial, does not advance the last_pull watermark.
 func TestPullProjectScope(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`[
 		  {"id":1,"workspace_id":1,"project_id":5,"description":"mine",
@@ -481,38 +561,39 @@ func TestPullProjectScope(t *testing.T) {
 	})
 
 	pid := int64(5)
-	now := ts("2026-01-02T12:00:00Z")
-	res, err := Pull(ctx, st, c, &pid, ts("2026-01-01T00:00:00Z"), now)
+	now := ts(t, "2026-01-02T12:00:00Z")
+	res, err := Pull(ctx, st, c, &pid, ts(t, "2026-01-01T00:00:00Z"), now)
 	if err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	if res.Inserted != 1 {
 		t.Errorf("inserted = %d, want 1 (only project 5)", res.Inserted)
 	}
-	if got, _ := st.EntryByRemoteID(ctx, 1); got == nil {
+	if got := mustEntryByRemoteID(t, st, 1); got == nil {
 		t.Error("entry for project 5 should have been inserted")
 	}
-	if got, _ := st.EntryByRemoteID(ctx, 2); got != nil {
+	if got := mustEntryByRemoteID(t, st, 2); got != nil {
 		t.Error("entry for other project should be ignored")
 	}
-	if got, _ := st.EntryByRemoteID(ctx, 3); got != nil {
+	if got := mustEntryByRemoteID(t, st, 3); got != nil {
 		t.Error("entry with no project should be ignored")
 	}
 	// A scoped pull is partial: the watermark must not advance.
-	if _, ok, _ := st.Meta(ctx, store.MetaLastPull); ok {
+	if _, ok := mustMeta(t, st, store.MetaLastPull); ok {
 		t.Error("scoped pull should not advance last_pull")
 	}
 }
 
 func TestPullAdvancesLastPull(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`[]`))
 	})
-	now := ts("2026-01-02T12:00:00Z")
-	if _, err := Pull(ctx, st, c, nil, ts("2026-01-01T00:00:00Z"), now); err != nil {
+	now := ts(t, "2026-01-02T12:00:00Z")
+	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), now); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
-	v, ok, _ := st.Meta(ctx, store.MetaLastPull)
+	v, ok := mustMeta(t, st, store.MetaLastPull)
 	if !ok || v != "2026-01-02T12:00:00Z" {
 		t.Errorf("last_pull = %q ok=%v, want now", v, ok)
 	}
@@ -523,17 +604,18 @@ func TestPullAdvancesLastPull(t *testing.T) {
 // day pulls "today", whose start precedes the watermark left by the first run,
 // so the two windows chain and no change can slip through the seam.
 func TestPullChainedWindowAdvancesLastPull(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`[]`))
 	})
 	if err := st.SetMeta(ctx, store.MetaLastPull, "2026-01-02T06:00:00Z"); err != nil {
 		t.Fatalf("seed watermark: %v", err)
 	}
-	now := ts("2026-01-02T12:00:00Z")
-	if _, err := Pull(ctx, st, c, nil, ts("2026-01-02T00:00:00Z"), now); err != nil {
+	now := ts(t, "2026-01-02T12:00:00Z")
+	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-02T00:00:00Z"), now); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
-	v, _, _ := st.Meta(ctx, store.MetaLastPull)
+	v, _ := mustMeta(t, st, store.MetaLastPull)
 	if v != "2026-01-02T12:00:00Z" {
 		t.Errorf("last_pull = %q, want now (window reaches back past the watermark)", v)
 	}
@@ -544,17 +626,18 @@ func TestPullChainedWindowAdvancesLastPull(t *testing.T) {
 // first time in days never looked at what changed in between, so claiming
 // coverage up to now would hide those changes from a later wider pull.
 func TestPullPartialWindowKeepsLastPull(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`[]`))
 	})
 	if err := st.SetMeta(ctx, store.MetaLastPull, "2025-12-28T09:00:00Z"); err != nil {
 		t.Fatalf("seed watermark: %v", err)
 	}
-	now := ts("2026-01-02T12:00:00Z")
-	if _, err := Pull(ctx, st, c, nil, ts("2026-01-02T00:00:00Z"), now); err != nil {
+	now := ts(t, "2026-01-02T12:00:00Z")
+	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-02T00:00:00Z"), now); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
-	v, _, _ := st.Meta(ctx, store.MetaLastPull)
+	v, _ := mustMeta(t, st, store.MetaLastPull)
 	if v != "2025-12-28T09:00:00Z" {
 		t.Errorf("last_pull = %q, want the untouched watermark", v)
 	}
@@ -564,17 +647,18 @@ func TestPullPartialWindowKeepsLastPull(t *testing.T) {
 // wedge the pull path: there is no coverage claim worth protecting, so it is
 // overwritten with a well-formed one.
 func TestPullUnparsableWatermarkAdvances(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`[]`))
 	})
 	if err := st.SetMeta(ctx, store.MetaLastPull, "not-a-timestamp"); err != nil {
 		t.Fatalf("seed watermark: %v", err)
 	}
-	now := ts("2026-01-02T12:00:00Z")
-	if _, err := Pull(ctx, st, c, nil, ts("2026-01-02T00:00:00Z"), now); err != nil {
+	now := ts(t, "2026-01-02T12:00:00Z")
+	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-02T00:00:00Z"), now); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
-	v, _, _ := st.Meta(ctx, store.MetaLastPull)
+	v, _ := mustMeta(t, st, store.MetaLastPull)
 	if v != "2026-01-02T12:00:00Z" {
 		t.Errorf("last_pull = %q, want now", v)
 	}
@@ -585,14 +669,15 @@ func TestPullUnparsableWatermarkAdvances(t *testing.T) {
 // silently becoming now (which would store a local clock as if the server had
 // sent it and skew every later LWW comparison).
 func TestRemoteAt(t *testing.T) {
-	now := ts("2026-01-02T12:00:00Z")
+	t.Parallel()
+	now := ts(t, "2026-01-02T12:00:00Z")
 
 	got, err := remoteAt("", now)
 	if err != nil || !got.Equal(now) {
 		t.Errorf("remoteAt(\"\") = %v err=%v, want now", got, err)
 	}
 	got, err = remoteAt("2026-01-02T10:00:00Z", now)
-	if err != nil || !got.Equal(ts("2026-01-02T10:00:00Z")) {
+	if err != nil || !got.Equal(ts(t, "2026-01-02T10:00:00Z")) {
 		t.Errorf("remoteAt(valid) = %v err=%v, want the parsed remote at", got, err)
 	}
 	for _, bad := range []string{"not-a-timestamp", "2026-01-02 10:00:00", "1767355200"} {
@@ -606,24 +691,25 @@ func TestRemoteAt(t *testing.T) {
 // rather than being papered over: the entry keeps its own clock and stays dirty,
 // so nothing converges on a fabricated `at`.
 func TestPushInvalidRemoteAt(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"id":557,"at":"yesterday"}`))
 	})
-	start := ts("2026-01-02T09:00:00Z")
+	start := ts(t, "2026-01-02T09:00:00Z")
 	stop := start.Add(5 * time.Minute)
-	id, _ := st.CreateEntry(ctx, store.Entry{
+	id := mustCreate(t, st, store.Entry{
 		WorkspaceID: 1, Start: start, Stop: &stop, Duration: 300,
 		UpdatedAt: stop, Dirty: true,
 	})
 
-	res, err := Push(ctx, st, c, ts("2026-01-02T12:00:00Z"))
+	res, err := Push(ctx, st, c, ts(t, "2026-01-02T12:00:00Z"))
 	if err == nil {
 		t.Fatalf("push = %+v, want an error for the malformed remote at", res)
 	}
 	if res.Created != 0 {
 		t.Errorf("created = %d, want 0", res.Created)
 	}
-	dirty, _ := st.DirtyEntries(ctx)
+	dirty := mustDirty(t, st)
 	if len(dirty) != 1 || dirty[0].ID != id {
 		t.Fatalf("dirty = %+v, want the entry left for a later push", dirty)
 	}
@@ -635,6 +721,7 @@ func TestPushInvalidRemoteAt(t *testing.T) {
 // TestRoundTrip pushes a fresh local entry, then pulls the server's view of it
 // back and asserts convergence (clean, single consistent row).
 func TestRoundTrip(t *testing.T) {
+	t.Parallel()
 	created := false
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -650,29 +737,29 @@ func TestRoundTrip(t *testing.T) {
 		}
 	})
 
-	start := ts("2026-01-02T09:00:00Z")
+	start := ts(t, "2026-01-02T09:00:00Z")
 	stop := start.Add(5 * time.Minute)
-	st.CreateEntry(ctx, store.Entry{
+	mustCreate(t, st, store.Entry{
 		WorkspaceID: 1, Start: start, Stop: &stop, Duration: 300,
 		UpdatedAt: stop, Dirty: true,
 	})
 
-	if _, err := Push(ctx, st, c, ts("2026-01-02T10:00:00Z")); err != nil {
+	if _, err := Push(ctx, st, c, ts(t, "2026-01-02T10:00:00Z")); err != nil {
 		t.Fatalf("push: %v", err)
 	}
 	if !created {
 		t.Fatal("expected a create call")
 	}
-	if _, err := Pull(ctx, st, c, nil, ts("2026-01-01T00:00:00Z"), ts("2026-01-02T12:00:00Z")); err != nil {
+	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z")); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 
 	// Converged: exactly one clean entry mirroring remote 1000.
-	dirty, _ := st.DirtyEntries(ctx)
+	dirty := mustDirty(t, st)
 	if len(dirty) != 0 {
 		t.Errorf("dirty entries after round-trip = %d, want 0", len(dirty))
 	}
-	got, _ := st.EntryByRemoteID(ctx, 1000)
+	got := mustEntryByRemoteID(t, st, 1000)
 	if got == nil || got.Duration != 300 {
 		t.Fatalf("converged entry = %+v", got)
 	}
@@ -683,11 +770,10 @@ func TestRoundTrip(t *testing.T) {
 // pushed. It stays dirty (so it can be fixed or retried) and is reported, while
 // everything else goes through.
 func TestPushSkipsFailedEntry(t *testing.T) {
+	t.Parallel()
 	var attempted []string
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]any
-		raw, _ := io.ReadAll(r.Body)
-		json.Unmarshal(raw, &body)
+		body := decodeBody(t, r)
 		desc, _ := body["description"].(string)
 		attempted = append(attempted, desc)
 		if desc == "poison" {
@@ -699,7 +785,7 @@ func TestPushSkipsFailedEntry(t *testing.T) {
 		fmt.Fprintf(w, `{"id":%d,"at":"2026-01-02T10:00:00Z"}`, 600+len(attempted))
 	})
 
-	day := ts("2026-01-02T09:00:00Z")
+	day := ts(t, "2026-01-02T09:00:00Z")
 	var ids []int64
 	for i, desc := range []string{"first", "poison", "last"} {
 		start := day.Add(time.Duration(i) * time.Hour)
@@ -714,7 +800,7 @@ func TestPushSkipsFailedEntry(t *testing.T) {
 		ids = append(ids, id)
 	}
 
-	res, err := Push(ctx, st, c, ts("2026-01-02T12:00:00Z"))
+	res, err := Push(ctx, st, c, ts(t, "2026-01-02T12:00:00Z"))
 	// The push reports the failure, but as a summary of what was left behind.
 	var perr *PushError
 	if !errors.As(err, &perr) {
@@ -756,6 +842,7 @@ func TestPushSkipsFailedEntry(t *testing.T) {
 // retries it) and an update that fails keeps the entry dirty, while an unrelated
 // entry in the same run is still sent.
 func TestPushSkipsFailedDeleteAndUpdate(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodDelete, http.MethodPut:
@@ -766,26 +853,26 @@ func TestPushSkipsFailedDeleteAndUpdate(t *testing.T) {
 		}
 	})
 
-	day := ts("2026-01-02T09:00:00Z")
+	day := ts(t, "2026-01-02T09:00:00Z")
 	delStop := day.Add(30 * time.Minute)
-	delID, _ := st.CreateEntry(ctx, store.Entry{
+	delID := mustCreate(t, st, store.Entry{
 		RemoteID: ptrInt(801), WorkspaceID: 1, Start: day, Stop: &delStop,
 		Duration: 1800, UpdatedAt: delStop, Dirty: true, Deleted: true,
 	})
 	updStart := day.Add(time.Hour)
 	updStop := updStart.Add(30 * time.Minute)
-	updID, _ := st.CreateEntry(ctx, store.Entry{
+	updID := mustCreate(t, st, store.Entry{
 		RemoteID: ptrInt(802), WorkspaceID: 1, Start: updStart, Stop: &updStop,
 		Duration: 1800, UpdatedAt: updStop, Dirty: true,
 	})
 	newStart := day.Add(2 * time.Hour)
 	newStop := newStart.Add(30 * time.Minute)
-	newID, _ := st.CreateEntry(ctx, store.Entry{
+	newID := mustCreate(t, st, store.Entry{
 		WorkspaceID: 1, Start: newStart, Stop: &newStop,
 		Duration: 1800, UpdatedAt: newStop, Dirty: true,
 	})
 
-	res, err := Push(ctx, st, c, ts("2026-01-02T12:00:00Z"))
+	res, err := Push(ctx, st, c, ts(t, "2026-01-02T12:00:00Z"))
 	if err == nil {
 		t.Fatalf("push = %+v, want an error reporting the failures", res)
 	}
@@ -797,7 +884,7 @@ func TestPushSkipsFailedDeleteAndUpdate(t *testing.T) {
 	}
 	// The failed delete kept its row (soft-deleted, dirty) instead of being
 	// dropped locally while Toggl still holds it.
-	dirty, _ := st.DirtyEntries(ctx)
+	dirty := mustDirty(t, st)
 	got := map[int64]store.Entry{}
 	for _, e := range dirty {
 		got[e.ID] = e
@@ -820,6 +907,7 @@ func TestPushSkipsFailedDeleteAndUpdate(t *testing.T) {
 // per-entry failure to be skipped: the loop stops at once and the context error
 // is what surfaces.
 func TestPushContextCancelAborts(t *testing.T) {
+	t.Parallel()
 	var calls int
 	cctx, cancel := context.WithCancel(context.Background())
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
@@ -828,7 +916,7 @@ func TestPushContextCancelAborts(t *testing.T) {
 		w.Write([]byte(`{"id":900,"at":"2026-01-02T10:00:00Z"}`))
 	})
 
-	day := ts("2026-01-02T09:00:00Z")
+	day := ts(t, "2026-01-02T09:00:00Z")
 	for i := 0; i < 3; i++ {
 		start := day.Add(time.Duration(i) * time.Hour)
 		stop := start.Add(30 * time.Minute)
@@ -840,7 +928,7 @@ func TestPushContextCancelAborts(t *testing.T) {
 		}
 	}
 
-	_, err := Push(cctx, st, c, ts("2026-01-02T12:00:00Z"))
+	_, err := Push(cctx, st, c, ts(t, "2026-01-02T12:00:00Z"))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
@@ -853,6 +941,7 @@ func TestPushContextCancelAborts(t *testing.T) {
 // malformed entry half-way through the remote list leaves the store untouched
 // rather than half-reconciled, and the watermark is not moved either.
 func TestPullRollsBackOnFailure(t *testing.T) {
+	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		// The first entry is fine; the second carries an unparsable `at`.
 		w.Write([]byte(`[{"id":910,"workspace_id":1,"description":"good",
@@ -862,17 +951,17 @@ func TestPullRollsBackOnFailure(t *testing.T) {
 		  "start":"2026-01-02T10:00:00Z","duration":1800,"at":"yesterday"}]`))
 	})
 
-	res, err := Pull(ctx, st, c, nil, ts("2026-01-01T00:00:00Z"), ts("2026-01-02T12:00:00Z"))
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"))
 	if err == nil {
 		t.Fatalf("pull = %+v, want an error for the malformed entry", res)
 	}
 	if res != (PullResult{}) {
 		t.Errorf("res = %+v, want a zero result: nothing was applied", res)
 	}
-	if got, _ := st.EntryByRemoteID(ctx, 910); got != nil {
+	if got := mustEntryByRemoteID(t, st, 910); got != nil {
 		t.Errorf("entry = %+v, want it rolled back with the failed pull", got)
 	}
-	if _, ok, _ := st.Meta(ctx, store.MetaLastPull); ok {
+	if _, ok := mustMeta(t, st, store.MetaLastPull); ok {
 		t.Error("a failed pull must not advance last_pull")
 	}
 }
@@ -880,6 +969,7 @@ func TestPullRollsBackOnFailure(t *testing.T) {
 // TestPullContextCancelAborts verifies a cancelled context stops the pull loop
 // and rolls back whatever it had applied.
 func TestPullContextCancelAborts(t *testing.T) {
+	t.Parallel()
 	cctx, cancel := context.WithCancel(context.Background())
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		cancel()
@@ -888,10 +978,10 @@ func TestPullContextCancelAborts(t *testing.T) {
 		  "duration":1800,"at":"2026-01-02T09:30:00Z"}]`))
 	})
 
-	if _, err := Pull(cctx, st, c, nil, ts("2026-01-01T00:00:00Z"), ts("2026-01-02T12:00:00Z")); !errors.Is(err, context.Canceled) {
+	if _, err := Pull(cctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z")); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
-	if got, _ := st.EntryByRemoteID(ctx, 920); got != nil {
+	if got := mustEntryByRemoteID(t, st, 920); got != nil {
 		t.Errorf("entry = %+v, want nothing applied", got)
 	}
 }
@@ -899,6 +989,7 @@ func TestPullContextCancelAborts(t *testing.T) {
 // TestPushErrorMessage pins the summary error's shape: it names the entries and
 // carries their errors, so `tg push` says what was left behind.
 func TestPushErrorMessage(t *testing.T) {
+	t.Parallel()
 	one := &PushError{Failures: []PushFailure{{EntryID: 3, Err: "nope"}}}
 	if got, want := one.Error(), "1 entry could not be pushed: entry 3: nope"; got != want {
 		t.Errorf("Error() = %q, want %q", got, want)

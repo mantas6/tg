@@ -14,6 +14,7 @@ func hm(h, m int) time.Time {
 }
 
 func TestParseAbsoluteValid(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		in                     string
 		wantStartH, wantStartM int
@@ -29,6 +30,7 @@ func TestParseAbsoluteValid(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
+			t.Parallel()
 			span, err := Parse(tc.in, now, time.UTC)
 			if err != nil {
 				t.Fatalf("Parse(%q): %v", tc.in, err)
@@ -47,6 +49,7 @@ func TestParseAbsoluteValid(t *testing.T) {
 }
 
 func TestParseAbsoluteErrors(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		in   string
@@ -69,6 +72,7 @@ func TestParseAbsoluteErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			if _, err := Parse(tc.in, now, time.UTC); err == nil {
 				t.Errorf("Parse(%q) = nil error, want an error", tc.in)
 			}
@@ -77,6 +81,7 @@ func TestParseAbsoluteErrors(t *testing.T) {
 }
 
 func TestParseRelativeValid(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name    string
 		in      string
@@ -106,6 +111,7 @@ func TestParseRelativeValid(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			span, err := Parse(tc.in, tc.now, time.UTC)
 			if err != nil {
 				t.Fatalf("Parse(%q): %v", tc.in, err)
@@ -127,6 +133,7 @@ func TestParseRelativeValid(t *testing.T) {
 }
 
 func TestParseRelativeSecondsAreDropped(t *testing.T) {
+	t.Parallel()
 	// Sub-minute components of now never leak into the resolved span.
 	in := time.Date(2026, 1, 2, 14, 23, 47, 123456789, time.UTC)
 	span, err := Parse("+:15", in, time.UTC)
@@ -142,6 +149,7 @@ func TestParseRelativeSecondsAreDropped(t *testing.T) {
 }
 
 func TestParseRelativeCrossesMidnightBackwards(t *testing.T) {
+	t.Parallel()
 	span, err := Parse("+2", hm(0, 30), time.UTC)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
@@ -156,6 +164,7 @@ func TestParseRelativeCrossesMidnightBackwards(t *testing.T) {
 }
 
 func TestParseRelativeErrors(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		in   string
@@ -177,6 +186,7 @@ func TestParseRelativeErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			if _, err := Parse(tc.in, now, time.UTC); err == nil {
 				t.Errorf("Parse(%q) = nil error, want an error", tc.in)
 			}
@@ -185,6 +195,7 @@ func TestParseRelativeErrors(t *testing.T) {
 }
 
 func TestParseDurationValid(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		in   string
 		want time.Duration
@@ -200,6 +211,7 @@ func TestParseDurationValid(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
+			t.Parallel()
 			got, err := ParseDuration(tc.in)
 			if err != nil {
 				t.Fatalf("ParseDuration(%q): %v", tc.in, err)
@@ -212,6 +224,7 @@ func TestParseDurationValid(t *testing.T) {
 }
 
 func TestParseDurationErrors(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		in   string
@@ -233,6 +246,7 @@ func TestParseDurationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			if _, err := ParseDuration(tc.in); err == nil {
 				t.Errorf("ParseDuration(%q) = nil error, want an error", tc.in)
 			}
@@ -243,6 +257,7 @@ func TestParseDurationErrors(t *testing.T) {
 // TestParseDurationHasNoAnchor pins the point of the bare form: it resolves to
 // a length only, so neither now nor a location can influence it.
 func TestParseDurationHasNoAnchor(t *testing.T) {
+	t.Parallel()
 	got, err := ParseDuration("1:30")
 	if err != nil {
 		t.Fatalf("ParseDuration: %v", err)
@@ -260,6 +275,7 @@ func TestParseDurationHasNoAnchor(t *testing.T) {
 }
 
 func TestIsDuration(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		in   string
 		want bool
@@ -285,6 +301,7 @@ func TestIsDuration(t *testing.T) {
 }
 
 func TestIsRelative(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		in   string
 		want bool
@@ -307,6 +324,7 @@ func TestIsRelative(t *testing.T) {
 }
 
 func TestParseDispatchesOnPrefix(t *testing.T) {
+	t.Parallel()
 	// A relative sign parsed as absolute (and vice versa) must fail, proving
 	// Parse dispatches on the "+" prefix rather than guessing.
 	if _, err := ParseAbsolute("+:20", now, time.UTC); err == nil {
@@ -318,6 +336,7 @@ func TestParseDispatchesOnPrefix(t *testing.T) {
 }
 
 func TestFloor5(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		in, want time.Time
 	}{
@@ -339,6 +358,7 @@ func TestFloor5(t *testing.T) {
 }
 
 func TestFloor5KeepsLocation(t *testing.T) {
+	t.Parallel()
 	// Flooring is a wall-clock operation: a location with a non-hour UTC offset
 	// must still land on a local :00/:05/... mark.
 	loc := time.FixedZone("half", 30*60)
@@ -350,6 +370,7 @@ func TestFloor5KeepsLocation(t *testing.T) {
 }
 
 func TestParseRelativeUsesLocationWallClock(t *testing.T) {
+	t.Parallel()
 	// now is given in UTC but loc is offset, so the 5-minute mark is computed
 	// against loc's wall clock.
 	loc := time.FixedZone("plus2", 2*60*60)
@@ -368,6 +389,7 @@ func TestParseRelativeUsesLocationWallClock(t *testing.T) {
 }
 
 func TestKindString(t *testing.T) {
+	t.Parallel()
 	if got := Absolute.String(); got != "absolute" {
 		t.Errorf("Absolute.String() = %q", got)
 	}

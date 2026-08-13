@@ -90,8 +90,7 @@ func runAdd(ctx context.Context, args []string) error {
 	// --desc and --description are aliases bound to the same variable, so
 	// either spelling sets the entry's description (empty leaves it blank).
 	var desc string
-	fs.StringVar(&desc, "desc", "", "entry description")
-	fs.StringVar(&desc, "description", "", "entry description (alias of --desc)")
+	bindDescFlag(fs, &desc, "entry description")
 	var first bool
 	bindFirstFlag(fs, &first, "task or project")
 	// Flags may follow the timesign and the fragment (`tg add 9-10 login -1`),
@@ -133,20 +132,14 @@ func runMod(ctx context.Context, args []string) error {
 	fs := newFlagSet("mod")
 	// Same --desc/--description alias pair as `add`; here an explicitly empty
 	// value clears the description, which is why the flag's presence is tracked
-	// separately (see setDesc below).
+	// separately (see descWasSet).
 	var desc string
-	fs.StringVar(&desc, "desc", "", "new entry description")
-	fs.StringVar(&desc, "description", "", "new entry description (alias of --desc)")
+	bindDescFlag(fs, &desc, "new entry description")
 	rest, err := parseArgsAndFlags(fs, args)
 	if err != nil {
 		return err
 	}
-	setDesc := false
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "desc" || f.Name == "description" {
-			setDesc = true
-		}
-	})
+	setDesc := descWasSet(fs)
 
 	ref, timesign, err := parseModArgs(rest)
 	if err != nil {
@@ -287,28 +280,14 @@ func runProjectsUpdate(ctx context.Context, args []string) error {
 
 func runUpdate(ctx context.Context, args []string) error {
 	fs := newFlagSet("update")
-	all := fs.Bool("all", false, "include inactive tasks")
-	jsonOut := fs.Bool("json", false, "emit JSON")
-	// --days and -n are aliases bound to the same variable: how many days back
-	// the time-entry pull reaches. The default is one day (see
-	// resolveUpdateSince).
-	var days int
-	fs.IntVar(&days, "days", updateDefaultDays, "pull entries from the last N days")
-	fs.IntVar(&days, "n", updateDefaultDays, "pull entries from the last N days (alias of --days)")
-	// --project and -p are aliases naming the project by fragment, exactly
-	// like the positional form (`tg update backend` == `tg update -p backend`).
-	var project string
-	fs.StringVar(&project, "project", "", "project name fragment to update")
-	fs.StringVar(&project, "p", "", "project name fragment to update (alias of --project)")
-	var first bool
-	bindFirstFlag(fs, &first, "project")
+	f := bindUpdateFlags(fs)
 	// Flags may follow the project fragment (`tg update backend -n 3`), so
 	// positionals are peeled off the same way `tg grep` does it.
 	rest, err := parseArgsAndFlags(fs, args)
 	if err != nil {
 		return err
 	}
-	fragment, err := updateProjectFragment(project, rest)
+	fragment, err := f.resolveFragment(rest)
 	if err != nil {
 		return err
 	}
@@ -317,8 +296,8 @@ func runUpdate(ctx context.Context, args []string) error {
 		return err
 	}
 	return withEnv(ctx, func(env *cmdEnv) error {
-		since := resolveUpdateSince(days, env.now, env.loc)
-		return cmdUpdate(env, projectID, first, fragment, since, *all, *jsonOut)
+		since := resolveUpdateSince(f.days, env.now, env.loc)
+		return cmdUpdate(env, projectID, f.first, fragment, since, f.all, f.jsonOut)
 	})
 }
 
@@ -333,16 +312,7 @@ func runPush(ctx context.Context, args []string) error {
 
 func runPull(ctx context.Context, args []string) error {
 	fs := newFlagSet("pull")
-	jsonOut := fs.Bool("json", false, "emit JSON")
-	sinceFlag := fs.String("since", "", "pull entries modified since DATE (YYYY-MM-DD)")
-	// --all and -a are aliases bound to the same variable: they widen the
-	// default today-only window to the whole current month (see
-	// resolvePullSince).
-	var all bool
-	fs.BoolVar(&all, "all", false, "pull this month's entries instead of only today's")
-	fs.BoolVar(&all, "a", false, "pull this month's entries (alias of --all)")
-	var first bool
-	bindFirstFlag(fs, &first, "project")
+	f := bindPullFlags(fs)
 	// Flags may follow the project fragment (`tg pull backend -a`), so
 	// positionals are peeled off the same way `tg update` does it.
 	rest, err := parseArgsAndFlags(fs, args)
@@ -351,7 +321,7 @@ func runPull(ctx context.Context, args []string) error {
 	}
 	fragment := strings.Join(rest, " ")
 	return withEnv(ctx, func(env *cmdEnv) error {
-		since, err := resolvePullSince(*sinceFlag, all, env.now, env.loc)
+		since, err := resolvePullSince(f.since, f.all, env.now, env.loc)
 		if err != nil {
 			return err
 		}
@@ -359,7 +329,7 @@ func runPull(ctx context.Context, args []string) error {
 		// it always reconciles every project. Scoping happens only via an
 		// explicit <project> argument, so the env project id is never passed
 		// through here.
-		return cmdPull(env, first, fragment, since, *jsonOut)
+		return cmdPull(env, f.first, fragment, since, f.jsonOut)
 	})
 }
 
@@ -426,6 +396,14 @@ func runCompletion(args []string) error {
 // The clock and calendar are pinned once per invocation, so every part of a
 // command sees the same "now" rather than sampling it repeatedly.
 func withEnv(ctx context.Context, fn func(env *cmdEnv) error) error {
+	return withEnvOut(ctx, os.Stdout, fn)
+}
+
+// withEnvOut is withEnv with the command's output stream given explicitly. Every
+// command writes to stdout, so withEnv fills that in; the parameter exists so
+// the prologue itself (config loading, store opening, the assembled cmdEnv) can
+// be exercised without a command scribbling on the test's own stdout.
+func withEnvOut(ctx context.Context, w io.Writer, fn func(env *cmdEnv) error) error {
 	cfg, err := optionalConfig()
 	if err != nil {
 		return err
@@ -436,7 +414,7 @@ func withEnv(ctx context.Context, fn func(env *cmdEnv) error) error {
 	}
 	defer st.Close()
 
-	env := &cmdEnv{ctx: ctx, w: os.Stdout, st: st, now: time.Now(), loc: time.Local}
+	env := &cmdEnv{ctx: ctx, w: w, st: st, now: time.Now(), loc: time.Local}
 	if cfg != nil {
 		env.c = api.New(cfg.APIToken)
 		env.workspaceID = cfg.WorkspaceID
@@ -488,6 +466,91 @@ func bindFirstFlag(fs *flag.FlagSet, first *bool, subject string) {
 	usage := "on an ambiguous " + subject + " fragment, use the first match instead of failing"
 	fs.BoolVar(first, "1", false, usage)
 	fs.BoolVar(first, "first", false, usage+" (alias of -1)")
+}
+
+// bindDescFlag binds --desc and its --description alias to the same variable, so
+// either spelling sets an entry's description. `add` and `mod` share it (and so
+// share the spelling), which is also what lets descWasSet recognize both names.
+func bindDescFlag(fs *flag.FlagSet, desc *string, usage string) {
+	fs.StringVar(desc, "desc", "", usage)
+	fs.StringVar(desc, "description", "", usage+" (alias of --desc)")
+}
+
+// descWasSet reports whether either spelling of the description flag actually
+// appeared on the command line. `tg mod` needs the distinction because an
+// explicitly empty --desc CLEARS the description, which an unset flag (whose
+// value is empty too) must not do.
+func descWasSet(fs *flag.FlagSet) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "desc" || f.Name == "description" {
+			set = true
+		}
+	})
+	return set
+}
+
+// updateFlags holds `tg update`'s flag values. Registration lives in
+// bindUpdateFlags rather than inline in runUpdate so the flag names, aliases and
+// defaults are one testable thing: a test that re-declared them would keep
+// passing after a rename here, which is exactly what it must not do.
+type updateFlags struct {
+	all     bool
+	jsonOut bool
+	// days is how many days back the time-entry pull reaches (--days/-n),
+	// defaulting to one day; see resolveUpdateSince.
+	days int
+	// project names the project by fragment (--project/-p), the flag form of
+	// the positional argument; see resolveFragment.
+	project string
+	first   bool
+}
+
+func bindUpdateFlags(fs *flag.FlagSet) *updateFlags {
+	f := &updateFlags{}
+	fs.BoolVar(&f.all, "all", false, "include inactive tasks")
+	fs.BoolVar(&f.jsonOut, "json", false, "emit JSON")
+	// --days and -n are aliases bound to the same variable, so either spelling
+	// sets the window and both share the default.
+	fs.IntVar(&f.days, "days", updateDefaultDays, "pull entries from the last N days")
+	fs.IntVar(&f.days, "n", updateDefaultDays, "pull entries from the last N days (alias of --days)")
+	// --project and -p name the project by fragment, exactly like the
+	// positional form (`tg update backend` == `tg update -p backend`).
+	fs.StringVar(&f.project, "project", "", "project name fragment to update")
+	fs.StringVar(&f.project, "p", "", "project name fragment to update (alias of --project)")
+	bindFirstFlag(fs, &f.first, "project")
+	return f
+}
+
+// resolveFragment folds the flag and positional spellings of `tg update`'s
+// project into the one fragment resolveUpdateProject matches against the cached
+// catalog (see updateProjectFragment for the precedence rules).
+func (f *updateFlags) resolveFragment(positional []string) (string, error) {
+	return updateProjectFragment(f.project, positional)
+}
+
+// pullFlags holds `tg pull`'s flag values; see updateFlags for why registration
+// is a function of its own.
+type pullFlags struct {
+	jsonOut bool
+	// since is the explicit window start (--since DATE), empty when absent;
+	// see resolvePullSince.
+	since string
+	// all widens the default today-only window to the whole current month
+	// (--all/-a).
+	all   bool
+	first bool
+}
+
+func bindPullFlags(fs *flag.FlagSet) *pullFlags {
+	f := &pullFlags{}
+	fs.BoolVar(&f.jsonOut, "json", false, "emit JSON")
+	fs.StringVar(&f.since, "since", "", "pull entries modified since DATE (YYYY-MM-DD)")
+	// --all and -a are aliases bound to the same variable.
+	fs.BoolVar(&f.all, "all", false, "pull this month's entries instead of only today's")
+	fs.BoolVar(&f.all, "a", false, "pull this month's entries (alias of --all)")
+	bindFirstFlag(fs, &f.first, "project")
+	return f
 }
 
 // parseArgsAndFlags parses args with fs and returns the positional arguments,

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,11 +15,18 @@ import (
 
 var update = flag.Bool("update", false, "update golden files")
 
+// goldenMu serializes the -update rewrites. The tests run in parallel and two of
+// them assert the same golden (the renderer's own output and the command's), so
+// without it two goroutines could truncate and write one file at once.
+var goldenMu sync.Mutex
+
 // assertGolden compares got against testdata/<name>, rewriting it under -update.
 func assertGolden(t *testing.T, name, got string) {
 	t.Helper()
 	path := filepath.Join("testdata", name)
 	if *update {
+		goldenMu.Lock()
+		defer goldenMu.Unlock()
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -37,6 +45,7 @@ func assertGolden(t *testing.T, name, got string) {
 }
 
 func TestFormatHM(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		in   time.Duration
 		want string
@@ -58,6 +67,7 @@ func TestFormatHM(t *testing.T) {
 // formatHM it must keep the sign (so an under-run is never read as an over-run)
 // and it must not clamp negatives to zero.
 func TestFormatOvertime(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		in   time.Duration
 		want string
@@ -81,6 +91,7 @@ func TestFormatOvertime(t *testing.T) {
 }
 
 func TestPlural(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		n    int
 		want string
@@ -93,6 +104,7 @@ func TestPlural(t *testing.T) {
 }
 
 func TestFormatClock(t *testing.T) {
+	t.Parallel()
 	tm := time.Date(2026, 1, 2, 9, 15, 0, 0, time.UTC)
 	if got := formatClock(tm, time.UTC); got != "09:15" {
 		t.Errorf("formatClock = %q, want 09:15", got)
@@ -115,6 +127,7 @@ func sampleDay() (entries []store.Entry, now time.Time) {
 }
 
 func TestRenderTodayGolden(t *testing.T) {
+	t.Parallel()
 	entries, now := sampleDay()
 	var buf bytes.Buffer
 	renderToday(&buf, entries, now, time.UTC, false)
@@ -122,6 +135,7 @@ func TestRenderTodayGolden(t *testing.T) {
 }
 
 func TestRenderTodayJSONGolden(t *testing.T) {
+	t.Parallel()
 	entries, now := sampleDay()
 	var buf bytes.Buffer
 	if err := renderTodayJSON(&buf, entries, now); err != nil {
@@ -134,6 +148,7 @@ func TestRenderTodayJSONGolden(t *testing.T) {
 // the last entry's stop so the trailing gap (covered by
 // TestRenderTodayTrailingGap) never contributes a "(gap ...)" row of its own.
 func TestRenderTodayGaps(t *testing.T) {
+	t.Parallel()
 	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
 	at := func(d time.Duration) time.Time { return day.Add(d) }
 	pt := func(t time.Time) *time.Time { return &t }
@@ -191,6 +206,7 @@ func TestRenderTodayGaps(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
 			// now sits exactly on the last entry's stop (or its start when it
 			// is running), so only inter-entry gaps can show up.
 			last := c.entries[len(c.entries)-1]
@@ -217,6 +233,7 @@ func TestRenderTodayGaps(t *testing.T) {
 // the gaps between entries and under the same rules — nothing while the last
 // entry runs, nothing below the threshold, nothing across midnight.
 func TestRenderTodayTrailingGap(t *testing.T) {
+	t.Parallel()
 	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
 	at := func(d time.Duration) time.Time { return day.Add(d) }
 	pt := func(t time.Time) *time.Time { return &t }
@@ -276,6 +293,7 @@ func TestRenderTodayTrailingGap(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
 			var buf bytes.Buffer
 			renderToday(&buf, c.entries, c.now, time.UTC, false)
 			got := buf.String()
@@ -295,6 +313,7 @@ func TestRenderTodayTrailingGap(t *testing.T) {
 // number, and the column widens (right-aligned) once a number reaches two
 // digits.
 func TestRenderTodayRefNumbers(t *testing.T) {
+	t.Parallel()
 	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
 	at := func(d time.Duration) time.Time { return day.Add(d) }
 	pt := func(t time.Time) *time.Time { return &t }
@@ -348,6 +367,7 @@ func TestRenderTodayRefNumbers(t *testing.T) {
 // whose entry 2 was deleted still lists 1 and 3 — and the column is sized by
 // the highest number, not by how many entries are left.
 func TestRenderTodayNumbersAreNotPositions(t *testing.T) {
+	t.Parallel()
 	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
 	at := func(d time.Duration) time.Time { return day.Add(d) }
 	pt := func(t time.Time) *time.Time { return &t }
@@ -376,6 +396,7 @@ func TestRenderTodayNumbersAreNotPositions(t *testing.T) {
 // shape: each calendar day numbers from 1, so a listing spanning days labels
 // the groups. A single-day listing gets no header at all.
 func TestRenderTodayMultiDayHeaders(t *testing.T) {
+	t.Parallel()
 	first := time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC)
 	second := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	pt := func(t time.Time) *time.Time { return &t }
@@ -418,6 +439,7 @@ func TestRenderTodayMultiDayHeaders(t *testing.T) {
 // and the project bracket: names at or beyond the padding width must not run
 // into "[project]".
 func TestRenderTodayLongNameSpacing(t *testing.T) {
+	t.Parallel()
 	start := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	stop := time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 1, 2, 11, 0, 0, 0, time.UTC)
@@ -433,6 +455,7 @@ func TestRenderTodayLongNameSpacing(t *testing.T) {
 }
 
 func TestParseHexColor(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		in      string
 		r, g, b uint8
@@ -457,6 +480,7 @@ func TestParseHexColor(t *testing.T) {
 }
 
 func TestColorBlock(t *testing.T) {
+	t.Parallel()
 	if got, want := colorBlock("#0B83D9"), "\x1b[38;2;11;131;217m\u25a0\x1b[0m"; got != want {
 		t.Errorf("colorBlock = %q, want %q", got, want)
 	}
@@ -468,6 +492,7 @@ func TestColorBlock(t *testing.T) {
 }
 
 func TestRenderTodayColor(t *testing.T) {
+	t.Parallel()
 	entries, now := sampleDay()
 	for i := range entries {
 		entries[i].ProjectColor = "#0B83D9"
@@ -499,6 +524,7 @@ func TestRenderTodayColor(t *testing.T) {
 }
 
 func TestRenderTodayEmpty(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	renderToday(&buf, nil, time.Now(), time.UTC, false)
 	if buf.String() != "No entries.\n" {
@@ -507,6 +533,7 @@ func TestRenderTodayEmpty(t *testing.T) {
 }
 
 func TestRenderCurrentGolden(t *testing.T) {
+	t.Parallel()
 	entries, now := sampleDay()
 	running := entries[1] // the running entry
 	total, _ := totalDuration(entries, now)
@@ -527,6 +554,7 @@ func TestRenderCurrentGolden(t *testing.T) {
 // TestRenderCurrentLastGolden covers the no-timer status line: the newest
 // finished entry with its wall-clock range plus the idle gap up to now.
 func TestRenderCurrentLastGolden(t *testing.T) {
+	t.Parallel()
 	entries, _ := sampleDay()
 	last := entries[0] // 09:15-10:30
 	now := time.Date(2026, 1, 2, 10, 55, 0, 0, time.UTC)
@@ -549,6 +577,7 @@ func TestRenderCurrentLastGolden(t *testing.T) {
 // within the 5-minute quantization noise of) the last entry's stop, and that the
 // gap deliberately spans calendar days once it is real.
 func TestRenderCurrentGapSuppressed(t *testing.T) {
+	t.Parallel()
 	entries, _ := sampleDay()
 	last := entries[0] // stops 10:30
 	stop := *last.Stop
@@ -574,6 +603,7 @@ func TestRenderCurrentGapSuppressed(t *testing.T) {
 }
 
 func TestTotalDuration(t *testing.T) {
+	t.Parallel()
 	entries, now := sampleDay()
 	total, anyRunning := totalDuration(entries, now)
 	if want := 2 * time.Hour; total != want { // 1h15m stored + 0h45m live
@@ -597,6 +627,7 @@ func TestTotalDuration(t *testing.T) {
 }
 
 func TestTruncName(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name     string
 		in       string
@@ -621,6 +652,7 @@ func TestTruncName(t *testing.T) {
 }
 
 func TestRenderCurrentTruncatesName(t *testing.T) {
+	t.Parallel()
 	start := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
 	now := time.Date(2026, 1, 2, 11, 15, 0, 0, time.UTC)
 	e := store.Entry{
@@ -646,6 +678,7 @@ func TestRenderCurrentTruncatesName(t *testing.T) {
 
 // A name at or under the (doubled) status cap must pass through untouched.
 func TestRenderCurrentKeepsNameUnderNewLimit(t *testing.T) {
+	t.Parallel()
 	start := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
 	now := time.Date(2026, 1, 2, 11, 15, 0, 0, time.UTC)
 	name := "This task name is definitely way too long" // 41 runes: fit under 60
@@ -674,12 +707,14 @@ func sampleTasks() []store.Task {
 }
 
 func TestRenderTasksGolden(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	renderTasks(&buf, sampleTasks())
 	assertGolden(t, "tasks.txt", buf.String())
 }
 
 func TestRenderTasksJSONGolden(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	if err := renderTasksJSON(&buf, sampleTasks()); err != nil {
 		t.Fatal(err)
@@ -688,6 +723,7 @@ func TestRenderTasksJSONGolden(t *testing.T) {
 }
 
 func TestRenderTasksEmpty(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	renderTasks(&buf, nil)
 	if !strings.Contains(buf.String(), "tg update") {
@@ -705,12 +741,14 @@ func sampleProjects() []store.Project {
 }
 
 func TestRenderProjectsGolden(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	renderProjects(&buf, sampleProjects())
 	assertGolden(t, "projects.txt", buf.String())
 }
 
 func TestRenderProjectsJSONGolden(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	if err := renderProjectsJSON(&buf, sampleProjects()); err != nil {
 		t.Fatal(err)
@@ -719,6 +757,7 @@ func TestRenderProjectsJSONGolden(t *testing.T) {
 }
 
 func TestRenderProjectsEmpty(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	renderProjects(&buf, nil)
 	if !strings.Contains(buf.String(), "tg projects update") {
@@ -727,6 +766,7 @@ func TestRenderProjectsEmpty(t *testing.T) {
 }
 
 func TestRenderCurrentNoneGolden(t *testing.T) {
+	t.Parallel()
 	var human bytes.Buffer
 	if err := renderCurrent(&human, nil, 0, time.Now(), time.UTC, false); err != nil {
 		t.Fatal(err)
@@ -755,6 +795,7 @@ func sampleMonth() (rows []dailyRow, now time.Time) {
 }
 
 func TestRenderDailyGolden(t *testing.T) {
+	t.Parallel()
 	rows, now := sampleMonth()
 	var buf bytes.Buffer
 	renderDaily(&buf, rows, now, 8*time.Hour, time.UTC, false)
@@ -762,6 +803,7 @@ func TestRenderDailyGolden(t *testing.T) {
 }
 
 func TestRenderDailyJSONGolden(t *testing.T) {
+	t.Parallel()
 	rows, _ := sampleMonth()
 	var buf bytes.Buffer
 	if err := renderDailyJSON(&buf, rows, 8*time.Hour, time.UTC); err != nil {
@@ -774,6 +816,7 @@ func TestRenderDailyJSONGolden(t *testing.T) {
 // column is tracked-minus-target, signed, and the divider footer sums the days
 // and measures them against target x the number of LISTED days.
 func TestRenderDailyOvertimeColumn(t *testing.T) {
+	t.Parallel()
 	rows, now := sampleMonth()
 	var buf bytes.Buffer
 	renderDaily(&buf, rows, now, 8*time.Hour, time.UTC, false)
@@ -798,6 +841,7 @@ func TestRenderDailyOvertimeColumn(t *testing.T) {
 // overtime column (and the footer's target) without touching the tracked
 // durations, and that a non-integer target works.
 func TestRenderDailyTargetChangesOnlyOvertime(t *testing.T) {
+	t.Parallel()
 	rows, now := sampleMonth()
 	var buf bytes.Buffer
 	renderDaily(&buf, rows, now, 7*time.Hour+30*time.Minute, time.UTC, false)
@@ -818,6 +862,7 @@ func TestRenderDailyTargetChangesOnlyOvertime(t *testing.T) {
 // TestRenderDailyZeroTarget covers the degenerate target: with no target every
 // overtime figure is just the tracked time, and nothing is ever negative.
 func TestRenderDailyZeroTarget(t *testing.T) {
+	t.Parallel()
 	rows, now := sampleMonth()
 	var buf bytes.Buffer
 	renderDaily(&buf, rows, now, 0, time.UTC, false)
@@ -835,6 +880,7 @@ func TestRenderDailyZeroTarget(t *testing.T) {
 // TestRenderDailySingleDayFooter covers the footer's singular noun and the fact
 // that the footer target scales with the number of listed days.
 func TestRenderDailySingleDayFooter(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	rows := []dailyRow{{Day: time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC), Tracked: 9 * time.Hour}}
 	renderDaily(&buf, rows, time.Date(2026, 1, 5, 18, 0, 0, 0, time.UTC), 8*time.Hour, time.UTC, false)
@@ -847,6 +893,7 @@ func TestRenderDailySingleDayFooter(t *testing.T) {
 }
 
 func TestRenderDailyEmpty(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	renderDaily(&buf, nil, time.Now(), 8*time.Hour, time.UTC, false)
 	if got := buf.String(); got != "No entries this month.\n" {
@@ -857,6 +904,7 @@ func TestRenderDailyEmpty(t *testing.T) {
 // TestRenderDailyJSONEmpty pins that the JSON shape stays a well-formed object
 // with an empty (never null) days array when nothing was tracked.
 func TestRenderDailyJSONEmpty(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	if err := renderDailyJSON(&buf, nil, 8*time.Hour, time.UTC); err != nil {
 		t.Fatal(err)
@@ -871,6 +919,7 @@ func TestRenderDailyJSONEmpty(t *testing.T) {
 // reporting location, not UTC: a day whose midnight is stored in a UTC-offset
 // zone must still print its own calendar date.
 func TestRenderDailyLocalDates(t *testing.T) {
+	t.Parallel()
 	loc := time.FixedZone("UTC+3", 3*60*60)
 	rows := []dailyRow{{Day: time.Date(2026, 1, 5, 0, 0, 0, 0, loc), Tracked: 8 * time.Hour}}
 	now := time.Date(2026, 1, 5, 18, 0, 0, 0, loc)
@@ -889,6 +938,7 @@ func TestRenderDailyLocalDates(t *testing.T) {
 }
 
 func TestFaint(t *testing.T) {
+	t.Parallel()
 	if got, want := faint("x"), "\x1b[2mx\x1b[0m"; got != want {
 		t.Errorf("faint = %q, want %q", got, want)
 	}
@@ -899,6 +949,7 @@ func TestFaint(t *testing.T) {
 // and the days already behind stay plain — so the listing separates worked time
 // from planned time. Nothing is styled when color is off.
 func TestRenderDailyGreysFutureDays(t *testing.T) {
+	t.Parallel()
 	day := func(d int) time.Time { return time.Date(2026, 1, d, 0, 0, 0, 0, time.UTC) }
 	rows := []dailyRow{
 		{Day: day(5), Tracked: 8 * time.Hour}, // yesterday
@@ -938,6 +989,7 @@ func TestRenderDailyGreysFutureDays(t *testing.T) {
 // after local midnight, today's row is still today (its midnight is behind now)
 // and only the next day is dimmed, even though both sit ahead of now in UTC.
 func TestRenderDailyFutureDayUsesLocalCalendar(t *testing.T) {
+	t.Parallel()
 	loc := time.FixedZone("UTC+3", 3*60*60)
 	rows := []dailyRow{
 		{Day: time.Date(2026, 1, 5, 0, 0, 0, 0, loc), Tracked: 8 * time.Hour},

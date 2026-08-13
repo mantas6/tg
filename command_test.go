@@ -83,6 +83,105 @@ func newStoreIn(t *testing.T, loc *time.Location) *store.Store {
 	return s
 }
 
+// ptrInt is the pointer helper the store's optional ids need (project/task ids,
+// remote ids), matching the one each of the other packages' tests defines.
+func ptrInt(v int64) *int64 { return &v }
+
+// --- checked store reads -----------------------------------------------------
+//
+// The must* helpers below wrap the store reads the assertions are made against.
+// They exist because these tests used to drop the errors (`entries, _ :=
+// s.EntriesBetween(...)`), which turns a failing query into an empty result and
+// so into a confusing assertion failure ("entries = 0, want 1") about the
+// command rather than about the store call that actually broke.
+
+// mustEntries reads the entries in [from, to).
+func mustEntries(t *testing.T, s *store.Store, from, to time.Time) []store.Entry {
+	t.Helper()
+	entries, err := s.EntriesBetween(ctx, from, to)
+	if err != nil {
+		t.Fatalf("EntriesBetween(%v, %v): %v", from, to, err)
+	}
+	return entries
+}
+
+// mustRunning reads the running entry, if any.
+func mustRunning(t *testing.T, s *store.Store) *store.Entry {
+	t.Helper()
+	e, err := s.Running(ctx)
+	if err != nil {
+		t.Fatalf("Running: %v", err)
+	}
+	return e
+}
+
+// mustEntryByRemoteID reads the entry mirroring a Toggl id, nil when none does.
+func mustEntryByRemoteID(t *testing.T, s *store.Store, remoteID int64) *store.Entry {
+	t.Helper()
+	e, err := s.EntryByRemoteID(ctx, remoteID)
+	if err != nil {
+		t.Fatalf("EntryByRemoteID(%d): %v", remoteID, err)
+	}
+	return e
+}
+
+// mustDirtyEntries reads the push queue.
+func mustDirtyEntries(t *testing.T, s *store.Store) []store.Entry {
+	t.Helper()
+	dirty, err := s.DirtyEntries(ctx)
+	if err != nil {
+		t.Fatalf("DirtyEntries: %v", err)
+	}
+	return dirty
+}
+
+// mustMeta reads a meta key, returning its value and whether it is set.
+func mustMeta(t *testing.T, s *store.Store, key string) (string, bool) {
+	t.Helper()
+	v, ok, err := s.Meta(ctx, key)
+	if err != nil {
+		t.Fatalf("Meta(%q): %v", key, err)
+	}
+	return v, ok
+}
+
+func mustListTasks(t *testing.T, s *store.Store, includeInactive bool, projectID *int64) []store.Task {
+	t.Helper()
+	tasks, err := s.ListTasks(ctx, includeInactive, projectID)
+	if err != nil {
+		t.Fatalf("ListTasks: %v", err)
+	}
+	return tasks
+}
+
+func mustListProjects(t *testing.T, s *store.Store, includeInactive bool) []store.Project {
+	t.Helper()
+	projects, err := s.ListProjects(ctx, includeInactive)
+	if err != nil {
+		t.Fatalf("ListProjects: %v", err)
+	}
+	return projects
+}
+
+// decodeBody unmarshals a JSON request body captured by one of the stub Toggl
+// handlers below. It runs on the server's goroutine, so it reports a malformed
+// body with t.Errorf (t.Fatalf may only be called from the test's own
+// goroutine) instead of leaving the captured map silently empty.
+func decodeBody(t *testing.T, r *http.Request) map[string]any {
+	t.Helper()
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Errorf("read request body: %v", err)
+		return nil
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Errorf("decode request body %q: %v", raw, err)
+		return nil
+	}
+	return body
+}
+
 func seedCatalog(t *testing.T, s *store.Store) {
 	t.Helper()
 	if err := s.ReplaceProjects(ctx, []store.Project{
@@ -112,10 +211,39 @@ var testStart = time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 func seedRunning(t *testing.T, s *store.Store, taskID int64, start time.Time) {
 	t.Helper()
 	if _, err := s.CreateEntry(ctx, store.Entry{
-		WorkspaceID: 1, ProjectID: p(1), TaskID: &taskID,
+		WorkspaceID: 1, ProjectID: ptrInt(1), TaskID: &taskID,
 		Start: start, Duration: -1, UpdatedAt: start,
 	}); err != nil {
 		t.Fatalf("seed running entry: %v", err)
+	}
+}
+
+// fixtureEntry describes one entry for the table-driven fixtures below: when it
+// starts, how long it lasts and the task it is filed under (all in project 1 of
+// seedCatalog). A zero dur means the entry is still running — no stop, Toggl's
+// negative-duration marker — which is how a pulled timer looks locally.
+type fixtureEntry struct {
+	start  time.Time
+	dur    time.Duration
+	taskID int64
+}
+
+// seedFixture inserts the given entries in order, which is also what hands out
+// their per-day numbers (so the first one is entry 1 of its day).
+func seedFixture(t *testing.T, s *store.Store, entries ...fixtureEntry) {
+	t.Helper()
+	for _, fe := range entries {
+		e := store.Entry{
+			WorkspaceID: 1, ProjectID: ptrInt(1), TaskID: ptrInt(fe.taskID),
+			Start: fe.start, Duration: -1, UpdatedAt: fe.start,
+		}
+		if fe.dur > 0 {
+			stop := fe.start.Add(fe.dur)
+			e.Stop, e.Duration, e.UpdatedAt = &stop, int64(fe.dur/time.Second), stop
+		}
+		if _, err := s.CreateEntry(ctx, e); err != nil {
+			t.Fatalf("seed entry at %v: %v", fe.start, err)
+		}
 	}
 }
 
@@ -156,7 +284,15 @@ func TestProjectIDFromEnvInvalid(t *testing.T) {
 // below; the timesign grammar itself is covered by the timesig package.
 var addNow = time.Date(2026, 1, 2, 15, 0, 0, 0, time.UTC)
 
+// addWindow is the window the add fixtures live in: a day either side of the
+// instant the timesigns resolve against.
+func addWindow(t *testing.T, s *store.Store, now time.Time) []store.Entry {
+	t.Helper()
+	return mustEntries(t, s, now.Add(-24*time.Hour), now.Add(24*time.Hour))
+}
+
 func TestAddCreatesFinishedEntry(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -171,7 +307,7 @@ func TestAddCreatesFinishedEntry(t *testing.T) {
 		}
 	}
 
-	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	entries := addWindow(t, s, addNow)
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
@@ -203,7 +339,7 @@ func TestAddCreatesFinishedEntry(t *testing.T) {
 	if !e.Dirty {
 		t.Error("added entry should be dirty for a later push")
 	}
-	if r, _ := s.Running(ctx); r != nil {
+	if r := mustRunning(t, s); r != nil {
 		t.Errorf("add must not create a running entry, got %+v", r)
 	}
 }
@@ -213,6 +349,7 @@ func TestAddCreatesFinishedEntry(t *testing.T) {
 // preceding 5-minute mark and starts that many minutes earlier. (Overlap
 // checks are a separate concern.)
 func TestAddAcceptsRelativeTimesign(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -226,7 +363,7 @@ func TestAddAcceptsRelativeTimesign(t *testing.T) {
 		t.Errorf("output = %q, want 14:45-15:05", out)
 	}
 
-	entries, _ := s.EntriesBetween(ctx, now.Add(-24*time.Hour), now.Add(24*time.Hour))
+	entries := addWindow(t, s, now)
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
@@ -244,18 +381,150 @@ func TestAddAcceptsRelativeTimesign(t *testing.T) {
 	}
 }
 
-// TestAddRejectsInvalidRelativeTimesign keeps the zero-duration relative form
-// out of the store.
-func TestAddRejectsInvalidRelativeTimesign(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
+// TestAddResolvesTask tables what `tg add` files an entry against: the fragment
+// is resolved through the shared task resolver (an exact task name beating the
+// longer names it is part of, a project scope narrowing the candidates, `-1`
+// inert on a fragment that already resolves), the entry inherits its project
+// from the resolved task — billable flag included — and --desc lands on it.
+func TestAddResolvesTask(t *testing.T) {
+	t.Parallel()
+	payments := int64(2)
+	for _, tc := range []struct {
+		name          string
+		projectID     *int64
+		first         bool
+		fragment      string
+		desc          string
+		wantTaskID    int64
+		wantProjectID int64
+		wantBillable  bool
+		wantDesc      string
+	}{
+		{
+			// Backend (project 1) is not billable, so neither is the entry.
+			name: "unique fragment", fragment: "login",
+			wantTaskID: 10, wantProjectID: 1,
+		},
+		{
+			// "Fix" exactly matches task 11 even though it is a substring of
+			// "Fix login bug" and "Payment fix".
+			name: "exact name wins", fragment: "Fix",
+			wantTaskID: 11, wantProjectID: 1,
+		},
+		{
+			// "fix" matches several tasks, but scoping to Payments leaves one —
+			// and that project is billable, which the entry inherits.
+			name: "project scope narrows the fragment", projectID: &payments, fragment: "fix",
+			wantTaskID: 20, wantProjectID: 2, wantBillable: true,
+		},
+		{
+			// `-1` never changes which task a working fragment picks.
+			name: "first flag is inert when unique", first: true, fragment: "login",
+			wantTaskID: 10, wantProjectID: 1,
+		},
+		{
+			name: "description is stored", fragment: "login", desc: "reset password flow",
+			wantTaskID: 10, wantProjectID: 1, wantDesc: "reset password flow",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
 
-	var buf bytes.Buffer
-	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "+:00", "login", ""); err == nil {
-		t.Fatal("add with +:00 = nil error, want an error")
+			var buf bytes.Buffer
+			if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), tc.projectID, tc.first, "9-10", tc.fragment, tc.desc); err != nil {
+				t.Fatalf("add: %v", err)
+			}
+			entries := addWindow(t, s, addNow)
+			if len(entries) != 1 {
+				t.Fatalf("entries = %d, want 1", len(entries))
+			}
+			e := entries[0]
+			if e.TaskID == nil || *e.TaskID != tc.wantTaskID {
+				t.Errorf("task_id = %v, want %d", e.TaskID, tc.wantTaskID)
+			}
+			if e.ProjectID == nil || *e.ProjectID != tc.wantProjectID {
+				t.Errorf("project_id = %v, want %d", e.ProjectID, tc.wantProjectID)
+			}
+			if e.Billable != tc.wantBillable {
+				t.Errorf("billable = %v, want %v (the project's flag)", e.Billable, tc.wantBillable)
+			}
+			if e.Description != tc.wantDesc {
+				t.Errorf("description = %q, want %q", e.Description, tc.wantDesc)
+			}
+		})
 	}
-	if entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 0 {
-		t.Errorf("entries = %d, want 0", len(entries))
+}
+
+// TestAddRefusals tables the calls `tg add` declines: every malformed timesign
+// form and every fragment that does not resolve to exactly one task. None of
+// them may write an entry — a bad timesign is rejected before the catalog is
+// even consulted — and the ambiguity error carries the candidates (with their
+// projects, which is how same-named tasks are told apart) plus the way out.
+func TestAddRefusals(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		// anchored seeds a 09:00-10:00 entry first, which is what the bare
+		// duration forms would otherwise continue from.
+		anchored bool
+		timesign string
+		fragment string
+		first    bool
+		wantErr  []string
+	}{
+		{name: "zero-length relative timesign", timesign: "+:00", fragment: "login", wantErr: []string{"timesign"}},
+		{name: "unparsable timesign", timesign: "nope", fragment: "login", wantErr: []string{"timesign"}},
+		{name: "zero bare duration", anchored: true, timesign: "0", fragment: "review", wantErr: []string{"timesign"}},
+		{name: "zero minutes duration", anchored: true, timesign: ":00", fragment: "review", wantErr: []string{"timesign"}},
+		{name: "duration out of range", anchored: true, timesign: "24", fragment: "review", wantErr: []string{"timesign"}},
+		{name: "duration minutes out of range", anchored: true, timesign: "1:60", fragment: "review", wantErr: []string{"timesign"}},
+		{name: "duration missing minutes", anchored: true, timesign: "1:", fragment: "review", wantErr: []string{"timesign"}},
+		{
+			name: "ambiguous fragment", timesign: "10-11", fragment: "write",
+			wantErr: []string{"multiple tasks match", "Write tests", "Write docs", "[Backend]", "pass -1"},
+		},
+		{
+			name: "no match", timesign: "10-11", fragment: "nonexistent",
+			wantErr: []string{"no task matches", "tg update"},
+		},
+		{
+			// `-1` resolves ambiguity; with nothing to choose from it still fails.
+			name: "no match with -1", timesign: "10-11", fragment: "nonexistent", first: true,
+			wantErr: []string{"tg update"},
+		},
+		{name: "empty fragment", timesign: "10-11", fragment: "  ", wantErr: []string{addUsage}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
+			wantEntries := 0
+			if tc.anchored {
+				if err := cmdAdd(env(io.Discard, s, nil, addNow, time.UTC), nil, false, "9-10", "login", ""); err != nil {
+					t.Fatalf("seed anchor: %v", err)
+				}
+				wantEntries = 1
+			}
+
+			var buf bytes.Buffer
+			err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, tc.first, tc.timesign, tc.fragment, "")
+			if err == nil {
+				t.Fatalf("add %q %q = nil error, want a refusal", tc.timesign, tc.fragment)
+			}
+			for _, want := range tc.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("err = %v, want it to mention %q", err, want)
+				}
+			}
+			if buf.Len() != 0 {
+				t.Errorf("output = %q, want nothing written", buf.String())
+			}
+			if got := addWindow(t, s, addNow); len(got) != wantEntries {
+				t.Errorf("entries = %d, want %d (a refused add writes nothing)", len(got), wantEntries)
+			}
+		})
 	}
 }
 
@@ -263,6 +532,7 @@ func TestAddRejectsInvalidRelativeTimesign(t *testing.T) {
 // start time given, the entry picks up where the last one ended and runs for
 // the duration typed, so `tg add 1:30 <task>` logs the block back to back.
 func TestAddDurationStartsAtLastEntryEnd(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -280,7 +550,7 @@ func TestAddDurationStartsAtLastEntryEnd(t *testing.T) {
 		t.Errorf("output = %q, want 10:00-11:30 (1h30m)", out)
 	}
 
-	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	entries := addWindow(t, s, addNow)
 	if len(entries) != 2 {
 		t.Fatalf("entries = %d, want 2", len(entries))
 	}
@@ -315,6 +585,7 @@ func TestAddDurationStartsAtLastEntryEnd(t *testing.T) {
 // (pointing at the forms that need no anchor) rather than silently starting at
 // now or reaching back into yesterday.
 func TestAddDurationWithoutLastEntry(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -338,7 +609,7 @@ func TestAddDurationWithoutLastEntry(t *testing.T) {
 		t.Errorf("output = %q, want nothing written", buf.String())
 	}
 	// Only yesterday's entry exists; nothing was created today.
-	entries, _ := s.EntriesBetween(ctx, addNow.AddDate(0, 0, -2), addNow.Add(24*time.Hour))
+	entries := mustEntries(t, s, addNow.AddDate(0, 0, -2), addNow.Add(24*time.Hour))
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1 (yesterday's only)", len(entries))
 	}
@@ -348,6 +619,7 @@ func TestAddDurationWithoutLastEntry(t *testing.T) {
 // running entry has no end time to continue from, so the bare form is refused
 // exactly as `tg mod +DURATION` refuses one.
 func TestAddDurationWithRunningLastEntry(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -361,7 +633,7 @@ func TestAddDurationWithRunningLastEntry(t *testing.T) {
 	if !strings.Contains(err.Error(), "still running") {
 		t.Errorf("err = %v, want it to mention the running entry", err)
 	}
-	if entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 1 {
+	if entries := addWindow(t, s, addNow); len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1 (the running entry only)", len(entries))
 	}
 }
@@ -371,6 +643,7 @@ func TestAddDurationWithRunningLastEntry(t *testing.T) {
 // the anchor (LastEntry ignores future starts), so only the guard can catch a
 // duration long enough to run into it.
 func TestAddDurationRejectsOverlap(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -395,7 +668,7 @@ func TestAddDurationRejectsOverlap(t *testing.T) {
 			t.Errorf("err = %v, want it to mention %q", err, want)
 		}
 	}
-	if entries, _ := s.EntriesBetween(ctx, now.Add(-24*time.Hour), now.Add(24*time.Hour)); len(entries) != 2 {
+	if entries := addWindow(t, s, now); len(entries) != 2 {
 		t.Fatalf("entries = %d, want 2", len(entries))
 	}
 
@@ -409,56 +682,16 @@ func TestAddDurationRejectsOverlap(t *testing.T) {
 	}
 }
 
-// TestAddRejectsInvalidDuration keeps a malformed or zero bare duration out of
-// the store, reported as a timesign error before any anchor lookup.
-func TestAddRejectsInvalidDuration(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	if err := cmdAdd(env(&bytes.Buffer{}, s, nil, addNow, time.UTC), nil, false, "9-10", "login", ""); err != nil {
-		t.Fatalf("add first: %v", err)
-	}
-	for _, ts := range []string{"0", ":00", "24", "1:60", "1:"} {
-		var buf bytes.Buffer
-		err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, ts, "review", "")
-		if err == nil || !strings.Contains(err.Error(), "timesign") {
-			t.Errorf("add %q: err = %v, want a timesign parse error", ts, err)
-		}
-	}
-	if entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 1 {
-		t.Fatalf("entries = %d, want 1", len(entries))
-	}
-}
-
-// TestAddWithDescription verifies --desc/--description sets the entry's
-// description on the stored entry.
-func TestAddWithDescription(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "9-:30", "login", "reset password flow"); err != nil {
-		t.Fatalf("add: %v", err)
-	}
-	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
-	if len(entries) != 1 {
-		t.Fatalf("entries = %d, want 1", len(entries))
-	}
-	if got := entries[0].Description; got != "reset password flow" {
-		t.Errorf("description = %q, want %q", got, "reset password flow")
-	}
-}
-
 // TestAddDescriptionInPushPayload verifies a description set via --desc reaches
 // Toggl in the create payload on the best-effort push.
 func TestAddDescriptionInPushPayload(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
 	var body map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, _ := io.ReadAll(r.Body)
-		json.Unmarshal(raw, &body)
+		body = decodeBody(t, r)
 		w.Write([]byte(`{"id":9200,"at":"2026-01-02T09:00:00Z"}`))
 	}))
 	defer srv.Close()
@@ -473,44 +706,11 @@ func TestAddDescriptionInPushPayload(t *testing.T) {
 	}
 }
 
-// TestAddExactWins covers the shared fragment matching: an exact task title
-// beats the longer titles it is a substring of.
-func TestAddExactWins(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	// "Fix" exactly matches task 11 even though it is a substring of others.
-	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "9-10", "Fix", ""); err != nil {
-		t.Fatalf("add: %v", err)
-	}
-	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
-	if len(entries) != 1 {
-		t.Fatalf("entries = %d, want 1", len(entries))
-	}
-	if entries[0].TaskID == nil || *entries[0].TaskID != 11 {
-		t.Errorf("task_id = %v, want 11 (Fix)", entries[0].TaskID)
-	}
-}
-
-// TestAddNonBillableProject verifies a task in a non-billable project (Backend,
-// id 1) yields a non-billable entry (the billable counterpart is covered by
-// TestAddProjectScopeViaEnvID).
-func TestAddNonBillableProject(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "9-10", "login", ""); err != nil {
-		t.Fatalf("add: %v", err)
-	}
-	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
-	if len(entries) != 1 || entries[0].Billable {
-		t.Fatalf("entries = %+v, want a single non-billable entry", entries)
-	}
-}
-
+// TestAddKeepsRunningEntry verifies a pulled running entry survives an `add`:
+// tg has no timer of its own, so nothing about adding a finished entry may
+// close or drop one that came down from the Toggl web app.
 func TestAddKeepsRunningEntry(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -522,7 +722,7 @@ func TestAddKeepsRunningEntry(t *testing.T) {
 	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "7-8", "login", ""); err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	r, _ := s.Running(ctx)
+	r := mustRunning(t, s)
 	if r == nil || r.TaskID == nil || *r.TaskID != 12 {
 		t.Fatalf("running entry = %+v, want Code review still running", r)
 	}
@@ -532,6 +732,7 @@ func TestAddKeepsRunningEntry(t *testing.T) {
 // already tracked entry is refused, the error names the existing entry, and
 // nothing is written. Touching the neighbour's endpoints stays allowed.
 func TestAddRejectsOverlap(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -556,7 +757,7 @@ func TestAddRejectsOverlap(t *testing.T) {
 	}
 
 	// Only the first entry exists; the rejected one was never created.
-	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	entries := addWindow(t, s, addNow)
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
@@ -566,7 +767,7 @@ func TestAddRejectsOverlap(t *testing.T) {
 	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "10-11", "review", ""); err != nil {
 		t.Fatalf("touching add: %v", err)
 	}
-	if entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 2 {
+	if entries := addWindow(t, s, addNow); len(entries) != 2 {
 		t.Fatalf("entries = %d, want 2", len(entries))
 	}
 }
@@ -574,6 +775,7 @@ func TestAddRejectsOverlap(t *testing.T) {
 // TestAddRejectsOverlapWithRunningEntry checks a running entry blocks any span
 // reaching past its start, since it is still accruing time.
 func TestAddRejectsOverlapWithRunningEntry(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -589,60 +791,8 @@ func TestAddRejectsOverlapWithRunningEntry(t *testing.T) {
 			t.Errorf("err = %v, want it to mention %q", err, want)
 		}
 	}
-	if entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 1 {
+	if entries := addWindow(t, s, addNow); len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1 (the running entry only)", len(entries))
-	}
-}
-
-func TestAddProjectScopeViaEnvID(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	// "fix" matches several tasks, but scoping to project 2 leaves only one.
-	pid := int64(2)
-	var buf bytes.Buffer
-	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), &pid, false, "10-11", "fix", ""); err != nil {
-		t.Fatalf("add: %v", err)
-	}
-	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
-	if len(entries) != 1 {
-		t.Fatalf("entries = %d, want 1", len(entries))
-	}
-	e := entries[0]
-	if e.TaskID == nil || *e.TaskID != 20 {
-		t.Errorf("task_id = %v, want 20 (Payment fix)", e.TaskID)
-	}
-	if e.ProjectID == nil || *e.ProjectID != 2 {
-		t.Errorf("project_id = %v, want 2", e.ProjectID)
-	}
-	// The billable project carries its flag onto the entry.
-	if !e.Billable {
-		t.Error("entry in a billable project should be billable")
-	}
-}
-
-func TestAddAmbiguous(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "10-11", "write", "")
-	if err == nil {
-		t.Fatal("expected ambiguity error")
-	}
-	if !strings.Contains(err.Error(), "Write tests") || !strings.Contains(err.Error(), "Write docs") {
-		t.Errorf("error should list candidates: %v", err)
-	}
-	// Each candidate carries its project, so same-named tasks are told apart,
-	// and the way out (`-1`) is advertised with the list.
-	if !strings.Contains(err.Error(), "[Backend]") {
-		t.Errorf("candidates should name their project: %v", err)
-	}
-	if !strings.Contains(err.Error(), "pass -1") {
-		t.Errorf("error should point at -1: %v", err)
-	}
-	if entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 0 {
-		t.Errorf("no entry should be created on ambiguity, got %d", len(entries))
 	}
 }
 
@@ -651,6 +801,7 @@ func TestAddAmbiguous(t *testing.T) {
 // the flag `add` refuses to guess and with it the FIRST candidate — the one the
 // ambiguity error lists first — is the task recorded against.
 func TestAddAmbiguousFirstMatchWins(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	// The same task name in a second project; "Code review" is now an exact
@@ -672,7 +823,7 @@ func TestAddAmbiguousFirstMatchWins(t *testing.T) {
 	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, true, "10-11", "code review", ""); err != nil {
 		t.Fatalf("add -1: %v", err)
 	}
-	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	entries := addWindow(t, s, addNow)
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
@@ -685,39 +836,11 @@ func TestAddAmbiguousFirstMatchWins(t *testing.T) {
 	}
 }
 
-// TestAddFirstMatchIsNotNeededWhenUnique verifies `-1` is inert on a fragment
-// that already resolves: it never changes which task a working command picks.
-func TestAddFirstMatchIsNotNeededWhenUnique(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, true, "9-:30", "login", ""); err != nil {
-		t.Fatalf("add -1: %v", err)
-	}
-	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
-	if len(entries) != 1 || entries[0].TaskID == nil || *entries[0].TaskID != 10 {
-		t.Errorf("entries = %+v, want one entry on task 10", entries)
-	}
-}
-
-// TestAddFirstMatchDoesNotInventAMatch verifies `-1` only resolves ambiguity:
-// with nothing to choose from it still fails, pointing at `tg update`.
-func TestAddFirstMatchDoesNotInventAMatch(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, true, "10-11", "nonexistent", "")
-	if err == nil || !strings.Contains(err.Error(), "tg update") {
-		t.Errorf("err = %v, want the no-match error even with -1", err)
-	}
-}
-
 // TestResolveTaskFragment pins the shared task-fragment resolver every
 // fragment-taking command goes through: one match resolves, several fail with
 // the candidate list unless `-1` takes the first, and none never resolves.
 func TestResolveTaskFragment(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -736,6 +859,7 @@ func TestResolveTaskFragment(t *testing.T) {
 		{name: "none with -1", fragment: "nonexistent", first: true, wantErr: "no task matches"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			got, err := resolveTaskFragment(ctx, s, tc.fragment, nil, tc.first)
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
@@ -753,33 +877,8 @@ func TestResolveTaskFragment(t *testing.T) {
 	}
 }
 
-func TestAddNoneSuggestsUpdate(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "10-11", "nonexistent", "")
-	if err == nil || !strings.Contains(err.Error(), "tg update") {
-		t.Errorf("err = %v, want suggestion to run `tg update`", err)
-	}
-}
-
-func TestAddInvalidTimesign(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "nope", "login", "")
-	if err == nil || !strings.Contains(err.Error(), "timesign") {
-		t.Errorf("err = %v, want a timesign parse error", err)
-	}
-	// A bad timesign must be rejected before any task lookup or write.
-	if entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour)); len(entries) != 0 {
-		t.Errorf("no entry should be created for a bad timesign, got %d", len(entries))
-	}
-}
-
 func TestAddBestEffortPush(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -787,8 +886,7 @@ func TestAddBestEffortPush(t *testing.T) {
 	var gotMethod string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
-		raw, _ := io.ReadAll(r.Body)
-		json.Unmarshal(raw, &body)
+		body = decodeBody(t, r)
 		w.Write([]byte(`{"id":9100,"at":"2026-01-02T09:00:00Z"}`))
 	}))
 	defer srv.Close()
@@ -808,7 +906,7 @@ func TestAddBestEffortPush(t *testing.T) {
 		t.Errorf("duration = %v, want 1800", body["duration"])
 	}
 	// A successful push marks the entry synced (remote id set, clean).
-	r, _ := s.EntryByRemoteID(ctx, 9100)
+	r := mustEntryByRemoteID(t, s, 9100)
 	if r == nil {
 		t.Fatal("expected the added entry to be synced with its remote id")
 	}
@@ -818,6 +916,7 @@ func TestAddBestEffortPush(t *testing.T) {
 }
 
 func TestAddSyncFailureIsNonFatal(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -834,7 +933,7 @@ func TestAddSyncFailureIsNonFatal(t *testing.T) {
 	if !strings.Contains(buf.String(), "warning") {
 		t.Errorf("output = %q, want a sync warning", buf.String())
 	}
-	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	entries := addWindow(t, s, addNow)
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
@@ -864,14 +963,14 @@ func seedModDay(t *testing.T, s *store.Store) []store.Entry {
 	start2 := stop1
 	stop2 := start2.Add(time.Hour)
 	if _, err := s.CreateEntry(ctx, store.Entry{
-		RemoteID: p(9001), WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
+		RemoteID: ptrInt(9001), WorkspaceID: 1, ProjectID: ptrInt(1), TaskID: ptrInt(10),
 		Start: testStart, Stop: &stop1, Duration: 3600, UpdatedAt: stop1,
 		SyncedAt: &stop1,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.CreateEntry(ctx, store.Entry{
-		RemoteID: p(9002), WorkspaceID: 1, ProjectID: p(1), TaskID: p(12),
+		RemoteID: ptrInt(9002), WorkspaceID: 1, ProjectID: ptrInt(1), TaskID: ptrInt(12),
 		Start: start2, Stop: &stop2, Duration: 3600, UpdatedAt: stop2,
 		SyncedAt: &stop2,
 	}); err != nil {
@@ -925,6 +1024,7 @@ func entryByID(t *testing.T, s *store.Store, id int64) store.Entry {
 // deliberately NOT re-anchored to now the way `tg add` would be, and it is not
 // read as an absolute length either.
 func TestModLastEntryRelativeTimesign(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	entries := seedModDay(t, s)
@@ -969,6 +1069,7 @@ func TestModLastEntryRelativeTimesign(t *testing.T) {
 }
 
 func TestModUnitlessRelativeUsesMinutes(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	entries := seedModDay(t, s)
@@ -992,6 +1093,7 @@ func TestModUnitlessRelativeUsesMinutes(t *testing.T) {
 // 11:00 ends at 11:30, then 12:45 — never at start+duration (which would shrink
 // it back to 30m) and never anywhere near modNow (15:07).
 func TestModRelativeAddsToTheEnd(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	entries := seedModDay(t, s)
@@ -1023,12 +1125,13 @@ func TestModRelativeAddsToTheEnd(t *testing.T) {
 // cannot act on: a running entry has no end to add to, so mod says so instead
 // of inventing one from now. An absolute sign still gives it a finished span.
 func TestModRelativeRefusesRunningEntry(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
 	start := time.Date(2026, 1, 2, 14, 0, 0, 0, time.UTC)
 	id, err := s.CreateEntry(ctx, store.Entry{
-		WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
+		WorkspaceID: 1, ProjectID: ptrInt(1), TaskID: ptrInt(10),
 		Start: start, Duration: -1, UpdatedAt: start,
 	})
 	if err != nil {
@@ -1065,6 +1168,7 @@ func TestModRelativeRefusesRunningEntry(t *testing.T) {
 // ahead of modNow) is not the last entry, so a bare `tg mod` still edits the
 // last thing actually tracked and leaves the future one alone.
 func TestModLastEntrySkipsFutureEntry(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	entries := seedModDay(t, s) // 09:00-10:00 and 10:00-11:00 on 2026-01-02
@@ -1072,7 +1176,7 @@ func TestModLastEntrySkipsFutureEntry(t *testing.T) {
 	future := modNow.Add(3 * time.Hour) // 18:07, same day
 	futureStop := future.Add(time.Hour)
 	futureID, err := s.CreateEntry(ctx, store.Entry{
-		WorkspaceID: 1, ProjectID: p(1), TaskID: p(13),
+		WorkspaceID: 1, ProjectID: ptrInt(1), TaskID: ptrInt(13),
 		Start: future, Stop: &futureStop, Duration: 3600, UpdatedAt: modNow,
 	})
 	if err != nil {
@@ -1100,6 +1204,7 @@ func TestModLastEntrySkipsFutureEntry(t *testing.T) {
 // and today's are necessarily the same here; the restriction itself is covered
 // by TestModRefusesEntryOlderThanToday.
 func TestModEntryByNumber(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	entries := seedModDay(t, s)
@@ -1138,6 +1243,7 @@ func TestModEntryByNumber(t *testing.T) {
 // TestModNumberIsScopedToToday. The store-level failsafe that backs both up
 // (store.ErrEntryTooOld) is covered in the store's own tests.
 func TestModRefusesEntryOlderThanToday(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	entries := seedModDay(t, s)
@@ -1196,6 +1302,7 @@ func TestModRefusesEntryOlderThanToday(t *testing.T) {
 // not addressable today (rather than silently reaching back into history, which
 // mod would refuse anyway). Nothing is written.
 func TestModNumberIsScopedToToday(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	entries := seedModDay(t, s)
@@ -1226,6 +1333,7 @@ func TestModNumberIsScopedToToday(t *testing.T) {
 // TestModAllowsTodaysEntryAtDayEnd guards the boundary from the other side: an
 // entry started earlier on the current day stays editable right up to midnight.
 func TestModAllowsTodaysEntryAtDayEnd(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	entries := seedModDay(t, s)
@@ -1245,6 +1353,7 @@ func TestModAllowsTodaysEntryAtDayEnd(t *testing.T) {
 // TestModDescriptionOnly verifies --desc alone is a valid change and leaves the
 // times exactly as they were.
 func TestModDescriptionOnly(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	entries := seedModDay(t, s)
@@ -1280,6 +1389,7 @@ func TestModDescriptionOnly(t *testing.T) {
 
 // TestModTimesignAndDescription verifies both changes can be applied at once.
 func TestModTimesignAndDescription(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	entries := seedModDay(t, s)
@@ -1301,31 +1411,12 @@ func TestModTimesignAndDescription(t *testing.T) {
 	}
 }
 
-// TestModRequiresAChange keeps a no-op invocation a usage error instead of a
-// silent dirty write.
-func TestModRequiresAChange(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-	entries := seedModDay(t, s)
-
-	var buf bytes.Buffer
-	err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 1, "", "", false)
-	if err == nil {
-		t.Fatal("mod with no changes = nil error, want a usage error")
-	}
-	if !strings.Contains(err.Error(), "usage: tg mod") {
-		t.Errorf("err = %v, want a usage message", err)
-	}
-	if got := entryByID(t, s, entries[0].ID); got.Dirty {
-		t.Error("a rejected mod must not mark the entry dirty")
-	}
-}
-
 // TestModRejectsOverlap covers the overlap guard: growing an entry into its
 // neighbour is refused, the error names the neighbour, and nothing is written.
 // Growing it up to the neighbour's start stays allowed (half-open intervals),
 // which also proves the entry is not compared against itself.
 func TestModRejectsOverlap(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	entries := seedModDay(t, s)
@@ -1378,59 +1469,83 @@ func TestModRejectsOverlap(t *testing.T) {
 	}
 }
 
-// TestModStaleNumber verifies a number today's numbering never handed out is
-// reported as such (wrapping store.ErrNoEntryNum) rather than silently
-// modifying something else.
-func TestModStaleNumber(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-	seedModDay(t, s)
+// TestModRefusals tables the edits `tg mod` declines outright: an invocation
+// asking for no change at all, a number today's numbering never handed out, a
+// bare `tg mod` on a day with nothing tracked, and the malformed timesigns.
+// Every one of them must leave the store exactly as it was — nothing written,
+// nothing marked dirty — and print nothing, since a refused mod is not a
+// partial one. (The day-scope refusals have fixtures of their own: see
+// TestModRefusesEntryOlderThanToday and TestModNumberIsScopedToToday.)
+func TestModRefusals(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		seed      bool // seed the two-entry fixture day
+		ref       int
+		timesign  string
+		desc      string
+		setDesc   bool
+		wantErrIs error
+		wantErr   []string
+	}{
+		{
+			name: "no change requested", seed: true, ref: 1,
+			wantErr: []string{"usage: tg mod"},
+		},
+		{
+			name: "number never handed out", seed: true, ref: 7, timesign: "+:30",
+			wantErrIs: store.ErrNoEntryNum, wantErr: []string{"tg ls"},
+		},
+		{
+			name: "nothing tracked today", timesign: "+:30",
+			wantErr: []string{"no entry tracked today"},
+		},
+		{name: "zero-length relative timesign", seed: true, ref: 1, timesign: "+:00"},
+		{name: "reversed absolute timesign", seed: true, ref: 1, timesign: "10-9"},
+		{name: "unparsable timesign", seed: true, ref: 1, timesign: "nonsense"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
+			var entries []store.Entry
+			if tc.seed {
+				entries = seedModDay(t, s)
+			}
 
-	var buf bytes.Buffer
-	err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 7, "+:30", "", false)
-	if !errors.Is(err, store.ErrNoEntryNum) {
-		t.Fatalf("err = %v, want ErrNoEntryNum", err)
-	}
-	if !strings.Contains(err.Error(), "tg ls") {
-		t.Errorf("err = %v, want it to suggest `tg ls`", err)
-	}
-	if buf.Len() != 0 {
-		t.Errorf("output = %q, want nothing written", buf.String())
-	}
-}
-
-// TestModNoEntries verifies the default target is an error, not a panic, in an
-// empty store.
-func TestModNoEntries(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 0, "+:30", "", false); err == nil {
-		t.Fatal("mod on an empty store = nil error, want an error")
-	}
-}
-
-// TestModInvalidTimesign keeps a malformed timesign from touching the store.
-func TestModInvalidTimesign(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-	entries := seedModDay(t, s)
-
-	for _, sign := range []string{"+:00", "10-9", "nonsense"} {
-		var buf bytes.Buffer
-		if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 1, sign, "", false); err == nil {
-			t.Errorf("mod %q = nil error, want an error", sign)
-		}
-	}
-	if got := entryByID(t, s, entries[0].ID); got.Dirty {
-		t.Error("a rejected mod must not mark the entry dirty")
+			var buf bytes.Buffer
+			err := cmdMod(env(&buf, s, nil, modNow, time.UTC), tc.ref, tc.timesign, tc.desc, tc.setDesc)
+			if err == nil {
+				t.Fatalf("mod(%d, %q) = nil error, want a refusal", tc.ref, tc.timesign)
+			}
+			if tc.wantErrIs != nil && !errors.Is(err, tc.wantErrIs) {
+				t.Errorf("err = %v, want it to wrap %v", err, tc.wantErrIs)
+			}
+			for _, want := range tc.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("err = %v, want it to mention %q", err, want)
+				}
+			}
+			if buf.Len() != 0 {
+				t.Errorf("output = %q, want nothing written", buf.String())
+			}
+			for i, e := range entries {
+				got := entryByID(t, s, e.ID)
+				if got.Dirty {
+					t.Errorf("entry %d is dirty, want a refused mod to leave it alone", i+1)
+				}
+				if got.Duration != e.Duration || !got.Start.Equal(e.Start) || got.Description != e.Description {
+					t.Errorf("entry %d = %+v, want it unchanged (%+v)", i+1, got, e)
+				}
+			}
+		})
 	}
 }
 
 // TestModPushesBestEffort verifies a successful mod pushes the change straight
 // to Toggl as an update (the entry keeps its remote id) and comes back clean.
 func TestModPushesBestEffort(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	entries := seedModDay(t, s)
@@ -1439,8 +1554,7 @@ func TestModPushesBestEffort(t *testing.T) {
 	var body map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		method, path = r.Method, r.URL.Path
-		raw, _ := io.ReadAll(r.Body)
-		json.Unmarshal(raw, &body)
+		body = decodeBody(t, r)
 		w.Write([]byte(`{"id":9002,"at":"2026-01-02T15:07:00Z"}`))
 	}))
 	defer srv.Close()
@@ -1464,6 +1578,7 @@ func TestModPushesBestEffort(t *testing.T) {
 // TestModSyncFailureIsNonFatal verifies a failed push only warns: the local
 // edit stands and stays dirty for a later `tg push`.
 func TestModSyncFailureIsNonFatal(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	entries := seedModDay(t, s)
@@ -1490,6 +1605,7 @@ func TestModSyncFailureIsNonFatal(t *testing.T) {
 // TestDelRemovesEntry covers the happy path: the addressed entry is confirmed,
 // disappears from listings, and the other entry survives.
 func TestDelRemovesEntry(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	entries := seedModDay(t, s)
@@ -1505,7 +1621,7 @@ func TestDelRemovesEntry(t *testing.T) {
 		}
 	}
 
-	left, _ := s.EntriesBetween(ctx, testStart.Add(-24*time.Hour), testStart.Add(24*time.Hour))
+	left := mustEntries(t, s, testStart.Add(-24*time.Hour), testStart.Add(24*time.Hour))
 	if len(left) != 1 || left[0].ID != entries[1].ID {
 		t.Fatalf("remaining entries = %+v, want only entry 2", left)
 	}
@@ -1524,6 +1640,7 @@ func TestDelRemovesEntry(t *testing.T) {
 // deleted and dirty with a fresh LWW clock, so togglsync.Push can DELETE it remotely
 // before dropping it.
 func TestDelMarksDeletedAndDirty(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	entries := seedModDay(t, s)
@@ -1560,6 +1677,7 @@ func TestDelMarksDeletedAndDirty(t *testing.T) {
 // TestDelStaleNumber verifies a number that resolves to nothing is an error
 // naming `tg ls`, and that nothing is deleted.
 func TestDelStaleNumber(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	seedModDay(t, s)
@@ -1575,7 +1693,7 @@ func TestDelStaleNumber(t *testing.T) {
 	if buf.Len() != 0 {
 		t.Errorf("output = %q, want nothing written", buf.String())
 	}
-	if left, _ := s.EntriesBetween(ctx, testStart.Add(-24*time.Hour), testStart.Add(24*time.Hour)); len(left) != 2 {
+	if left := mustEntries(t, s, testStart.Add(-24*time.Hour), testStart.Add(24*time.Hour)); len(left) != 2 {
 		t.Errorf("entries = %d, want both kept", len(left))
 	}
 
@@ -1591,6 +1709,7 @@ func TestDelStaleNumber(t *testing.T) {
 
 // TestDelRequiresNumber verifies del never guesses a target.
 func TestDelRequiresNumber(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	seedModDay(t, s)
@@ -1605,6 +1724,7 @@ func TestDelRequiresNumber(t *testing.T) {
 // TestDelPushesBestEffort verifies a successful del DELETEs the entry remotely
 // and drops the local row.
 func TestDelPushesBestEffort(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	seedModDay(t, s)
@@ -1627,8 +1747,54 @@ func TestDelPushesBestEffort(t *testing.T) {
 	if !strings.Contains(path, "9001") {
 		t.Errorf("path = %s, want the entry's remote id 9001", path)
 	}
-	if dirty, _ := s.DirtyEntries(ctx); len(dirty) != 0 {
+	if dirty := mustDirtyEntries(t, s); len(dirty) != 0 {
 		t.Errorf("dirty entries = %+v, want the row dropped after the remote delete", dirty)
+	}
+}
+
+// TestRunDispatchValidatesArgs exercises the run* layer itself: run() dispatches
+// the command word, the run* function parses the arguments and only then opens
+// anything. Every case here is refused during that argument handling — before
+// withEnv touches the state directory or prints a thing — so the test can drive
+// the real entry point without a database or a config.
+//
+// It is what keeps the command words, the argument shapes and the usage messages
+// pinned to the code a user actually reaches, rather than to a cmd* call a test
+// made up.
+func TestRunDispatchValidatesArgs(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		cmd     string
+		args    []string
+		wantErr string
+	}{
+		{name: "add without a task", cmd: "add", args: []string{"9-10"}, wantErr: addUsage},
+		{name: "add with nothing at all", cmd: "add", wantErr: addUsage},
+		{name: "del without a number", cmd: "del", wantErr: "usage: tg del"},
+		{name: "del with two numbers", cmd: "del", args: []string{"1", "2"}, wantErr: "usage: tg del"},
+		{name: "del with a non-number", cmd: "del", args: []string{"x"}, wantErr: "invalid entry number"},
+		{name: "del with zero", cmd: "del", args: []string{"0"}, wantErr: "invalid entry number"},
+		{name: "mod with two numbers", cmd: "mod", args: []string{"1", "2"}, wantErr: "unexpected second entry number"},
+		{name: "mod with two timesigns", cmd: "mod", args: []string{"+:30", "9-10"}, wantErr: "unexpected second timesign"},
+		{
+			name: "update naming the project twice", cmd: "update",
+			args: []string{"-p", "backend", "payments"}, wantErr: "twice",
+		},
+		{name: "completion without a shell", cmd: "completion", wantErr: "usage: tg completion zsh"},
+		{name: "completion with too many args", cmd: "completion", args: []string{"zsh", "extra"}, wantErr: "usage: tg completion zsh"},
+		{name: "completion for another shell", cmd: "completion", args: []string{"bash"}, wantErr: "usage: tg completion zsh"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := run(ctx, tc.cmd, tc.args)
+			if err == nil {
+				t.Fatalf("run(%q, %q) = nil error, want %q", tc.cmd, tc.args, tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("run(%q, %q) error = %v, want it to contain %q", tc.cmd, tc.args, err, tc.wantErr)
+			}
+		})
 	}
 }
 
@@ -1637,6 +1803,7 @@ func TestDelPushesBestEffort(t *testing.T) {
 // TestParseModArgs covers `tg mod`'s positional disambiguation: bare digits are
 // the entry number, everything else is the timesign, in either order.
 func TestParseModArgs(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		args     []string
@@ -1656,6 +1823,7 @@ func TestParseModArgs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			ref, timesign, err := parseModArgs(tt.args)
 			if tt.wantErr {
 				if err == nil {
@@ -1678,6 +1846,7 @@ func TestParseModArgs(t *testing.T) {
 // argument, which is what makes `tg mod 2 --desc x` work (the flag package on
 // its own stops parsing at "2").
 func TestParseArgsAndFlags(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		args     []string
@@ -1694,11 +1863,13 @@ func TestParseArgsAndFlags(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			fs := newFlagSet("mod")
 			fs.SetOutput(io.Discard)
+			// The real registration `tg mod` uses, so a rename of either
+			// spelling fails here rather than passing against a local copy.
 			var desc string
-			fs.StringVar(&desc, "desc", "", "")
-			fs.StringVar(&desc, "description", "", "")
+			bindDescFlag(fs, &desc, "new entry description")
 			pos, err := parseArgsAndFlags(fs, tt.args)
 			if err != nil {
 				t.Fatalf("parseArgsAndFlags(%q): %v", tt.args, err)
@@ -1709,10 +1880,11 @@ func TestParseArgsAndFlags(t *testing.T) {
 			if desc != tt.wantDesc {
 				t.Errorf("desc = %q, want %q", desc, tt.wantDesc)
 			}
-			set := false
-			fs.Visit(func(*flag.Flag) { set = true })
-			if set != tt.wantSet {
-				t.Errorf("flag set = %v, want %v", set, tt.wantSet)
+			// descWasSet is what `tg mod` asks, and the distinction it draws
+			// (an explicitly empty --desc CLEARS the description) is why an
+			// empty value still counts as set.
+			if set := descWasSet(fs); set != tt.wantSet {
+				t.Errorf("descWasSet = %v, want %v", set, tt.wantSet)
 			}
 		})
 	}
@@ -1725,6 +1897,7 @@ func TestParseArgsAndFlags(t *testing.T) {
 // positionals that make up the fragment. Anything else that looks like a
 // number-flag is still an error, so a typo is never taken for a fragment.
 func TestFirstFlagParsing(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		args      []string
 		wantFirst bool
@@ -1767,23 +1940,55 @@ func TestFirstFlagParsing(t *testing.T) {
 	}
 }
 
+// TestTasksCommand tables `tg tasks`: unscoped it lists the whole cached
+// catalog with each task's project, and scoped by project id (TOGGL_PROJECT_ID)
+// it lists that project's tasks only. The --all/inactive half is covered by
+// TestTasksCommandAllIncludesInactive, which needs a catalog of its own.
 func TestTasksCommand(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
+	t.Parallel()
+	payments := int64(2)
+	for _, tc := range []struct {
+		name      string
+		projectID *int64
+		want      []string
+		absent    []string
+	}{
+		{
+			name: "unscoped",
+			want: []string{"Fix login bug", "Code review", "Payment fix", "[Backend]", "[Payments]"},
+		},
+		{
+			name: "scoped to a project", projectID: &payments,
+			want:   []string{"Payment fix"},
+			absent: []string{"Fix login bug", "Code review", "Write tests"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
 
-	var buf bytes.Buffer
-	if err := cmdTasks(localEnv(&buf, s), false, nil, false); err != nil {
-		t.Fatalf("tasks: %v", err)
-	}
-	out := buf.String()
-	for _, want := range []string{"Fix login bug", "Code review", "Payment fix", "[Backend]", "[Payments]"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("tasks output missing %q:\n%s", want, out)
-		}
+			var buf bytes.Buffer
+			if err := cmdTasks(localEnv(&buf, s), false, tc.projectID, false); err != nil {
+				t.Fatalf("tasks: %v", err)
+			}
+			out := buf.String()
+			for _, want := range tc.want {
+				if !strings.Contains(out, want) {
+					t.Errorf("tasks output missing %q:\n%s", want, out)
+				}
+			}
+			for _, absent := range tc.absent {
+				if strings.Contains(out, absent) {
+					t.Errorf("tasks output should hide %q:\n%s", absent, out)
+				}
+			}
+		})
 	}
 }
 
 func TestTasksCommandAllIncludesInactive(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	if err := s.ReplaceProjects(ctx, []store.Project{{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true}}); err != nil {
 		t.Fatal(err)
@@ -1812,152 +2017,106 @@ func TestTasksCommandAllIncludesInactive(t *testing.T) {
 	}
 }
 
-func TestTasksCommandProjectScope(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
+// TestGrepCommand tables `tg grep`'s listing against the seeded catalog: it
+// matches on a case-insensitive substring, all positionals form ONE fragment,
+// an exact task name does NOT suppress the other matches (grep exists to show
+// every candidate, unlike `add`/`total`), a project scope narrows the
+// candidates, `-1` cuts the list down to the first one — the same one `tg add
+// -1` would record against — and a fragment matching nothing, or no fragment at
+// all, fails without printing anything.
+func TestGrepCommand(t *testing.T) {
+	t.Parallel()
+	payments := int64(2)
+	for _, tc := range []struct {
+		name      string
+		fragment  string
+		first     bool
+		projectID *int64
+		wantLines int      // expected listed lines (a successful case lists >= 1)
+		want      []string // substrings the listing must contain
+		absent    []string // substrings it must not contain
+		wantErr   []string // substrings the error must contain (a failing case)
+	}{
+		{
+			name: "lists every match", fragment: "write", wantLines: 2,
+			want:   []string{"Write docs", "Write tests", "[Backend]"},
+			absent: []string{"Code review", "Payment fix"},
+		},
+		{name: "case insensitive", fragment: "CODE REVIEW", wantLines: 1, want: []string{"Code review"}},
+		{name: "joined multi-word fragment", fragment: "code review", wantLines: 1, want: []string{"Code review"}},
+		{
+			// "Fix" is an exact task name in the catalog; "Fix login bug" and
+			// "Payment fix" merely contain it, and all three must be listed.
+			name: "exact name does not win", fragment: "fix", wantLines: 3,
+			want: []string{"Fix login bug", "Payment fix", "[Payments]"},
+		},
+		{
+			name: "project scope", fragment: "fix", projectID: &payments, wantLines: 1,
+			want: []string{"Payment fix"}, absent: []string{"Fix login bug"},
+		},
+		{
+			// Catalog order, so "Write docs" is the first candidate.
+			name: "first match only", fragment: "write", first: true, wantLines: 1,
+			want: []string{"Write docs"}, absent: []string{"Write tests"},
+		},
+		{
+			name: "no match", fragment: "nothing here",
+			wantErr: []string{"no task matches", "tg update"},
+		},
+		{
+			// `-1` resolves ambiguity; it never invents a candidate.
+			name: "no match with -1", fragment: "nothing here", first: true,
+			wantErr: []string{"no task matches"},
+		},
+		// An empty fragment is a usage error, not "list everything": that is
+		// `tg tasks`.
+		{name: "empty fragment", fragment: "", wantErr: []string{"usage: tg grep"}},
+		{name: "blank fragment", fragment: "   ", wantErr: []string{"usage: tg grep"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
 
-	pid := int64(2) // Payments
-	var buf bytes.Buffer
-	if err := cmdTasks(localEnv(&buf, s), false, &pid, false); err != nil {
-		t.Fatalf("tasks: %v", err)
-	}
-	out := buf.String()
-	if !strings.Contains(out, "Payment fix") {
-		t.Errorf("scoped tasks should list Payment fix:\n%s", out)
-	}
-	for _, hidden := range []string{"Fix login bug", "Code review", "Write tests"} {
-		if strings.Contains(out, hidden) {
-			t.Errorf("scoped tasks should hide %q:\n%s", hidden, out)
-		}
-	}
-}
-
-func TestGrepListsMatches(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	if err := cmdGrep(localEnv(&buf, s), false, nil, false, "write", false); err != nil {
-		t.Fatalf("grep: %v", err)
-	}
-	out := buf.String()
-	for _, want := range []string{"Write docs", "Write tests", "[Backend]"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("grep output missing %q:\n%s", want, out)
-		}
-	}
-	for _, hidden := range []string{"Code review", "Payment fix"} {
-		if strings.Contains(out, hidden) {
-			t.Errorf("grep output should not list %q:\n%s", hidden, out)
-		}
-	}
-}
-
-func TestGrepCaseInsensitive(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	if err := cmdGrep(localEnv(&buf, s), false, nil, false, "CODE REVIEW", false); err != nil {
-		t.Fatalf("grep: %v", err)
-	}
-	if !strings.Contains(buf.String(), "Code review") {
-		t.Errorf("grep should match case-insensitively:\n%s", buf.String())
-	}
-}
-
-// TestGrepExactDoesNotWin pins grep's key difference from `add`/`total`
-// matching: an exact name match must not suppress the other substring matches,
-// since grep exists to show every candidate.
-func TestGrepExactDoesNotWin(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	// "Fix" is an exact task name in the catalog; "Fix login bug" and
-	// "Payment fix" merely contain it, and all three must be listed.
-	if err := cmdGrep(localEnv(&buf, s), false, nil, false, "fix", false); err != nil {
-		t.Fatalf("grep: %v", err)
-	}
-	out := buf.String()
-	for _, want := range []string{"Fix login bug", "Payment fix", "[Payments]"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("grep output missing %q:\n%s", want, out)
-		}
-	}
-	if lines := strings.Count(strings.TrimSpace(out), "\n") + 1; lines != 3 {
-		t.Errorf("grep listed %d lines, want 3:\n%s", lines, out)
-	}
-}
-
-// TestGrepFirstListsOneMatch verifies `-1` cuts grep down to its first
-// candidate, which is how the fragment a user is about to pass to `tg add -1`
-// is checked. The order is grep's own (catalog order), so "Write docs" leads.
-func TestGrepFirstListsOneMatch(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	if err := cmdGrep(localEnv(&buf, s), false, nil, true, "write", false); err != nil {
-		t.Fatalf("grep -1: %v", err)
-	}
-	out := buf.String()
-	if !strings.Contains(out, "Write docs") {
-		t.Errorf("grep -1 should list the first match:\n%s", out)
-	}
-	if strings.Contains(out, "Write tests") {
-		t.Errorf("grep -1 should list only one match:\n%s", out)
-	}
-	if lines := strings.Count(strings.TrimSpace(out), "\n") + 1; lines != 1 {
-		t.Errorf("grep -1 listed %d lines, want 1:\n%s", lines, out)
-	}
-}
-
-// TestGrepFirstStillFailsWithoutAMatch verifies `-1` does not turn an empty
-// result into a success (there is no first candidate to take).
-func TestGrepFirstStillFailsWithoutAMatch(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	err := cmdGrep(localEnv(&buf, s), false, nil, true, "nothing here", false)
-	if err == nil || !strings.Contains(err.Error(), "no task matches") {
-		t.Errorf("err = %v, want a no-match error even with -1", err)
-	}
-}
-
-func TestGrepJoinsFragment(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	if err := cmdGrep(localEnv(&buf, s), false, nil, false, "code review", false); err != nil {
-		t.Fatalf("grep: %v", err)
-	}
-	if !strings.Contains(buf.String(), "Code review") {
-		t.Errorf("grep should match a multi-word fragment:\n%s", buf.String())
-	}
-}
-
-func TestGrepProjectScope(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	pid := int64(2) // Payments
-	var buf bytes.Buffer
-	if err := cmdGrep(localEnv(&buf, s), false, &pid, false, "fix", false); err != nil {
-		t.Fatalf("grep: %v", err)
-	}
-	out := buf.String()
-	if !strings.Contains(out, "Payment fix") {
-		t.Errorf("scoped grep should list Payment fix:\n%s", out)
-	}
-	if strings.Contains(out, "Fix login bug") {
-		t.Errorf("scoped grep should hide other projects' tasks:\n%s", out)
+			var buf bytes.Buffer
+			err := cmdGrep(localEnv(&buf, s), false, tc.projectID, tc.first, tc.fragment, false)
+			if len(tc.wantErr) > 0 {
+				if err == nil {
+					t.Fatalf("grep %q = nil error, want %q", tc.fragment, tc.wantErr)
+				}
+				for _, want := range tc.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("err = %v, want it to mention %q", err, want)
+					}
+				}
+				if buf.Len() != 0 {
+					t.Errorf("output = %q, want nothing written when grep fails", buf.String())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("grep %q: %v", tc.fragment, err)
+			}
+			out := buf.String()
+			for _, want := range tc.want {
+				if !strings.Contains(out, want) {
+					t.Errorf("output missing %q:\n%s", want, out)
+				}
+			}
+			for _, absent := range tc.absent {
+				if strings.Contains(out, absent) {
+					t.Errorf("output should not list %q:\n%s", absent, out)
+				}
+			}
+			if got := strings.Count(strings.TrimSpace(out), "\n") + 1; got != tc.wantLines {
+				t.Errorf("grep listed %d lines, want %d:\n%s", got, tc.wantLines, out)
+			}
+		})
 	}
 }
 
 func TestGrepAllIncludesInactive(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	if err := s.ReplaceProjects(ctx, []store.Project{{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true}}); err != nil {
 		t.Fatal(err)
@@ -1986,39 +2145,8 @@ func TestGrepAllIncludesInactive(t *testing.T) {
 	}
 }
 
-func TestGrepNoMatch(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	var buf bytes.Buffer
-	err := cmdGrep(localEnv(&buf, s), false, nil, false, "nothing here", false)
-	if err == nil {
-		t.Fatal("expected an error when nothing matches")
-	}
-	if !strings.Contains(err.Error(), "no task matches") || !strings.Contains(err.Error(), "tg update") {
-		t.Errorf("err = %v, want a no-match error suggesting `tg update`", err)
-	}
-	if buf.Len() != 0 {
-		t.Errorf("grep should print nothing when it fails:\n%s", buf.String())
-	}
-}
-
-func TestGrepRequiresFragment(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	// An empty fragment is a usage error, not "list everything": that is
-	// `tg tasks`.
-	for _, frag := range []string{"", "   "} {
-		var buf bytes.Buffer
-		err := cmdGrep(localEnv(&buf, s), false, nil, false, frag, false)
-		if err == nil || !strings.Contains(err.Error(), "usage: tg grep") {
-			t.Errorf("grep %q: err = %v, want a usage error", frag, err)
-		}
-	}
-}
-
 func TestGrepJSON(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -2048,6 +2176,7 @@ func TestGrepJSON(t *testing.T) {
 }
 
 func TestGrepTasksPreservesOrder(t *testing.T) {
+	t.Parallel()
 	in := []store.Task{
 		{ID: 1, Name: "Fix login bug"},
 		{ID: 2, Name: "Code review"},
@@ -2062,100 +2191,123 @@ func TestGrepTasksPreservesOrder(t *testing.T) {
 	}
 }
 
-func TestResolvePullProjectRequiresFragment(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	// pull ignores TOGGL_PROJECT_ID, so a blank argument is a hard error that
-	// must NOT suggest the env var as a fallback.
-	_, err := resolvePullProject(ctx, s, "  ", false)
-	if err == nil || !strings.Contains(err.Error(), "project-name argument") {
-		t.Errorf("err = %v, want a required-argument error", err)
+// TestResolvePullProject tables the project resolution behind `tg pull
+// <project>`: the argument is required (pull ignores TOGGL_PROJECT_ID, so there
+// is no fallback to fall back to), a unique fragment resolves, an ambiguous one
+// fails with the candidates listed and a pointer at `-1`, and `-1` then takes
+// the first candidate — but never invents one.
+func TestResolvePullProject(t *testing.T) {
+	t.Parallel()
+	// The ambiguous cases need two projects sharing a prefix; the others use
+	// the standard catalog.
+	ambiguousCatalog := func(t *testing.T, s *store.Store) {
+		t.Helper()
+		if err := s.ReplaceProjects(ctx, []store.Project{
+			{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true},
+			{ID: 2, WorkspaceID: 1, Name: "Back office", Active: true},
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if strings.Contains(err.Error(), "TOGGL_PROJECT_ID") {
-		t.Errorf("err = %v, should not mention TOGGL_PROJECT_ID (pull ignores it)", err)
+
+	for _, tc := range []struct {
+		name      string
+		ambiguous bool
+		fragment  string
+		first     bool
+		want      *int64
+		wantErr   []string
+		absentErr []string
+	}{
+		{name: "unique fragment", fragment: "back", want: ptrInt(1)},
+		{
+			name: "blank fragment", fragment: "  ",
+			wantErr:   []string{"project-name argument"},
+			absentErr: []string{"TOGGL_PROJECT_ID"},
+		},
+		{
+			name: "blank fragment with -1", fragment: "  ", first: true,
+			wantErr: []string{"project-name argument"},
+		},
+		{name: "no match", fragment: "nonexistent", wantErr: []string{"tg update"}},
+		{name: "no match with -1", fragment: "nonexistent", first: true, wantErr: []string{"tg update"}},
+		{
+			name: "ambiguous fragment", ambiguous: true, fragment: "back",
+			wantErr: []string{"Backend", "Back office", "pass -1"},
+		},
+		{
+			// Candidates are ordered by name then id, so "Back office" (2)
+			// wins over "Backend" (1).
+			name: "ambiguous fragment with -1", ambiguous: true, fragment: "back", first: true,
+			want: ptrInt(2),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			if tc.ambiguous {
+				ambiguousCatalog(t, s)
+			} else {
+				seedCatalog(t, s)
+			}
+
+			got, err := resolvePullProject(ctx, s, tc.fragment, tc.first)
+			if len(tc.wantErr) > 0 {
+				if err == nil {
+					t.Fatalf("resolvePullProject(%q) = %v, want an error", tc.fragment, got)
+				}
+				for _, want := range tc.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("err = %v, want it to mention %q", err, want)
+					}
+				}
+				for _, absent := range tc.absentErr {
+					if strings.Contains(err.Error(), absent) {
+						t.Errorf("err = %v, should not mention %q", err, absent)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if got == nil || *got != *tc.want {
+				t.Errorf("resolved = %v, want %d", got, *tc.want)
+			}
+		})
 	}
 }
 
-func TestResolvePullProjectUnique(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
+// TestResolvePullScope covers the scope `tg pull` derives from its optional
+// argument: a blank one means every project (a nil scope), a fragment scopes to
+// the project it names. That pull never falls back to TOGGL_PROJECT_ID is
+// covered by TestResolvePullScopeIgnoresEnv, which has to set the environment.
+func TestResolvePullScope(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		fragment string
+		want     *int64
+	}{
+		{name: "unscoped means all projects", fragment: "   "},
+		{name: "fragment scopes to one project", fragment: "pay", want: ptrInt(2)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
 
-	got, err := resolvePullProject(ctx, s, "back", false)
-	if err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	if got == nil || *got != 1 {
-		t.Errorf("resolved = %v, want project 1 (Backend)", got)
-	}
-}
-
-func TestResolvePullProjectAmbiguous(t *testing.T) {
-	s := newStore(t)
-	if err := s.ReplaceProjects(ctx, []store.Project{
-		{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true},
-		{ID: 2, WorkspaceID: 1, Name: "Back office", Active: true},
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err := resolvePullProject(ctx, s, "back", false)
-	if err == nil {
-		t.Fatal("expected ambiguity error")
-	}
-	if !strings.Contains(err.Error(), "Backend") || !strings.Contains(err.Error(), "Back office") {
-		t.Errorf("error should list candidates: %v", err)
-	}
-	if !strings.Contains(err.Error(), "pass -1") {
-		t.Errorf("error should point at -1: %v", err)
-	}
-
-	// With -1 the first candidate is taken instead: candidates are ordered by
-	// name then id, so "Back office" (2) wins over "Backend" (1).
-	got, err := resolvePullProject(ctx, s, "back", true)
-	if err != nil {
-		t.Fatalf("resolve -1: %v", err)
-	}
-	if got == nil || *got != 2 {
-		t.Errorf("resolved = %v, want 2 (Back office, the first candidate)", got)
-	}
-}
-
-// TestResolvePullProjectFirstNeedsAMatch verifies `-1` only resolves ambiguity:
-// a fragment matching nothing, and a missing fragment, still fail.
-func TestResolvePullProjectFirstNeedsAMatch(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	if _, err := resolvePullProject(ctx, s, "nonexistent", true); err == nil {
-		t.Error("expected a no-match error even with -1")
-	}
-	if _, err := resolvePullProject(ctx, s, "  ", true); err == nil {
-		t.Error("expected a required-argument error even with -1")
-	}
-}
-
-func TestResolvePullProjectNone(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	_, err := resolvePullProject(ctx, s, "nonexistent", false)
-	if err == nil || !strings.Contains(err.Error(), "tg update") {
-		t.Errorf("err = %v, want suggestion to run `tg update`", err)
-	}
-}
-
-func TestResolvePullScopeUnscopedMeansAll(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	// A blank argument means "pull every project": nil scope.
-	got, err := resolvePullScope(ctx, s, "   ", false)
-	if err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	if got != nil {
-		t.Errorf("resolved = %v, want nil (pull all projects)", got)
+			got, err := resolvePullScope(ctx, s, tc.fragment, false)
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			switch {
+			case tc.want == nil && got != nil:
+				t.Errorf("resolved = %v, want nil (pull all projects)", got)
+			case tc.want != nil && (got == nil || *got != *tc.want):
+				t.Errorf("resolved = %v, want %d", got, *tc.want)
+			}
+		})
 	}
 }
 
@@ -2176,19 +2328,6 @@ func TestResolvePullScopeIgnoresEnv(t *testing.T) {
 	}
 }
 
-func TestResolvePullScopeFragment(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	got, err := resolvePullScope(ctx, s, "pay", false)
-	if err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	if got == nil || *got != 2 {
-		t.Errorf("resolved = %v, want 2 (Payments)", got)
-	}
-}
-
 // --- push --------------------------------------------------------------------
 
 // pushNow is the reference instant the push tests below run at.
@@ -2201,7 +2340,7 @@ func seedDirty(t *testing.T, s *store.Store, i int, desc string) int64 {
 	start := testStart.Add(time.Duration(i) * time.Hour)
 	stop := start.Add(30 * time.Minute)
 	id, err := s.CreateEntry(ctx, store.Entry{
-		WorkspaceID: 1, TaskID: p(10), Description: desc,
+		WorkspaceID: 1, TaskID: ptrInt(10), Description: desc,
 		Start: start, Stop: &stop, Duration: 1800, UpdatedAt: stop, Dirty: true,
 	})
 	if err != nil {
@@ -2215,14 +2354,14 @@ func seedDirty(t *testing.T, s *store.Store, i int, desc string) int64 {
 // what got through, and the rejection is reported as the command's error (so the
 // exit status is non-zero) while the entry stays dirty for a later attempt.
 func TestPushReportsRejectedEntry(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
 	var created int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
-		raw, _ := io.ReadAll(r.Body)
-		json.Unmarshal(raw, &body)
+		body = decodeBody(t, r)
 		if body["description"] == "poison" {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte(`{"error":"task not in project"}`))
@@ -2253,7 +2392,7 @@ func TestPushReportsRejectedEntry(t *testing.T) {
 	if created != 2 {
 		t.Errorf("created = %d, want 2 (the rejection must not block the queue)", created)
 	}
-	dirty, _ := s.DirtyEntries(ctx)
+	dirty := mustDirtyEntries(t, s)
 	if len(dirty) != 1 || dirty[0].ID != poisoned {
 		t.Fatalf("dirty = %+v, want only the rejected entry %d", dirty, poisoned)
 	}
@@ -2262,6 +2401,7 @@ func TestPushReportsRejectedEntry(t *testing.T) {
 // TestPushJSONListsFailures verifies --json reports the rejected entries in the
 // result rather than only in the error text.
 func TestPushJSONListsFailures(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -2303,6 +2443,7 @@ func TestPushJSONListsFailures(t *testing.T) {
 // for a later `tg push`) instead of the command refusing to run, and its
 // workspace comes from the task's own catalog row since no config names one.
 func TestAddWorksUnauthenticated(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -2316,7 +2457,7 @@ func TestAddWorksUnauthenticated(t *testing.T) {
 	if strings.Contains(buf.String(), "warning") {
 		t.Errorf("output = %q, want no sync warning with no credentials", buf.String())
 	}
-	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	entries := addWindow(t, s, addNow)
 	if len(entries) != 1 {
 		t.Fatalf("entries = %d, want 1", len(entries))
 	}
@@ -2332,6 +2473,7 @@ func TestAddWorksUnauthenticated(t *testing.T) {
 // from: neither a config nor the catalog knows a workspace, so the entry could
 // never be pushed and the command says to run `tg auth`.
 func TestAddUnknownWorkspaceIsRefused(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	// A catalog row with no workspace, as only a hand-edited database has.
 	if err := s.ReplaceProjects(ctx, []store.Project{{ID: 1, Name: "Backend", Active: true}}); err != nil {
@@ -2346,7 +2488,7 @@ func TestAddUnknownWorkspaceIsRefused(t *testing.T) {
 	if !errors.Is(err, config.ErrNotConfigured) {
 		t.Fatalf("err = %v, want config.ErrNotConfigured", err)
 	}
-	entries, _ := s.EntriesBetween(ctx, addNow.Add(-24*time.Hour), addNow.Add(24*time.Hour))
+	entries := addWindow(t, s, addNow)
 	if len(entries) != 0 {
 		t.Errorf("entries = %+v, want nothing recorded", entries)
 	}
@@ -2356,6 +2498,7 @@ func TestAddUnknownWorkspaceIsRefused(t *testing.T) {
 // anything locally say so uniformly — with the same "run `tg auth`" error a
 // missing config always produced — instead of tripping over a nil client.
 func TestSyncCommandsRequireCredentials(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -2366,7 +2509,7 @@ func TestSyncCommandsRequireCredentials(t *testing.T) {
 	}{
 		{"push", func(e *cmdEnv) error { return cmdPush(e, false) }},
 		{"pull", func(e *cmdEnv) error { return cmdPull(e, false, "", since, false) }},
-		{"update", func(e *cmdEnv) error { return cmdUpdate(e, p(1), false, "", since, false, false) }},
+		{"update", func(e *cmdEnv) error { return cmdUpdate(e, ptrInt(1), false, "", since, false, false) }},
 		{"projects update", func(e *cmdEnv) error { return cmdUpdateProjects(e, false, false) }},
 		{"total", func(e *cmdEnv) error { return cmdTotal(e, false, "", since, false) }},
 	} {
@@ -2384,6 +2527,7 @@ func TestSyncCommandsRequireCredentials(t *testing.T) {
 // TestLocalCommandsWorkUnauthenticated verifies the read-only and edit commands
 // keep working with no credentials, which is what local-first means here.
 func TestLocalCommandsWorkUnauthenticated(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	seedDirty(t, s, 0, "work")
@@ -2414,80 +2558,78 @@ func TestLocalCommandsWorkUnauthenticated(t *testing.T) {
 	}
 }
 
-// TestPullAllProjectsUnscoped verifies `tg pull` with no project scope
-// reconciles entries from every project in one pass and advances last_pull.
-func TestPullAllProjectsUnscoped(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
+// pullEntriesJSON is the /me/time_entries payload the pull tests are served: one
+// entry in project 1 (Backend) and one in project 2 (Payments), both on
+// 2026-01-02.
+const pullEntriesJSON = `[
+  {"id":1,"workspace_id":1,"project_id":1,"description":"backend",
+   "start":"2026-01-02T09:00:00Z","stop":"2026-01-02T09:30:00Z",
+   "duration":1800,"at":"2026-01-02T09:30:00Z"},
+  {"id":2,"workspace_id":1,"project_id":2,"description":"payments",
+   "start":"2026-01-02T10:00:00Z","stop":"2026-01-02T10:30:00Z",
+   "duration":1800,"at":"2026-01-02T10:30:00Z"}]`
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`[
-		  {"id":1,"workspace_id":1,"project_id":1,"description":"a",
-		   "start":"2026-01-02T09:00:00Z","stop":"2026-01-02T09:30:00Z",
-		   "duration":1800,"at":"2026-01-02T09:30:00Z"},
-		  {"id":2,"workspace_id":1,"project_id":2,"description":"b",
-		   "start":"2026-01-02T10:00:00Z","stop":"2026-01-02T10:30:00Z",
-		   "duration":1800,"at":"2026-01-02T10:30:00Z"}]`))
-	}))
-	defer srv.Close()
-	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+// TestPullProjectScope tables `tg pull`'s two scopes over the same remote
+// payload: with no project argument it reconciles every project in one pass and,
+// having covered everything, advances the last_pull watermark; with a project
+// fragment it reconciles only that project's entries and, being a partial pull,
+// leaves the watermark alone so a later full pull still sees the rest. (That the
+// unscoped form also ignores TOGGL_PROJECT_ID is TestPullIgnoresProjectEnv,
+// which has to set the environment and so cannot run in parallel.)
+func TestPullProjectScope(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name          string
+		fragment      string
+		wantOutput    string
+		wantRemoteIDs []int64 // entries that must have landed
+		goneRemoteIDs []int64 // entries that must have been ignored
+		wantWatermark bool
+	}{
+		{
+			name: "unscoped pulls every project", wantOutput: "2 inserted",
+			wantRemoteIDs: []int64{1, 2}, wantWatermark: true,
+		},
+		{
+			// "back" resolves to Backend (project 1).
+			name: "fragment scopes to one project", fragment: "back", wantOutput: "1 inserted",
+			wantRemoteIDs: []int64{1}, goneRemoteIDs: []int64{2},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
 
-	since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
-	var buf bytes.Buffer
-	// empty argument => pull every project.
-	if err := cmdPull(env(&buf, s, c, now, time.UTC), false, "", since, false); err != nil {
-		t.Fatalf("pull: %v", err)
-	}
-	if !strings.Contains(buf.String(), "2 inserted") {
-		t.Errorf("output = %q, want 2 inserted", buf.String())
-	}
-	if got, _ := s.EntryByRemoteID(ctx, 1); got == nil {
-		t.Error("project 1 entry should be inserted")
-	}
-	if got, _ := s.EntryByRemoteID(ctx, 2); got == nil {
-		t.Error("project 2 entry should be inserted")
-	}
-	// A full (unscoped) pull advances the watermark.
-	if _, ok, _ := s.Meta(ctx, store.MetaLastPull); !ok {
-		t.Error("unscoped pull should advance last_pull")
-	}
-}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write([]byte(pullEntriesJSON))
+			}))
+			defer srv.Close()
+			c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
-// TestPullScopedByFragment verifies a fragment still scopes the pull to one
-// project (backwards compatible) and leaves the watermark untouched.
-func TestPullScopedByFragment(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`[
-		  {"id":1,"workspace_id":1,"project_id":1,"description":"backend",
-		   "start":"2026-01-02T09:00:00Z","stop":"2026-01-02T09:30:00Z",
-		   "duration":1800,"at":"2026-01-02T09:30:00Z"},
-		  {"id":2,"workspace_id":1,"project_id":2,"description":"payments",
-		   "start":"2026-01-02T10:00:00Z","stop":"2026-01-02T10:30:00Z",
-		   "duration":1800,"at":"2026-01-02T10:30:00Z"}]`))
-	}))
-	defer srv.Close()
-	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
-
-	since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
-	var buf bytes.Buffer
-	// "back" resolves to Backend (project 1); only its entry is reconciled.
-	if err := cmdPull(env(&buf, s, c, now, time.UTC), false, "back", since, false); err != nil {
-		t.Fatalf("pull: %v", err)
-	}
-	if got, _ := s.EntryByRemoteID(ctx, 1); got == nil {
-		t.Error("backend entry should be inserted")
-	}
-	if got, _ := s.EntryByRemoteID(ctx, 2); got != nil {
-		t.Error("payments entry should be ignored under a backend-scoped pull")
-	}
-	// A scoped pull is partial and must not advance the watermark.
-	if _, ok, _ := s.Meta(ctx, store.MetaLastPull); ok {
-		t.Error("scoped pull should not advance last_pull")
+			since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+			now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+			var buf bytes.Buffer
+			if err := cmdPull(env(&buf, s, c, now, time.UTC), false, tc.fragment, since, false); err != nil {
+				t.Fatalf("pull: %v", err)
+			}
+			if !strings.Contains(buf.String(), tc.wantOutput) {
+				t.Errorf("output = %q, want %q", buf.String(), tc.wantOutput)
+			}
+			for _, id := range tc.wantRemoteIDs {
+				if got := mustEntryByRemoteID(t, s, id); got == nil {
+					t.Errorf("entry %d should have been inserted", id)
+				}
+			}
+			for _, id := range tc.goneRemoteIDs {
+				if got := mustEntryByRemoteID(t, s, id); got != nil {
+					t.Errorf("entry %d = %+v, want it ignored by a scoped pull", id, got)
+				}
+			}
+			if _, ok := mustMeta(t, s, store.MetaLastPull); ok != tc.wantWatermark {
+				t.Errorf("last_pull set = %v, want %v", ok, tc.wantWatermark)
+			}
+		})
 	}
 }
 
@@ -2504,13 +2646,7 @@ func TestPullIgnoresProjectEnv(t *testing.T) {
 	t.Setenv("TOGGL_PROJECT_ID", "1")
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`[
-		  {"id":1,"workspace_id":1,"project_id":1,"description":"a",
-		   "start":"2026-01-02T09:00:00Z","stop":"2026-01-02T09:30:00Z",
-		   "duration":1800,"at":"2026-01-02T09:30:00Z"},
-		  {"id":2,"workspace_id":1,"project_id":2,"description":"b",
-		   "start":"2026-01-02T10:00:00Z","stop":"2026-01-02T10:30:00Z",
-		   "duration":1800,"at":"2026-01-02T10:30:00Z"}]`))
+		w.Write([]byte(pullEntriesJSON))
 	}))
 	defer srv.Close()
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
@@ -2525,15 +2661,15 @@ func TestPullIgnoresProjectEnv(t *testing.T) {
 		t.Errorf("output = %q, want 2 inserted (all projects)", buf.String())
 	}
 	// The env project's entry is pulled...
-	if got, _ := s.EntryByRemoteID(ctx, 1); got == nil {
+	if got := mustEntryByRemoteID(t, s, 1); got == nil {
 		t.Error("project 1 entry should be inserted")
 	}
 	// ...and so is the entry for a project other than TOGGL_PROJECT_ID.
-	if got, _ := s.EntryByRemoteID(ctx, 2); got == nil {
+	if got := mustEntryByRemoteID(t, s, 2); got == nil {
 		t.Error("project 2 entry should be inserted despite TOGGL_PROJECT_ID=1")
 	}
 	// Ignoring the env means this is a full pull: the watermark advances.
-	if _, ok, _ := s.Meta(ctx, store.MetaLastPull); !ok {
+	if _, ok := mustMeta(t, s, store.MetaLastPull); !ok {
 		t.Error("pull ignoring env should be a full pull and advance last_pull")
 	}
 }
@@ -2553,8 +2689,7 @@ func totalReportsServer(t *testing.T) (*api.Client, *map[string]any) {
 		if r.URL.Path != "/workspace/1/summary/time_entries" {
 			t.Errorf("path = %q, want /workspace/1/summary/time_entries", r.URL.Path)
 		}
-		raw, _ := io.ReadAll(r.Body)
-		json.Unmarshal(raw, &body)
+		body = decodeBody(t, r)
 		w.Write([]byte(`{"groups":[
 		  {"id":1,"sub_groups":[
 		    {"id":10,"seconds":4500},
@@ -2576,213 +2711,147 @@ var totalNow = time.Date(2026, 1, 2, 15, 0, 0, 0, time.UTC)
 // before totalNow (see resolveTotalSince), i.e. 2025-10-02.
 var totalSince = totalNow.AddDate(0, -3, 0)
 
-// TestTotalMatchesLocalCatalogByID is the regression test for `tg total`
-// matching nothing: the fragment is matched against the LOCAL catalog and the
-// summary rows are joined to it by task id, so a titleless report still yields
-// a named, project-tagged line. It also checks the default 3-month range.
-func TestTotalMatchesLocalCatalogByID(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-	c, body := totalReportsServer(t)
-
-	var buf bytes.Buffer
-	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "login", totalSince, false); err != nil {
-		t.Fatalf("total: %v", err)
-	}
-	out := buf.String()
-	for _, want := range []string{"Fix login bug", "1h15m", "[Backend]", "Total: 1h15m"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("output missing %q:\n%s", want, out)
-		}
-	}
-	// Only the matched task is listed.
-	for _, unwanted := range []string{"Code review", "Write tests", "Write docs", "task #99"} {
-		if strings.Contains(out, unwanted) {
-			t.Errorf("output should only list the matched task, has %q:\n%s", unwanted, out)
-		}
-	}
-	// The default 3-month start date and today's end date are sent.
-	if (*body)["start_date"] != "2025-10-02" {
-		t.Errorf("start_date = %v, want 2025-10-02", (*body)["start_date"])
-	}
-	if (*body)["end_date"] != "2026-01-02" {
-		t.Errorf("end_date = %v, want 2026-01-02", (*body)["end_date"])
-	}
-}
-
-// TestTotalJoinsFragment verifies the positionals form ONE fragment like
-// `tg add` does: "write docs" is a single search, not two.
-func TestTotalJoinsFragment(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-	c, _ := totalReportsServer(t)
-
-	var buf bytes.Buffer
-	// runTotal joins the positionals with a space before calling cmdTotal.
-	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, strings.Join([]string{"write", "docs"}, " "), totalSince, false); err != nil {
-		t.Fatalf("total: %v", err)
-	}
-	out := buf.String()
-	if !strings.Contains(out, "Write docs") || !strings.Contains(out, "Total: 0h15m") {
-		t.Errorf("joined fragment should match only Write docs:\n%s", out)
-	}
-	if strings.Contains(out, "Write tests") {
-		t.Errorf("joined fragment must not be treated as two searches:\n%s", out)
-	}
-}
-
-// TestTotalSinceOverridesStart verifies an explicit since date sets the Reports
-// API start_date instead of the default 3-month window, while end_date stays
-// today.
-func TestTotalSinceOverridesStart(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-	c, body := totalReportsServer(t)
-
-	since := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
-	var buf bytes.Buffer
-	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "login", since, false); err != nil {
-		t.Fatalf("total: %v", err)
-	}
-	if (*body)["start_date"] != "2025-01-01" {
-		t.Errorf("start_date = %v, want 2025-01-01", (*body)["start_date"])
-	}
-	if (*body)["end_date"] != "2026-01-02" {
-		t.Errorf("end_date = %v, want 2026-01-02", (*body)["end_date"])
-	}
-}
-
-// TestTotalFragmentMatchingMany verifies one fragment can match several tasks
-// (the store's substring semantics), all of which are listed and summed.
-func TestTotalFragmentMatchingMany(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-	c, _ := totalReportsServer(t)
-
-	var buf bytes.Buffer
-	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "write", totalSince, false); err != nil {
-		t.Fatalf("total: %v", err)
-	}
-	out := buf.String()
-	// "write" matches both Write tests (1h00m) and Write docs (0h15m).
-	for _, want := range []string{"Write tests", "1h00m", "Write docs", "0h15m", "Total: 1h15m"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("output missing %q:\n%s", want, out)
-		}
-	}
-}
-
-// TestTotalFirstMatchOnly verifies `-1` narrows a several-match fragment to its
-// first candidate — the same one `tg add -1` would record against — so only that
-// task's time is reported.
-func TestTotalFirstMatchOnly(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-	c, _ := totalReportsServer(t)
-
-	var buf bytes.Buffer
-	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), true, "write", totalSince, false); err != nil {
-		t.Fatalf("total -1: %v", err)
-	}
-	out := buf.String()
-	// Candidates are ordered by name, so "Write docs" (0h15m) is the first.
-	for _, want := range []string{"Write docs", "0h15m", "Total: 0h15m"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("output missing %q:\n%s", want, out)
-		}
-	}
-	if strings.Contains(out, "Write tests") {
-		t.Errorf("total -1 should report only the first match:\n%s", out)
-	}
-}
-
-// TestTotalExactNameWins verifies the store's exact-match-wins rule reaches
-// `total`: "fix" is a full task name (task 11) as well as a substring of
-// "Fix login bug", and only the exact one is considered.
-func TestTotalExactNameWins(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-	c, _ := totalReportsServer(t)
-
-	var buf bytes.Buffer
-	// Task 11 ("Fix") has no tracked time in the report, so the exact match
-	// winning is what makes this an empty result rather than "Fix login bug".
-	err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "fix", totalSince, false)
-	if err == nil || !strings.Contains(err.Error(), "no tracked time") {
-		t.Errorf("err = %v, want a no-tracked-time error for the exact match", err)
-	}
-}
-
-// TestTotalNoFragmentListsAll verifies an empty fragment lists every task with
-// tracked time, including rows whose task id is missing from the local catalog:
-// those keep the API's title when it sent one, else fall back to `task #<id>`.
-func TestTotalNoFragmentListsAll(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-	c, _ := totalReportsServer(t)
-
-	var buf bytes.Buffer
-	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "", totalSince, false); err != nil {
-		t.Fatalf("total: %v", err)
-	}
-	out := buf.String()
-	for _, want := range []string{
-		"Fix login bug", "Code review", "Write tests", "Write docs",
-		"Legacy work", // uncatalogued but titled by the API
-		"task #99",    // uncatalogued and untitled
-		"Total: 3h45m",
+// TestTotalCommand tables `tg total`'s matching. The regression it guards is
+// that the fragment is matched against the LOCAL catalog and the summary rows
+// are joined to it by task id: the report's task sub-groups carry no titles, so
+// anything matching on reported titles would match nothing at all. Beyond that,
+// the positionals form ONE fragment, an exact task name wins over the longer
+// names it is part of, `-1` narrows a many-match fragment to its first
+// candidate, an empty fragment lists everything with tracked time (including
+// rows the local catalog does not know), and a fragment matching no catalogued
+// task — or one with no tracked time — fails without printing anything.
+func TestTotalCommand(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		fragment string
+		first    bool
+		want     []string // substrings the report must contain
+		absent   []string // substrings it must not contain
+		wantErr  string
+	}{
+		{
+			name: "unique fragment joined by id", fragment: "login",
+			want:   []string{"Fix login bug", "1h15m", "[Backend]", "Total: 1h15m"},
+			absent: []string{"Code review", "Write tests", "Write docs", "task #99"},
+		},
+		{
+			// runTotal joins the positionals with a space before calling
+			// cmdTotal, so "write docs" is one search and not two.
+			name: "joined multi-word fragment", fragment: strings.Join([]string{"write", "docs"}, " "),
+			want:   []string{"Write docs", "Total: 0h15m"},
+			absent: []string{"Write tests"},
+		},
+		{
+			// One fragment may match several tasks (the store's substring
+			// semantics); all of them are listed and summed.
+			name: "fragment matching many", fragment: "write",
+			want: []string{"Write tests", "1h00m", "Write docs", "0h15m", "Total: 1h15m"},
+		},
+		{
+			// Candidates are ordered by name, so "Write docs" is the first —
+			// the same one `tg add -1` would record against.
+			name: "first match only", fragment: "write", first: true,
+			want:   []string{"Write docs", "0h15m", "Total: 0h15m"},
+			absent: []string{"Write tests"},
+		},
+		{
+			name: "no fragment lists all",
+			want: []string{
+				"Fix login bug", "Code review", "Write tests", "Write docs",
+				"Legacy work", // uncatalogued, but titled by the API
+				"task #99",    // uncatalogued and untitled
+				"Total: 3h45m",
+			},
+		},
+		{
+			// Task 11 ("Fix") is an exact name and has no tracked time in the
+			// report, so the exact match winning is what makes this an empty
+			// result rather than "Fix login bug".
+			name: "exact name wins", fragment: "fix", wantErr: "no tracked time",
+		},
+		{
+			// Task 20 (Payment fix) exists locally; the report never mentions
+			// it, which is reported as such rather than as a bogus no-match.
+			name: "matched but untracked", fragment: "payment", wantErr: "no tracked time",
+		},
+		{
+			// A row only the API named cannot be reached by a fragment:
+			// matching is catalog-only.
+			name: "api-only title not matchable", fragment: "legacy", wantErr: "no task matches",
+		},
+		{name: "no match", fragment: "nonexistent", wantErr: "no task matches"},
 	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("output missing %q:\n%s", want, out)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
+			c, _ := totalReportsServer(t)
+
+			var buf bytes.Buffer
+			err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), tc.first, tc.fragment, totalSince, false)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want it to contain %q", err, tc.wantErr)
+				}
+				if buf.Len() != 0 {
+					t.Errorf("output = %q, want nothing written when total fails", buf.String())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("total %q: %v", tc.fragment, err)
+			}
+			out := buf.String()
+			for _, want := range tc.want {
+				if !strings.Contains(out, want) {
+					t.Errorf("output missing %q:\n%s", want, out)
+				}
+			}
+			for _, absent := range tc.absent {
+				if strings.Contains(out, absent) {
+					t.Errorf("output should not report %q:\n%s", absent, out)
+				}
+			}
+		})
 	}
 }
 
-// TestTotalUncataloguedNotMatchable verifies a row that only the API named
-// cannot be reached by a fragment: matching is catalog-only.
-func TestTotalUncataloguedNotMatchable(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-	c, _ := totalReportsServer(t)
+// TestTotalWindow pins the range `tg total` asks the Reports API for: the
+// default start is three calendar months before now, --since overrides it, and
+// the end date is today either way.
+func TestTotalWindow(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		since     time.Time
+		wantStart string
+	}{
+		{name: "default three months", since: totalSince, wantStart: "2025-10-02"},
+		{name: "explicit since", since: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), wantStart: "2025-01-01"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
+			c, body := totalReportsServer(t)
 
-	var buf bytes.Buffer
-	err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "legacy", totalSince, false)
-	if err == nil || !strings.Contains(err.Error(), "no task matches") {
-		t.Errorf("err = %v, want a no-match error for an API-only title", err)
-	}
-}
-
-func TestTotalNoMatches(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-	c, _ := totalReportsServer(t)
-
-	var buf bytes.Buffer
-	err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "nonexistent", totalSince, false)
-	if err == nil || !strings.Contains(err.Error(), "no task matches") {
-		t.Errorf("err = %v, want a no-match error", err)
-	}
-	if buf.Len() != 0 {
-		t.Errorf("nothing should be written on no match, got %q", buf.String())
-	}
-}
-
-// TestTotalMatchedButUntracked verifies a task that exists locally but has no
-// tracked time in the range reports that, rather than a bogus no-match.
-func TestTotalMatchedButUntracked(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-	c, _ := totalReportsServer(t)
-
-	var buf bytes.Buffer
-	// "payment" matches task 20, which the report does not mention.
-	err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "payment", totalSince, false)
-	if err == nil || !strings.Contains(err.Error(), "no tracked time") {
-		t.Errorf("err = %v, want a no-tracked-time error", err)
+			var buf bytes.Buffer
+			if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "login", tc.since, false); err != nil {
+				t.Fatalf("total: %v", err)
+			}
+			if got := (*body)["start_date"]; got != tc.wantStart {
+				t.Errorf("start_date = %v, want %s", got, tc.wantStart)
+			}
+			if got := (*body)["end_date"]; got != "2026-01-02" {
+				t.Errorf("end_date = %v, want 2026-01-02 (today)", got)
+			}
+		})
 	}
 }
 
 func TestTotalJSON(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	c, _ := totalReportsServer(t)
@@ -2818,85 +2887,113 @@ func TestTotalJSON(t *testing.T) {
 	}
 }
 
-// TestResolveTotalSinceDefault verifies the default window starts three
-// calendar months before now when no --since is given.
-func TestResolveTotalSinceDefault(t *testing.T) {
-	got, err := resolveTotalSince("", totalNow, time.UTC)
-	if err != nil {
-		t.Fatalf("resolveTotalSince: %v", err)
-	}
-	want := totalNow.AddDate(0, -3, 0)
-	if !got.Equal(want) {
-		t.Errorf("since = %v, want %v (3 months before now)", got, want)
-	}
-}
-
-// TestResolveTotalSinceOverride verifies an explicit --since date is parsed in
-// the given location.
-func TestResolveTotalSinceOverride(t *testing.T) {
-	got, err := resolveTotalSince("2025-01-01", totalNow, time.UTC)
-	if err != nil {
-		t.Fatalf("resolveTotalSince: %v", err)
-	}
-	want := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
-	if !got.Equal(want) {
-		t.Errorf("since = %v, want %v", got, want)
-	}
-}
-
-// TestResolveTotalSinceInvalid verifies a malformed --since date is rejected
-// with the shared "invalid --since" error style.
-func TestResolveTotalSinceInvalid(t *testing.T) {
-	_, err := resolveTotalSince("not-a-date", totalNow, time.UTC)
-	if err == nil || !strings.Contains(err.Error(), "invalid --since") {
-		t.Errorf("err = %v, want an invalid --since error", err)
-	}
-}
-
-func TestResolveAddProjectUnique(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	got, err := resolveAddProject(ctx, s, "pay", false)
-	if err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	if got == nil || *got != 2 {
-		t.Errorf("resolved = %v, want project 2 (Payments)", got)
+// TestResolveTotalSince pins `tg total`'s window start: the default is three
+// calendar months before now, an explicit --since date is parsed as midnight in
+// the given location, and a malformed one is rejected in the shared
+// "invalid --since" style.
+func TestResolveTotalSince(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		flag    string
+		want    time.Time
+		wantErr string
+	}{
+		{name: "default is three months back", want: totalNow.AddDate(0, -3, 0)},
+		{name: "explicit date", flag: "2025-01-01", want: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{name: "malformed date", flag: "not-a-date", wantErr: "invalid --since"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := resolveTotalSince(tc.flag, totalNow, time.UTC)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want it to contain %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveTotalSince(%q): %v", tc.flag, err)
+			}
+			if !got.Equal(tc.want) {
+				t.Errorf("since = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
-func TestResolveAddProjectNone(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
+// TestResolveAddProject covers the project-name form of `tg add`
+// (`tg add <timesign> <project> <task>`): the fragment is resolved against the
+// cached catalog, and a fragment matching nothing points at `tg update`.
+func TestResolveAddProject(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		fragment string
+		want     *int64
+		wantErr  string
+	}{
+		{name: "unique fragment", fragment: "pay", want: ptrInt(2)},
+		{name: "no match", fragment: "nonexistent", wantErr: "tg update"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
 
-	_, err := resolveAddProject(ctx, s, "nonexistent", false)
-	if err == nil || !strings.Contains(err.Error(), "tg update") {
-		t.Errorf("err = %v, want suggestion to run `tg update`", err)
+			got, err := resolveAddProject(ctx, s, tc.fragment, false)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want it to contain %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if got == nil || *got != *tc.want {
+				t.Errorf("resolved = %v, want %d", got, *tc.want)
+			}
+		})
 	}
 }
 
-func TestResolveUpdateProjectEnvWins(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
+// TestResolveUpdateProject covers `tg update`'s two ways of naming a project:
+// TOGGL_PROJECT_ID wins outright when set (the fragment is not even consulted),
+// and with neither an id nor a fragment the command says which of the two is
+// missing.
+func TestResolveUpdateProject(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		projectID *int64
+		fragment  string
+		want      *int64
+		wantErr   string
+	}{
+		{name: "env id wins over the fragment", projectID: ptrInt(2), fragment: "backend", want: ptrInt(2)},
+		{name: "fragment resolves", fragment: "backend", want: ptrInt(1)},
+		{name: "neither is given", fragment: "  ", wantErr: "TOGGL_PROJECT_ID"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
 
-	pid := int64(2)
-	got, err := resolveUpdateProject(ctx, s, &pid, "backend", false)
-	if err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	if got == nil || *got != 2 {
-		t.Errorf("resolved = %v, want 2 (env wins)", got)
-	}
-}
-
-func TestResolveUpdateProjectRequiresScope(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	_, err := resolveUpdateProject(ctx, s, nil, "  ", false)
-	if err == nil || !strings.Contains(err.Error(), "TOGGL_PROJECT_ID") {
-		t.Errorf("err = %v, want required-argument error mentioning TOGGL_PROJECT_ID", err)
+			got, err := resolveUpdateProject(ctx, s, tc.projectID, tc.fragment, false)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want it to contain %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if got == nil || *got != *tc.want {
+				t.Errorf("resolved = %v, want %d", got, *tc.want)
+			}
+		})
 	}
 }
 
@@ -2920,6 +3017,7 @@ const updateEntriesJSON = `[
 // project's tasks (never the whole workspace, and never the project catalog
 // itself) and upserts them without wiping other projects' cached tasks.
 func TestUpdateScopedToOneProject(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -2961,13 +3059,13 @@ func TestUpdateScopedToOneProject(t *testing.T) {
 
 	// Project 2's tasks were replaced with the fetched one...
 	p2 := int64(2)
-	scoped, _ := s.ListTasks(ctx, false, &p2)
+	scoped := mustListTasks(t, s, false, &p2)
 	if len(scoped) != 1 || scoped[0].ID != 21 {
 		t.Errorf("project 2 tasks = %+v, want only id 21", scoped)
 	}
 	// ...while project 1's cached tasks are untouched.
 	p1 := int64(1)
-	backend, _ := s.ListTasks(ctx, false, &p1)
+	backend := mustListTasks(t, s, false, &p1)
 	if len(backend) == 0 {
 		t.Error("project 1 tasks should be untouched by a project-2 update")
 	}
@@ -2978,6 +3076,7 @@ func TestUpdateScopedToOneProject(t *testing.T) {
 // to one project, keeps other projects' entries out and the last_pull watermark
 // untouched so a later full `tg pull` still sees them.
 func TestUpdatePullsRecentEntries(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -3008,14 +3107,14 @@ func TestUpdatePullsRecentEntries(t *testing.T) {
 		t.Errorf("since = %q, want %q", gotSince, want)
 	}
 	// Only the scoped project's entry landed locally.
-	if got, _ := s.EntryByRemoteID(ctx, 2); got == nil {
+	if got := mustEntryByRemoteID(t, s, 2); got == nil {
 		t.Error("payments entry should be inserted by a project-2 update")
 	}
-	if got, _ := s.EntryByRemoteID(ctx, 1); got != nil {
+	if got := mustEntryByRemoteID(t, s, 1); got != nil {
 		t.Error("backend entry should be ignored by a project-2 update")
 	}
 	// A scoped pull is partial: the watermark must stay untouched.
-	if _, ok, _ := s.Meta(ctx, store.MetaLastPull); ok {
+	if _, ok := mustMeta(t, s, store.MetaLastPull); ok {
 		t.Error("update should not advance last_pull (it is a scoped pull)")
 	}
 }
@@ -3024,6 +3123,7 @@ func TestUpdatePullsRecentEntries(t *testing.T) {
 // human mode: --json keeps emitting the machine-readable summary, now including
 // the entry-pull counts.
 func TestUpdateJSONStillReports(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -3052,69 +3152,105 @@ func TestUpdateJSONStillReports(t *testing.T) {
 	}
 }
 
-// TestResolveUpdateSinceDefault pins `tg update`'s default window: one calendar
-// day back, aligned to midnight rather than a rolling 24h cut.
-func TestResolveUpdateSinceDefault(t *testing.T) {
-	now := time.Date(2026, 1, 2, 15, 30, 0, 0, time.UTC)
-	got := resolveUpdateSince(updateDefaultDays, now, time.UTC)
-	want := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	if !got.Equal(want) {
-		t.Errorf("since = %v, want %v", got, want)
-	}
-}
-
-// TestResolveUpdateSinceDays verifies --days/-n walks the window start back a
-// whole number of calendar days, with 0 meaning today only.
-func TestResolveUpdateSinceDays(t *testing.T) {
+// TestResolveUpdateSince pins `tg update`'s entry window: --days/-n walks the
+// start back a whole number of calendar days from midnight (rather than making a
+// rolling 24h cut), the default is one day back, 0 means today only and a
+// negative count is clamped to today instead of erroring.
+func TestResolveUpdateSince(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 1, 2, 15, 30, 0, 0, time.UTC)
 	for _, tc := range []struct {
+		name string
 		days int
 		want time.Time
 	}{
-		{0, time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)},
-		{3, time.Date(2025, 12, 30, 0, 0, 0, 0, time.UTC)},
-		{-5, time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)}, // clamped to today
+		{name: "default", days: updateDefaultDays, want: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{name: "today only", days: 0, want: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)},
+		{name: "three days back", days: 3, want: time.Date(2025, 12, 30, 0, 0, 0, 0, time.UTC)},
+		{name: "negative is clamped", days: -5, want: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)},
 	} {
-		if got := resolveUpdateSince(tc.days, now, time.UTC); !got.Equal(tc.want) {
-			t.Errorf("resolveUpdateSince(%d) = %v, want %v", tc.days, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := resolveUpdateSince(tc.days, now, time.UTC); !got.Equal(tc.want) {
+				t.Errorf("resolveUpdateSince(%d) = %v, want %v", tc.days, got, tc.want)
+			}
+		})
 	}
 }
 
-// TestUpdateDaysFlagAliases pins how runUpdate wires --days/-n: both spellings
-// share one variable and one default, and (thanks to parseArgsAndFlags) may
-// follow the project fragment, as in `tg update backend -n 3`.
-func TestUpdateDaysFlagAliases(t *testing.T) {
-	newFS := func() (*flag.FlagSet, *int) {
-		fs := flag.NewFlagSet("update", flag.ContinueOnError)
-		fs.SetOutput(io.Discard)
-		days := new(int)
-		fs.IntVar(days, "days", updateDefaultDays, "")
-		fs.IntVar(days, "n", updateDefaultDays, "")
-		return fs, days
-	}
-
+// TestUpdateFlagRegistration pins runUpdate's own flag wiring: the flags come
+// from bindUpdateFlags, the very function the command uses, so renaming or
+// dropping one fails here — which a test declaring its own FlagSet could not
+// do. --days/-n and --project/-p are aliases sharing one variable and one
+// default, -1/--first is the shared ambiguity flag, and (through
+// parseArgsAndFlags) any of them may sit before, between or after the positional
+// project fragment.
+func TestUpdateFlagRegistration(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
-		args     []string
-		wantDays int
-		wantFrag string
+		args      []string
+		wantFrag  string
+		wantDays  int
+		wantAll   bool
+		wantJSON  bool
+		wantFirst bool
+		wantErr   string
 	}{
-		{[]string{"backend"}, updateDefaultDays, "backend"},
-		{[]string{"backend", "-n", "3"}, 3, "backend"},
-		{[]string{"--days", "7", "backend"}, 7, "backend"},
-		{[]string{"backend", "--days=2"}, 2, "backend"},
+		{args: nil, wantDays: updateDefaultDays},
+		{args: []string{"backend"}, wantFrag: "backend", wantDays: updateDefaultDays},
+		{args: []string{"backend", "-n", "3"}, wantFrag: "backend", wantDays: 3},
+		{args: []string{"--days", "7", "backend"}, wantFrag: "backend", wantDays: 7},
+		{args: []string{"backend", "--days=2"}, wantFrag: "backend", wantDays: 2},
+		// The flag form of the project reaches the same fragment as the
+		// positional one.
+		{args: []string{"-p", "backend"}, wantFrag: "backend", wantDays: updateDefaultDays},
+		{args: []string{"--project", "backend"}, wantFrag: "backend", wantDays: updateDefaultDays},
+		{args: []string{"--project=backend"}, wantFrag: "backend", wantDays: updateDefaultDays},
+		{args: []string{"-p", "backend", "-n", "3"}, wantFrag: "backend", wantDays: 3},
+		{args: []string{"-n", "3", "-p", "backend"}, wantFrag: "backend", wantDays: 3},
+		// Positionals are joined, so a multi-word project name works unquoted.
+		{args: []string{"code", "review"}, wantFrag: "code review", wantDays: updateDefaultDays},
+		{
+			args: []string{"backend", "--all", "--json", "-1"}, wantFrag: "backend",
+			wantDays: updateDefaultDays, wantAll: true, wantJSON: true, wantFirst: true,
+		},
+		{args: []string{"--first", "backend"}, wantFrag: "backend", wantDays: updateDefaultDays, wantFirst: true},
+		// Naming the project twice is a usage error, not a silent precedence
+		// rule (see updateProjectFragment).
+		{args: []string{"-p", "backend", "payments"}, wantErr: "twice"},
+		{args: []string{"--nope"}, wantErr: "not defined"},
 	} {
-		fs, days := newFS()
-		rest, err := parseArgsAndFlags(fs, tc.args)
-		if err != nil {
-			t.Fatalf("parse %v: %v", tc.args, err)
-		}
-		if *days != tc.wantDays {
-			t.Errorf("parse %v: days = %d, want %d", tc.args, *days, tc.wantDays)
-		}
-		if frag := strings.Join(rest, " "); frag != tc.wantFrag {
-			t.Errorf("parse %v: fragment = %q, want %q", tc.args, frag, tc.wantFrag)
-		}
+		t.Run(fmt.Sprint(tc.args), func(t *testing.T) {
+			t.Parallel()
+			fs := flag.NewFlagSet("update", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			f := bindUpdateFlags(fs)
+
+			frag := ""
+			rest, err := parseArgsAndFlags(fs, tc.args)
+			if err == nil {
+				frag, err = f.resolveFragment(rest)
+			}
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("parse %v: err = %v, want it to contain %q", tc.args, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parse %v: %v", tc.args, err)
+			}
+			if frag != tc.wantFrag {
+				t.Errorf("fragment = %q, want %q", frag, tc.wantFrag)
+			}
+			if f.days != tc.wantDays {
+				t.Errorf("days = %d, want %d", f.days, tc.wantDays)
+			}
+			if f.all != tc.wantAll || f.jsonOut != tc.wantJSON || f.first != tc.wantFirst {
+				t.Errorf("all/json/first = %v/%v/%v, want %v/%v/%v",
+					f.all, f.jsonOut, f.first, tc.wantAll, tc.wantJSON, tc.wantFirst)
+			}
+		})
 	}
 }
 
@@ -3124,6 +3260,7 @@ func TestUpdateDaysFlagAliases(t *testing.T) {
 // for resolveUpdateProject to reject or for TOGGL_PROJECT_ID to cover), and
 // both at once, which is a usage error rather than a silent precedence rule.
 func TestUpdateProjectFragmentSources(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		flagValue  string
@@ -3158,56 +3295,12 @@ func TestUpdateProjectFragmentSources(t *testing.T) {
 	}
 }
 
-// TestUpdateProjectFlagAliases pins runUpdate's flag wiring for --project/-p:
-// both spellings share one variable, they mix freely with --days/-n, and (via
-// parseArgsAndFlags) order does not matter.
-func TestUpdateProjectFlagAliases(t *testing.T) {
-	parse := func(args []string) (project string, days int, rest []string, err error) {
-		fs := flag.NewFlagSet("update", flag.ContinueOnError)
-		fs.SetOutput(io.Discard)
-		fs.IntVar(&days, "days", updateDefaultDays, "")
-		fs.IntVar(&days, "n", updateDefaultDays, "")
-		fs.StringVar(&project, "project", "", "")
-		fs.StringVar(&project, "p", "", "")
-		rest, err = parseArgsAndFlags(fs, args)
-		return project, days, rest, err
-	}
-
-	for _, tc := range []struct {
-		args     []string
-		wantFrag string
-		wantDays int
-	}{
-		{[]string{"-p", "backend"}, "backend", updateDefaultDays},
-		{[]string{"--project", "backend"}, "backend", updateDefaultDays},
-		{[]string{"--project=backend"}, "backend", updateDefaultDays},
-		{[]string{"-p", "backend", "-n", "3"}, "backend", 3},
-		{[]string{"-n", "3", "-p", "backend"}, "backend", 3},
-		// The positional form still works and reaches the same fragment.
-		{[]string{"backend", "-n", "3"}, "backend", 3},
-	} {
-		project, days, rest, err := parse(tc.args)
-		if err != nil {
-			t.Fatalf("parse %v: %v", tc.args, err)
-		}
-		frag, err := updateProjectFragment(project, rest)
-		if err != nil {
-			t.Fatalf("fragment %v: %v", tc.args, err)
-		}
-		if frag != tc.wantFrag {
-			t.Errorf("parse %v: fragment = %q, want %q", tc.args, frag, tc.wantFrag)
-		}
-		if days != tc.wantDays {
-			t.Errorf("parse %v: days = %d, want %d", tc.args, days, tc.wantDays)
-		}
-	}
-}
-
 // TestUpdateResolvesProjectByFragment verifies `tg update` picks its project by
 // a case-insensitive name fragment against the cached catalog (no env id, no
 // exact name): "pay" reaches Payments (id 2), so the tasks fetched and the
 // entries kept are that project's.
 func TestUpdateResolvesProjectByFragment(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -3237,15 +3330,15 @@ func TestUpdateResolvesProjectByFragment(t *testing.T) {
 		}
 	}
 	p2 := int64(2)
-	scoped, _ := s.ListTasks(ctx, false, &p2)
+	scoped := mustListTasks(t, s, false, &p2)
 	if len(scoped) != 1 || scoped[0].ID != 21 {
 		t.Errorf("project 2 tasks = %+v, want only id 21", scoped)
 	}
 	// The entry pull was scoped to the resolved project too.
-	if got, _ := s.EntryByRemoteID(ctx, 2); got == nil {
+	if got := mustEntryByRemoteID(t, s, 2); got == nil {
 		t.Error("payments entry should be inserted")
 	}
-	if got, _ := s.EntryByRemoteID(ctx, 1); got != nil {
+	if got := mustEntryByRemoteID(t, s, 1); got != nil {
 		t.Error("backend entry should be ignored by a payments-scoped update")
 	}
 }
@@ -3254,6 +3347,7 @@ func TestUpdateResolvesProjectByFragment(t *testing.T) {
 // cached project fails with the candidate list (name + id) instead of guessing,
 // and that nothing is fetched before the ambiguity is resolved.
 func TestUpdateAmbiguousProjectFragment(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	if err := s.PutProject(ctx, store.Project{
@@ -3294,6 +3388,7 @@ func TestUpdateAmbiguousProjectFragment(t *testing.T) {
 // ambiguous fragment by taking the first candidate ("Backend", id 1) and that
 // update then really refreshes THAT project.
 func TestUpdateAmbiguousProjectFragmentFirst(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	if err := s.PutProject(ctx, store.Project{
@@ -3326,7 +3421,7 @@ func TestUpdateAmbiguousProjectFragmentFirst(t *testing.T) {
 		t.Fatal("update -1 made no requests")
 	}
 	p1 := int64(1)
-	tasks, _ := s.ListTasks(ctx, false, &p1)
+	tasks := mustListTasks(t, s, false, &p1)
 	if len(tasks) != 1 || tasks[0].ID != 15 {
 		t.Errorf("project 1 tasks = %+v, want only id 15 (Backend was refreshed)", tasks)
 	}
@@ -3335,114 +3430,135 @@ func TestUpdateAmbiguousProjectFragmentFirst(t *testing.T) {
 // pullNow is a fixed mid-month, mid-day clock for the `tg pull` window tests.
 var pullNow = time.Date(2026, 3, 17, 15, 30, 0, 0, time.UTC)
 
-// TestResolvePullSinceDefault pins `tg pull`'s default window: today only,
-// aligned to midnight in the given location.
-func TestResolvePullSinceDefault(t *testing.T) {
-	got, err := resolvePullSince("", false, pullNow, time.UTC)
-	if err != nil {
-		t.Fatalf("resolvePullSince: %v", err)
-	}
-	want := time.Date(2026, 3, 17, 0, 0, 0, 0, time.UTC)
-	if !got.Equal(want) {
-		t.Errorf("since = %v, want %v (start of today)", got, want)
-	}
-}
-
-// TestResolvePullSinceAll verifies -a/--all widens the window to the whole
-// current calendar month, starting at midnight on the 1st.
-func TestResolvePullSinceAll(t *testing.T) {
-	got, err := resolvePullSince("", true, pullNow, time.UTC)
-	if err != nil {
-		t.Fatalf("resolvePullSince: %v", err)
-	}
-	want := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
-	if !got.Equal(want) {
-		t.Errorf("since = %v, want %v (start of this month)", got, want)
-	}
-}
-
-// TestResolvePullSinceLocation verifies both windows are day-aligned in the
-// caller's location, not in UTC.
-func TestResolvePullSinceLocation(t *testing.T) {
-	loc := time.FixedZone("UTC+3", 3*60*60)
-	// 2026-03-01T01:00+03:00 is still February in UTC.
-	now := time.Date(2026, 2, 28, 22, 0, 0, 0, time.UTC)
-	day, err := resolvePullSince("", false, now, loc)
-	if err != nil {
-		t.Fatalf("resolvePullSince: %v", err)
-	}
-	if want := time.Date(2026, 3, 1, 0, 0, 0, 0, loc); !day.Equal(want) {
-		t.Errorf("today window = %v, want %v", day, want)
-	}
-	month, err := resolvePullSince("", true, now, loc)
-	if err != nil {
-		t.Fatalf("resolvePullSince: %v", err)
-	}
-	if want := time.Date(2026, 3, 1, 0, 0, 0, 0, loc); !month.Equal(want) {
-		t.Errorf("month window = %v, want %v", month, want)
-	}
-}
-
-// TestResolvePullSinceOverride verifies an explicit --since date wins over both
-// defaults, including over --all.
-func TestResolvePullSinceOverride(t *testing.T) {
-	for _, all := range []bool{false, true} {
-		got, err := resolvePullSince("2025-11-04", all, pullNow, time.UTC)
-		if err != nil {
-			t.Fatalf("resolvePullSince(all=%v): %v", all, err)
-		}
-		want := time.Date(2025, 11, 4, 0, 0, 0, 0, time.UTC)
-		if !got.Equal(want) {
-			t.Errorf("since(all=%v) = %v, want %v", all, got, want)
-		}
-	}
-}
-
-// TestResolvePullSinceInvalid verifies a malformed --since date is rejected
-// with the shared "invalid --since" error style.
-func TestResolvePullSinceInvalid(t *testing.T) {
-	_, err := resolvePullSince("17-03-2026", false, pullNow, time.UTC)
-	if err == nil || !strings.Contains(err.Error(), "invalid --since") {
-		t.Errorf("err = %v, want an invalid --since error", err)
-	}
-}
-
-// TestPullAllFlagAliases pins how runPull wires --all/-a: both spellings share
-// one variable, default to false (today only), and (thanks to parseArgsAndFlags)
-// may follow the project fragment, as in `tg pull backend -a`.
-func TestPullAllFlagAliases(t *testing.T) {
-	newFS := func() (*flag.FlagSet, *bool) {
-		fs := flag.NewFlagSet("pull", flag.ContinueOnError)
-		fs.SetOutput(io.Discard)
-		all := new(bool)
-		fs.BoolVar(all, "all", false, "")
-		fs.BoolVar(all, "a", false, "")
-		return fs, all
-	}
+// TestResolvePullSince tables `tg pull`'s window start: the default is today,
+// -a/--all widens it to the whole current calendar month, an explicit --since
+// date wins over both, and a malformed one is rejected in the shared
+// "invalid --since" style. Both defaults are day-aligned in the CALLER's
+// location rather than in UTC, so they mean "today" and "this month" in calendar
+// terms.
+func TestResolvePullSince(t *testing.T) {
+	t.Parallel()
+	// 2026-03-01T01:00+03:00 is still February in UTC, so a UTC-framed
+	// alignment would put these two cases in the wrong month.
+	eastern := time.FixedZone("UTC+3", 3*60*60)
+	lateFebruaryUTC := time.Date(2026, 2, 28, 22, 0, 0, 0, time.UTC)
 
 	for _, tc := range []struct {
-		args     []string
-		wantAll  bool
-		wantFrag string
+		name    string
+		flag    string
+		all     bool
+		now     time.Time
+		loc     *time.Location
+		want    time.Time
+		wantErr string
 	}{
-		{[]string{}, false, ""},
-		{[]string{"backend"}, false, "backend"},
-		{[]string{"-a"}, true, ""},
-		{[]string{"--all"}, true, ""},
-		{[]string{"backend", "-a"}, true, "backend"},
-		{[]string{"--all", "backend"}, true, "backend"},
+		{
+			name: "default is today", now: pullNow, loc: time.UTC,
+			want: time.Date(2026, 3, 17, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "--all is this month", all: true, now: pullNow, loc: time.UTC,
+			want: time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "explicit since", flag: "2025-11-04", now: pullNow, loc: time.UTC,
+			want: time.Date(2025, 11, 4, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "explicit since wins over --all", flag: "2025-11-04", all: true, now: pullNow, loc: time.UTC,
+			want: time.Date(2025, 11, 4, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "today is day-aligned in loc", now: lateFebruaryUTC, loc: eastern,
+			want: time.Date(2026, 3, 1, 0, 0, 0, 0, eastern),
+		},
+		{
+			name: "the month is aligned in loc too", all: true, now: lateFebruaryUTC, loc: eastern,
+			want: time.Date(2026, 3, 1, 0, 0, 0, 0, eastern),
+		},
+		{
+			name: "malformed since", flag: "17-03-2026", now: pullNow, loc: time.UTC,
+			wantErr: "invalid --since",
+		},
 	} {
-		fs, all := newFS()
-		rest, err := parseArgsAndFlags(fs, tc.args)
-		if err != nil {
-			t.Fatalf("parse %v: %v", tc.args, err)
-		}
-		if *all != tc.wantAll {
-			t.Errorf("parse %v: all = %v, want %v", tc.args, *all, tc.wantAll)
-		}
-		if frag := strings.Join(rest, " "); frag != tc.wantFrag {
-			t.Errorf("parse %v: fragment = %q, want %q", tc.args, frag, tc.wantFrag)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := resolvePullSince(tc.flag, tc.all, tc.now, tc.loc)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want it to contain %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolvePullSince: %v", err)
+			}
+			if !got.Equal(tc.want) {
+				t.Errorf("since = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPullFlagRegistration pins runPull's own flag wiring, through the same
+// bindPullFlags the command uses (see TestUpdateFlagRegistration for why the
+// test does not declare its own): --all/-a are aliases sharing one variable and
+// default to false (today only), --since takes the explicit window start,
+// -1/--first is the shared ambiguity flag, and any of them may follow the
+// positional project fragment, as in `tg pull backend -a`.
+func TestPullFlagRegistration(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		args      []string
+		wantFrag  string
+		wantAll   bool
+		wantSince string
+		wantJSON  bool
+		wantFirst bool
+		wantErr   string
+	}{
+		{args: nil},
+		{args: []string{"backend"}, wantFrag: "backend"},
+		{args: []string{"-a"}, wantAll: true},
+		{args: []string{"--all"}, wantAll: true},
+		{args: []string{"backend", "-a"}, wantFrag: "backend", wantAll: true},
+		{args: []string{"--all", "backend"}, wantFrag: "backend", wantAll: true},
+		{args: []string{"--since", "2025-11-04"}, wantSince: "2025-11-04"},
+		{args: []string{"backend", "--since=2025-11-04", "--json"}, wantFrag: "backend", wantSince: "2025-11-04", wantJSON: true},
+		{args: []string{"back", "office", "-1"}, wantFrag: "back office", wantFirst: true},
+		{args: []string{"--first", "backend"}, wantFrag: "backend", wantFirst: true},
+		{args: []string{"--nope"}, wantErr: "not defined"},
+	} {
+		t.Run(fmt.Sprint(tc.args), func(t *testing.T) {
+			t.Parallel()
+			fs := flag.NewFlagSet("pull", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			f := bindPullFlags(fs)
+
+			rest, err := parseArgsAndFlags(fs, tc.args)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("parse %v: err = %v, want it to contain %q", tc.args, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parse %v: %v", tc.args, err)
+			}
+			// runPull joins the positionals into one project fragment.
+			if frag := strings.Join(rest, " "); frag != tc.wantFrag {
+				t.Errorf("fragment = %q, want %q", frag, tc.wantFrag)
+			}
+			if f.all != tc.wantAll {
+				t.Errorf("all = %v, want %v", f.all, tc.wantAll)
+			}
+			if f.since != tc.wantSince {
+				t.Errorf("since = %q, want %q", f.since, tc.wantSince)
+			}
+			if f.jsonOut != tc.wantJSON || f.first != tc.wantFirst {
+				t.Errorf("json/first = %v/%v, want %v/%v", f.jsonOut, f.first, tc.wantJSON, tc.wantFirst)
+			}
+		})
 	}
 }
 
@@ -3450,6 +3566,7 @@ func TestPullAllFlagAliases(t *testing.T) {
 // is treated as a partial pull at the command level: an older watermark is left
 // alone so a later wider pull still reconciles the days in between.
 func TestPullTodayWindowKeepsStaleWatermark(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	if err := s.SetMeta(ctx, store.MetaLastPull, "2026-01-01T09:00:00Z"); err != nil {
@@ -3468,7 +3585,7 @@ func TestPullTodayWindowKeepsStaleWatermark(t *testing.T) {
 	if err := cmdPull(env(&buf, s, c, now, time.UTC), false, "", since, false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
-	v, _, _ := s.Meta(ctx, store.MetaLastPull)
+	v, _ := mustMeta(t, s, store.MetaLastPull)
 	if v != "2026-01-01T09:00:00Z" {
 		t.Errorf("last_pull = %q, want the untouched watermark", v)
 	}
@@ -3478,6 +3595,7 @@ func TestPullTodayWindowKeepsStaleWatermark(t *testing.T) {
 // entire workspace project list and upserts it (without wiping other cached
 // projects) while never fetching tasks.
 func TestProjectsUpdateSyncsWholeWorkspace(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -3511,7 +3629,7 @@ func TestProjectsUpdateSyncsWholeWorkspace(t *testing.T) {
 
 	// The fetched project was added and the pre-existing project 1 (Backend,
 	// not in the response) is left untouched by the upsert.
-	projects, _ := s.ListProjects(ctx, false)
+	projects := mustListProjects(t, s, false)
 	names := map[string]bool{}
 	for _, p := range projects {
 		names[p.Name] = true
@@ -3524,13 +3642,14 @@ func TestProjectsUpdateSyncsWholeWorkspace(t *testing.T) {
 
 	// Cached tasks are untouched: projects update never syncs tasks.
 	p1 := int64(1)
-	backend, _ := s.ListTasks(ctx, false, &p1)
+	backend := mustListTasks(t, s, false, &p1)
 	if len(backend) == 0 {
 		t.Error("project 1 tasks should be untouched by projects update")
 	}
 }
 
 func TestProjectsUpdateJSON(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3549,6 +3668,7 @@ func TestProjectsUpdateJSON(t *testing.T) {
 }
 
 func TestProjectsCommand(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
@@ -3580,13 +3700,13 @@ func seedSampleDay(t *testing.T, s *store.Store) (now time.Time, loc *time.Locat
 	stop1 := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
 	start2 := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
 	if _, err := s.CreateEntry(ctx, store.Entry{
-		WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
+		WorkspaceID: 1, ProjectID: ptrInt(1), TaskID: ptrInt(10),
 		Start: start1, Stop: &stop1, Duration: 4500, UpdatedAt: stop1,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.CreateEntry(ctx, store.Entry{
-		WorkspaceID: 1, ProjectID: p(1), TaskID: p(12),
+		WorkspaceID: 1, ProjectID: ptrInt(1), TaskID: ptrInt(12),
 		Start: start2, Duration: -1, UpdatedAt: start2,
 	}); err != nil {
 		t.Fatal(err)
@@ -3594,9 +3714,8 @@ func seedSampleDay(t *testing.T, s *store.Store) (now time.Time, loc *time.Locat
 	return time.Date(2026, 1, 2, 11, 15, 0, 0, time.UTC), time.UTC
 }
 
-func p(v int64) *int64 { return &v }
-
 func TestTodayCommandGolden(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	now, loc := seedSampleDay(t, s)
 	var buf bytes.Buffer
@@ -3611,6 +3730,7 @@ func TestTodayCommandGolden(t *testing.T) {
 // alike), and those are exactly the numbers the store resolves — listing is a
 // read, so it never renumbers anything.
 func TestTodayCommandNumbers(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	now, loc := seedSampleDay(t, s)
 
@@ -3683,13 +3803,14 @@ func TestTodayCommandNumbers(t *testing.T) {
 // own 1..N, so the listing groups entries under a date header instead of
 // showing a flat run of repeated numbers.
 func TestTodayCommandMultiDayGrouping(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
 	mk := func(start time.Time) {
 		stop := start.Add(time.Hour)
 		if _, err := s.CreateEntry(ctx, store.Entry{
-			WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
+			WorkspaceID: 1, ProjectID: ptrInt(1), TaskID: ptrInt(10),
 			Start: start, Stop: &stop, Duration: 3600, UpdatedAt: stop,
 		}); err != nil {
 			t.Fatal(err)
@@ -3726,13 +3847,14 @@ func TestTodayCommandMultiDayGrouping(t *testing.T) {
 // entry finished and now past its stop, the listing reports the idle time
 // before the total footer.
 func TestTodayCommandTrailingGap(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
 	start := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
 	stop := time.Date(2026, 1, 2, 10, 0, 0, 0, time.UTC)
 	if _, err := s.CreateEntry(ctx, store.Entry{
-		WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
+		WorkspaceID: 1, ProjectID: ptrInt(1), TaskID: ptrInt(10),
 		Start: start, Stop: &stop, Duration: 3600, UpdatedAt: stop,
 	}); err != nil {
 		t.Fatal(err)
@@ -3752,56 +3874,92 @@ func TestTodayCommandTrailingGap(t *testing.T) {
 }
 
 // seedDailyMonth records one finished entry per given (day, duration) pair in
-// January 2026 and returns a `now` inside that month. Each entry starts at
-// 09:00 on its day, so the durations never collide.
+// January 2026. Each entry starts at 09:00 on its day, so the durations never
+// collide.
 func seedDailyMonth(t *testing.T, s *store.Store, days map[int]time.Duration) {
 	t.Helper()
 	seedCatalog(t, s)
 	for day, d := range days {
-		start := time.Date(2026, 1, day, 9, 0, 0, 0, time.UTC)
-		stop := start.Add(d)
-		if _, err := s.CreateEntry(ctx, store.Entry{
-			WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
-			Start: start, Stop: &stop, Duration: int64(d / time.Second), UpdatedAt: stop,
-		}); err != nil {
-			t.Fatal(err)
-		}
+		seedFixture(t, s, fixtureEntry{
+			start: time.Date(2026, 1, day, 9, 0, 0, 0, time.UTC), dur: d, taskID: 10,
+		})
 	}
 }
 
-// TestDailySumsPerDay is the core of `tg daily`: entries are summed per
-// calendar day, one line each, and every line reports the day's overtime
-// against the target. The footer sums the month and measures it against
-// target x the number of listed days.
-func TestDailySumsPerDay(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
+// TestDailyOutput tables `tg daily`'s listing: entries are summed per calendar
+// day, one line each, every line reports that day's overtime against the target
+// and the footer sums the month and measures it against target x the number of
+// LISTED days. A running entry contributes its elapsed-so-far time (flagged with
+// a star, as `tg today`/`tg status` count it), days after today are dimmed when
+// color is on so booked-ahead time reads as planned rather than worked, and a
+// month with nothing tracked is an explanatory line rather than an error.
+func TestDailyOutput(t *testing.T) {
+	t.Parallel()
+	on := func(day, hour int) time.Time { return time.Date(2026, 1, day, hour, 0, 0, 0, time.UTC) }
+	for _, tc := range []struct {
+		name    string
+		entries []fixtureEntry
+		now     time.Time
+		color   bool
+		want    string
+	}{
+		{
+			name: "sums entries per day",
+			entries: []fixtureEntry{
+				{start: on(5, 9), dur: 4 * time.Hour, taskID: 10},
+				{start: on(5, 13), dur: 4*time.Hour + 30*time.Minute, taskID: 10},
+				{start: on(6, 9), dur: 7*time.Hour + 15*time.Minute, taskID: 10},
+			},
+			now: on(20, 12),
+			want: "Mon 2026-01-05  8h30m   +0:30\n" +
+				"Tue 2026-01-06  7h15m   -0:45\n" +
+				todayDivider + "\n" +
+				"Total: 15h45m  -0:15  (2 days x 8h00m)\n",
+		},
+		{
+			name:    "a running entry counts live",
+			entries: []fixtureEntry{{start: on(5, 9), taskID: 12}},
+			now:     time.Date(2026, 1, 5, 11, 30, 0, 0, time.UTC),
+			want: "Mon 2026-01-05  2h30m*  -5:30\n" +
+				todayDivider + "\n" +
+				"Total: 2h30m   -5:30  (1 day x 8h00m)   (* running)\n",
+		},
+		{
+			name: "upcoming days are dimmed",
+			entries: []fixtureEntry{
+				{start: on(19, 9), dur: 8 * time.Hour, taskID: 10}, // yesterday
+				{start: on(20, 9), dur: 6 * time.Hour, taskID: 10}, // today
+				{start: on(21, 9), dur: 4 * time.Hour, taskID: 10}, // booked ahead
+			},
+			now:   time.Date(2026, 1, 20, 18, 0, 0, 0, time.UTC),
+			color: true,
+			want: "Mon 2026-01-19  8h00m   +0:00\n" +
+				"Tue 2026-01-20  6h00m   -2:00\n" +
+				faint("Wed 2026-01-21  4h00m   -4:00") + "\n" +
+				todayDivider + "\n" +
+				"Total: 18h00m  -6:00  (3 days x 8h00m)\n",
+		},
+		{
+			// Safe to run on a fresh install.
+			name: "empty month",
+			now:  on(20, 12),
+			want: "No entries this month.\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
+			seedFixture(t, s, tc.entries...)
 
-	// Two entries on 2026-01-05 (8h30m together) and one on 2026-01-06 (7h15m).
-	mk := func(start time.Time, d time.Duration) {
-		stop := start.Add(d)
-		if _, err := s.CreateEntry(ctx, store.Entry{
-			WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
-			Start: start, Stop: &stop, Duration: int64(d / time.Second), UpdatedAt: stop,
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	mk(time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC), 4*time.Hour)
-	mk(time.Date(2026, 1, 5, 13, 0, 0, 0, time.UTC), 4*time.Hour+30*time.Minute)
-	mk(time.Date(2026, 1, 6, 9, 0, 0, 0, time.UTC), 7*time.Hour+15*time.Minute)
-
-	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
-	var buf bytes.Buffer
-	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, false); err != nil {
-		t.Fatalf("daily: %v", err)
-	}
-	want := "Mon 2026-01-05  8h30m   +0:30\n" +
-		"Tue 2026-01-06  7h15m   -0:45\n" +
-		todayDivider + "\n" +
-		"Total: 15h45m  -0:15  (2 days x 8h00m)\n"
-	if buf.String() != want {
-		t.Errorf("daily = %q, want %q", buf.String(), want)
+			var buf bytes.Buffer
+			if err := cmdDaily(env(&buf, s, nil, tc.now, time.UTC), dailyDefaultTarget, false, tc.color); err != nil {
+				t.Fatalf("daily: %v", err)
+			}
+			if got := buf.String(); got != tc.want {
+				t.Errorf("daily = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -3809,22 +3967,19 @@ func TestDailySumsPerDay(t *testing.T) {
 // calendar month containing now, so days later in the month are included even
 // when now sits early in it, while the neighbouring months are excluded.
 func TestDailyCoversWholeMonth(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 
-	mk := func(day time.Time) {
-		stop := day.Add(time.Hour)
-		if _, err := s.CreateEntry(ctx, store.Entry{
-			WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
-			Start: day, Stop: &stop, Duration: 3600, UpdatedAt: stop,
-		}); err != nil {
-			t.Fatal(err)
-		}
+	hour := func(y int, m time.Month, d int) fixtureEntry {
+		return fixtureEntry{start: time.Date(y, m, d, 9, 0, 0, 0, time.UTC), dur: time.Hour, taskID: 10}
 	}
-	mk(time.Date(2025, 12, 31, 9, 0, 0, 0, time.UTC)) // previous month
-	mk(time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC))   // first day of the month
-	mk(time.Date(2026, 1, 31, 9, 0, 0, 0, time.UTC))  // last day of the month
-	mk(time.Date(2026, 2, 1, 9, 0, 0, 0, time.UTC))   // next month
+	seedFixture(t, s,
+		hour(2025, time.December, 31), // previous month
+		hour(2026, time.January, 1),   // first day of the month
+		hour(2026, time.January, 31),  // last day of the month
+		hour(2026, time.February, 1),  // next month
+	)
 
 	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
@@ -3844,11 +3999,11 @@ func TestDailyCoversWholeMonth(t *testing.T) {
 	}
 }
 
-// TestDailyGreysUpcomingDays pins that days after today — the month's remaining
-// days, which can carry time booked ahead — are dimmed in the human listing so
-// they read as planned rather than worked. Today and the days behind it stay
-// plain, and JSON never carries styling.
-func TestDailyGreysUpcomingDays(t *testing.T) {
+// TestDailyJSONCarriesNoStyling pins that --json stays a data shape: even on a
+// terminal (color on), where the human listing dims the upcoming days, the JSON
+// output carries no ANSI escapes.
+func TestDailyJSONCarriesNoStyling(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedDailyMonth(t, s, map[int]time.Duration{
 		19: 8 * time.Hour, // yesterday
@@ -3858,20 +4013,6 @@ func TestDailyGreysUpcomingDays(t *testing.T) {
 	now := time.Date(2026, 1, 20, 18, 0, 0, 0, time.UTC)
 
 	var buf bytes.Buffer
-	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, true); err != nil {
-		t.Fatalf("daily: %v", err)
-	}
-	want := "Mon 2026-01-19  8h00m   +0:00\n" +
-		"Tue 2026-01-20  6h00m   -2:00\n" +
-		faint("Wed 2026-01-21  4h00m   -4:00") + "\n" +
-		todayDivider + "\n" +
-		"Total: 18h00m  -6:00  (3 days x 8h00m)\n"
-	if buf.String() != want {
-		t.Errorf("daily = %q, want %q", buf.String(), want)
-	}
-
-	// --json is a data shape, so it stays free of escapes even on a terminal.
-	buf.Reset()
 	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, true, true); err != nil {
 		t.Fatalf("daily --json: %v", err)
 	}
@@ -3883,6 +4024,7 @@ func TestDailyGreysUpcomingDays(t *testing.T) {
 // TestDailyTargetFlag pins -t/--target: it shifts every overtime figure,
 // including the footer's, and defaults to 8 hours.
 func TestDailyTargetFlag(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedDailyMonth(t, s, map[int]time.Duration{5: 6 * time.Hour, 6: 6 * time.Hour})
 	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
@@ -3918,6 +4060,7 @@ func TestDailyTargetFlag(t *testing.T) {
 // every worked minute into double overtime), so it is a usage error rather than
 // something silently accepted.
 func TestDailyRejectsNegativeTarget(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedDailyMonth(t, s, map[int]time.Duration{5: 8 * time.Hour})
 	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
@@ -3931,36 +4074,11 @@ func TestDailyRejectsNegativeTarget(t *testing.T) {
 	}
 }
 
-// TestDailyCountsRunningEntryLive pins that a running entry contributes its
-// elapsed-so-far time, exactly as `tg today`/`tg status` count it, and that the
-// day is flagged as still growing.
-func TestDailyCountsRunningEntryLive(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-	start := time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC)
-	if _, err := s.CreateEntry(ctx, store.Entry{
-		WorkspaceID: 1, ProjectID: p(1), TaskID: p(12),
-		Start: start, Duration: -1, UpdatedAt: start,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Date(2026, 1, 5, 11, 30, 0, 0, time.UTC)
-	var buf bytes.Buffer
-	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, false); err != nil {
-		t.Fatalf("daily: %v", err)
-	}
-	want := "Mon 2026-01-05  2h30m*  -5:30\n" +
-		todayDivider + "\n" +
-		"Total: 2h30m   -5:30  (1 day x 8h00m)   (* running)\n"
-	if buf.String() != want {
-		t.Errorf("daily = %q, want %q", buf.String(), want)
-	}
-}
-
 // TestDailySkipsDeletedEntries pins that a soft-deleted entry stops counting
 // towards its day, and that a day left with nothing tracked drops out of the
 // listing entirely (which also shrinks the footer's target).
 func TestDailySkipsDeletedEntries(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedDailyMonth(t, s, map[int]time.Duration{5: 8 * time.Hour, 6: 8 * time.Hour})
 	now := time.Date(2026, 1, 6, 20, 0, 0, 0, time.UTC)
@@ -3982,25 +4100,11 @@ func TestDailySkipsDeletedEntries(t *testing.T) {
 	}
 }
 
-// TestDailyEmptyMonth covers a month with nothing tracked: an explanatory line
-// rather than an error, so `tg daily` is safe to run on a fresh install.
-func TestDailyEmptyMonth(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
-	var buf bytes.Buffer
-	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, false); err != nil {
-		t.Fatalf("daily: %v", err)
-	}
-	if got := buf.String(); got != "No entries this month.\n" {
-		t.Errorf("daily = %q, want the empty-month line", got)
-	}
-}
-
 // TestDailyJSON pins the machine-readable shape: one object per listed day with
 // its date, tracked seconds and signed overtime, plus the month totals and the
 // per-day target the overtimes were measured against.
 func TestDailyJSON(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedDailyMonth(t, s, map[int]time.Duration{
 		5: 8*time.Hour + 30*time.Minute,
@@ -4033,6 +4137,7 @@ func TestDailyJSON(t *testing.T) {
 // entirely to the calendar day it STARTED on, even when it runs past midnight,
 // and the rows come out in chronological order.
 func TestGroupDailyBucketsByStartDay(t *testing.T) {
+	t.Parallel()
 	loc := time.UTC
 	start1 := time.Date(2026, 1, 5, 9, 0, 0, 0, loc)
 	stop1 := start1.Add(time.Hour)
@@ -4059,6 +4164,7 @@ func TestGroupDailyBucketsByStartDay(t *testing.T) {
 }
 
 func TestCurrentCommandGolden(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	now, loc := seedSampleDay(t, s)
 	var buf bytes.Buffer
@@ -4068,39 +4174,100 @@ func TestCurrentCommandGolden(t *testing.T) {
 	assertGolden(t, "current.txt", buf.String())
 }
 
-// TestCurrentCommandLastEntryAndGap covers the no-timer path: with nothing
-// running, status reports the newest finished entry, the idle gap since it
-// stopped, and today's total (both entries, 1h15m + 0h30m).
-func TestCurrentCommandLastEntryAndGap(t *testing.T) {
+// TestCurrentCommandLine tables `tg status`'s one-line report. With a timer
+// running it reports that live; otherwise it reports the newest already-started
+// entry of TODAY together with the idle gap since it stopped. Time booked later
+// today is not the last entry (it has not happened yet) but does count towards
+// the day total, yesterday's entries are out of reach entirely, and an empty
+// store still reports a total.
+func TestCurrentCommandLine(t *testing.T) {
+	t.Parallel()
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	at := func(h, m int) time.Time {
+		return day.Add(time.Duration(h)*time.Hour + time.Duration(m)*time.Minute)
+	}
+	for _, tc := range []struct {
+		name    string
+		entries []fixtureEntry
+		now     time.Time
+		want    string
+	}{
+		{
+			name: "last entry, gap and day total",
+			entries: []fixtureEntry{
+				{start: at(9, 15), dur: 75 * time.Minute, taskID: 10},
+				{start: at(10, 30), dur: 30 * time.Minute, taskID: 12},
+			},
+			now:  at(11, 25),
+			want: "Code review [Backend] 10:30-11:00 (gap 0h25m) Today: 1h45m\n",
+		},
+		{
+			// The 18:00 entry starts later today, so it is not the last entry;
+			// the day total covers it all the same.
+			name: "entry booked later today is skipped",
+			entries: []fixtureEntry{
+				{start: at(9, 15), dur: 75 * time.Minute, taskID: 10},
+				{start: at(18, 0), dur: time.Hour, taskID: 12},
+			},
+			now:  at(11, 25),
+			want: "Fix login bug [Backend] 09:15-10:30 (gap 0h55m) Today: 2h15m\n",
+		},
+		{
+			// A new day starts with no last entry rather than reporting
+			// yesterday's with an overnight gap.
+			name:    "yesterday is history",
+			entries: []fixtureEntry{{start: day.Add(-8 * time.Hour), dur: time.Hour, taskID: 10}},
+			now:     at(9, 30),
+			want:    "No entries. Today: 0h00m\n",
+		},
+		{
+			name: "empty store still reports a total",
+			now:  at(9, 0),
+			want: "No entries. Today: 0h00m\n",
+		},
+		{
+			// A pulled running entry is reported as running, and its elapsed
+			// time counts towards the day total alongside the finished entry.
+			name: "running entry wins",
+			entries: []fixtureEntry{
+				{start: at(7, 0), dur: time.Hour, taskID: 10},
+				{start: at(9, 0), taskID: 12},
+			},
+			now:  at(9, 30),
+			want: "run Code review [Backend] (0h30m) Today: 1h30m\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
+			seedFixture(t, s, tc.entries...)
+
+			var buf bytes.Buffer
+			if err := cmdCurrent(env(&buf, s, nil, tc.now, time.UTC), false); err != nil {
+				t.Fatalf("current: %v", err)
+			}
+			if got := buf.String(); got != tc.want {
+				t.Errorf("status = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCurrentCommandJSON pins the machine-readable shape of the no-timer case:
+// the same facts the human line carries, as fields.
+func TestCurrentCommandJSON(t *testing.T) {
+	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	seedFixture(t, s,
+		fixtureEntry{start: day.Add(9*time.Hour + 15*time.Minute), dur: 75 * time.Minute, taskID: 10},
+		fixtureEntry{start: day.Add(10*time.Hour + 30*time.Minute), dur: 30 * time.Minute, taskID: 12},
+	)
 
-	first := time.Date(2026, 1, 2, 9, 15, 0, 0, time.UTC)
-	firstStop := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
-	last := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
-	lastStop := time.Date(2026, 1, 2, 11, 0, 0, 0, time.UTC)
-	for _, e := range []store.Entry{
-		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(10), Start: first, Stop: &firstStop, Duration: 4500, UpdatedAt: firstStop},
-		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(12), Start: last, Stop: &lastStop, Duration: 1800, UpdatedAt: lastStop},
-	} {
-		if _, err := s.CreateEntry(ctx, e); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	now := time.Date(2026, 1, 2, 11, 25, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdCurrent(env(&buf, s, nil, now, time.UTC), false); err != nil {
-		t.Fatalf("current: %v", err)
-	}
-	want := "Code review [Backend] 10:30-11:00 (gap 0h25m) Today: 1h45m\n"
-	if buf.String() != want {
-		t.Errorf("status = %q, want %q", buf.String(), want)
-	}
-
-	// The JSON shape carries the same facts.
-	buf.Reset()
-	if err := cmdCurrent(env(&buf, s, nil, now, time.UTC), true); err != nil {
+	if err := cmdCurrent(env(&buf, s, nil, day.Add(11*time.Hour+25*time.Minute), time.UTC), true); err != nil {
 		t.Fatalf("current --json: %v", err)
 	}
 	for _, want := range []string{
@@ -4110,104 +4277,6 @@ func TestCurrentCommandLastEntryAndGap(t *testing.T) {
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("json = %s, want it to contain %s", buf.String(), want)
 		}
-	}
-}
-
-// TestCurrentCommandIgnoresFutureEntry covers the shared last-entry resolution
-// from status's side: an entry that starts later today has not happened yet, so
-// the line still reports the last thing actually tracked (and the gap since it
-// stopped). The day total is the whole day's tracked time and does include it.
-func TestCurrentCommandIgnoresFutureEntry(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	start := time.Date(2026, 1, 2, 9, 15, 0, 0, time.UTC)
-	stop := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
-	future := time.Date(2026, 1, 2, 18, 0, 0, 0, time.UTC)
-	futureStop := time.Date(2026, 1, 2, 19, 0, 0, 0, time.UTC)
-	for _, e := range []store.Entry{
-		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(10), Start: start, Stop: &stop, Duration: 4500, UpdatedAt: stop},
-		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(12), Start: future, Stop: &futureStop, Duration: 3600, UpdatedAt: stop},
-	} {
-		if _, err := s.CreateEntry(ctx, e); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	now := time.Date(2026, 1, 2, 11, 25, 0, 0, time.UTC)
-	var buf bytes.Buffer
-	if err := cmdCurrent(env(&buf, s, nil, now, time.UTC), false); err != nil {
-		t.Fatalf("current: %v", err)
-	}
-	want := "Fix login bug [Backend] 09:15-10:30 (gap 0h55m) Today: 2h15m\n"
-	if buf.String() != want {
-		t.Errorf("status = %q, want %q", buf.String(), want)
-	}
-}
-
-// TestCurrentCommandIgnoresYesterday pins the day scope: a new day starts with
-// no last entry rather than reporting yesterday's, so status says so instead of
-// showing a stale line with an overnight gap.
-func TestCurrentCommandIgnoresYesterday(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	start := time.Date(2026, 1, 1, 16, 0, 0, 0, time.UTC)
-	stop := time.Date(2026, 1, 1, 17, 0, 0, 0, time.UTC)
-	if _, err := s.CreateEntry(ctx, store.Entry{
-		WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
-		Start: start, Stop: &stop, Duration: 3600, UpdatedAt: stop,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	now := time.Date(2026, 1, 2, 9, 30, 0, 0, time.UTC)
-	var buf bytes.Buffer
-	if err := cmdCurrent(env(&buf, s, nil, now, time.UTC), false); err != nil {
-		t.Fatalf("current: %v", err)
-	}
-	if want := "No entries. Today: 0h00m\n"; buf.String() != want {
-		t.Errorf("status = %q, want %q", buf.String(), want)
-	}
-}
-
-// TestCurrentCommandEmptyStore verifies status still reports a day total when
-// nothing has ever been tracked.
-func TestCurrentCommandEmptyStore(t *testing.T) {
-	s := newStore(t)
-	var buf bytes.Buffer
-	if err := cmdCurrent(env(&buf, s, nil, testStart, time.UTC), false); err != nil {
-		t.Fatalf("current: %v", err)
-	}
-	if want := "No entries. Today: 0h00m\n"; buf.String() != want {
-		t.Errorf("status = %q, want %q", buf.String(), want)
-	}
-}
-
-// TestCurrentCommandRunningWinsOverNewerEntry verifies a pulled running entry is
-// reported as running even when a finished entry started later.
-func TestCurrentCommandRunningWinsOverNewerEntry(t *testing.T) {
-	s := newStore(t)
-	seedCatalog(t, s)
-
-	seedRunning(t, s, 12, testStart) // 09:00, still running
-	later := testStart.Add(-2 * time.Hour)
-	laterStop := testStart.Add(-time.Hour)
-	if _, err := s.CreateEntry(ctx, store.Entry{
-		WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
-		Start: later, Stop: &laterStop, Duration: 3600, UpdatedAt: laterStop,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	var buf bytes.Buffer
-	now := testStart.Add(30 * time.Minute)
-	if err := cmdCurrent(env(&buf, s, nil, now, time.UTC), false); err != nil {
-		t.Fatalf("current: %v", err)
-	}
-	want := "run Code review [Backend] (0h30m) Today: 1h30m\n"
-	if buf.String() != want {
-		t.Errorf("status = %q, want %q", buf.String(), want)
 	}
 }
 
@@ -4228,6 +4297,7 @@ func dstLoc(t *testing.T) *time.Location {
 // an hour of tomorrow into today. `tg ls` must list only today's entry and
 // `tg status`'s day total must ignore tomorrow's 00:30 one.
 func TestDayWindowSpringForward(t *testing.T) {
+	t.Parallel()
 	loc := dstLoc(t)
 	s := newStoreIn(t, loc)
 	seedCatalog(t, s)
@@ -4238,8 +4308,8 @@ func TestDayWindowSpringForward(t *testing.T) {
 	tomorrow := time.Date(2026, 3, 30, 0, 30, 0, 0, loc)
 	tomorrowStop := tomorrow.Add(30 * time.Minute)
 	for _, e := range []store.Entry{
-		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(10), Start: today, Stop: &todayStop, Duration: 3600, UpdatedAt: todayStop},
-		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(12), Start: tomorrow, Stop: &tomorrowStop, Duration: 1800, UpdatedAt: tomorrowStop},
+		{WorkspaceID: 1, ProjectID: ptrInt(1), TaskID: ptrInt(10), Start: today, Stop: &todayStop, Duration: 3600, UpdatedAt: todayStop},
+		{WorkspaceID: 1, ProjectID: ptrInt(1), TaskID: ptrInt(12), Start: tomorrow, Stop: &tomorrowStop, Duration: 1800, UpdatedAt: tomorrowStop},
 	} {
 		if _, err := s.CreateEntry(ctx, e); err != nil {
 			t.Fatal(err)
@@ -4276,6 +4346,7 @@ func TestDayWindowSpringForward(t *testing.T) {
 // the final hour. An entry at 23:15 belongs to the day and must be listed and
 // counted.
 func TestDayWindowFallBack(t *testing.T) {
+	t.Parallel()
 	loc := dstLoc(t)
 	s := newStoreIn(t, loc)
 	seedCatalog(t, s)
@@ -4283,7 +4354,7 @@ func TestDayWindowFallBack(t *testing.T) {
 	late := time.Date(2026, 10, 25, 23, 15, 0, 0, loc)
 	lateStop := late.Add(30 * time.Minute)
 	if _, err := s.CreateEntry(ctx, store.Entry{
-		WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
+		WorkspaceID: 1, ProjectID: ptrInt(1), TaskID: ptrInt(10),
 		Start: late, Stop: &lateStop, Duration: 1800, UpdatedAt: lateStop,
 	}); err != nil {
 		t.Fatal(err)
@@ -4308,6 +4379,183 @@ func TestDayWindowFallBack(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), `"day_total_seconds":1800`) {
 		t.Errorf("status json = %s, want day_total_seconds 1800", buf.String())
+	}
+}
+
+// TestSyncCommandsSurfaceUnauthorized pins what an expired or revoked token
+// looks like from a command: the api layer's ErrUnauthorized reaches the caller
+// — carrying Toggl's own complaint, so the failure is diagnosable — instead of
+// being swallowed or reported as a missing config, and the local store is left
+// exactly as it was, dirty entry included, for a retry after `tg auth`.
+//
+// `push` is the one exception to the sentinel reaching through: it reports
+// per-entry failures as a *togglsync.PushError summary (the queue is not
+// abandoned on the first rejection), so only the message survives.
+func TestSyncCommandsSurfaceUnauthorized(t *testing.T) {
+	t.Parallel()
+	since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		run  func(env *cmdEnv) error
+		// wantSentinel is false for push, whose per-entry failure summary
+		// carries the message but not the error value.
+		wantSentinel bool
+	}{
+		{name: "pull", run: func(e *cmdEnv) error { return cmdPull(e, false, "", since, false) }, wantSentinel: true},
+		{name: "update", run: func(e *cmdEnv) error { return cmdUpdate(e, ptrInt(1), false, "", since, false, false) }, wantSentinel: true},
+		{name: "projects update", run: func(e *cmdEnv) error { return cmdUpdateProjects(e, false, false) }, wantSentinel: true},
+		{name: "total", run: func(e *cmdEnv) error { return cmdTotal(e, false, "", since, false) }, wantSentinel: true},
+		{name: "push", run: func(e *cmdEnv) error { return cmdPush(e, false) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
+			id := seedDirty(t, s, 0, "work")
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(`token expired`))
+			}))
+			defer srv.Close()
+			c := api.New("tok", api.WithBaseURL(srv.URL),
+				api.WithReportsBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+
+			var buf bytes.Buffer
+			err := tc.run(env(&buf, s, c, pushNow, time.UTC))
+			if err == nil {
+				t.Fatal("err = nil, want the 401 reported")
+			}
+			if tc.wantSentinel && !errors.Is(err, api.ErrUnauthorized) {
+				t.Errorf("err = %v, want it to wrap api.ErrUnauthorized", err)
+			}
+			if !strings.Contains(err.Error(), "token expired") {
+				t.Errorf("err = %v, want Toggl's own complaint carried through", err)
+			}
+			if errors.Is(err, config.ErrNotConfigured) {
+				t.Errorf("err = %v, want a rejected token, not a missing config", err)
+			}
+			// The local edit is untouched and still queued for a later push.
+			dirty := mustDirtyEntries(t, s)
+			if len(dirty) != 1 || dirty[0].ID != id {
+				t.Fatalf("dirty = %+v, want the entry %d still queued", dirty, id)
+			}
+			if dirty[0].RemoteID != nil {
+				t.Errorf("remote_id = %v, want none: nothing was accepted", dirty[0].RemoteID)
+			}
+		})
+	}
+}
+
+// --- the shared command prologue ---------------------------------------------
+//
+// These tests exercise withEnv (through withEnvOut, which only adds the output
+// stream): the config loading, the state directory and database creation and the
+// cmdEnv every cmd* function is handed. They set XDG_STATE_HOME to a throwaway
+// directory, so — like the auth tests below — they cannot run in parallel.
+
+// TestWithEnvOffline covers the local-first case: with no config.json the
+// prologue is not an error, it opens the database and hands the command a cmdEnv
+// with no client, so a local command runs and only the API-bound ones complain
+// (see TestSyncCommandsRequireCredentials).
+func TestWithEnvOffline(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	var buf bytes.Buffer
+	var got *cmdEnv
+	if err := withEnvOut(ctx, &buf, func(e *cmdEnv) error {
+		got = e
+		return cmdCurrent(e, false)
+	}); err != nil {
+		t.Fatalf("withEnv: %v", err)
+	}
+	if got.st == nil {
+		t.Fatal("no store was opened")
+	}
+	if !got.offline() {
+		t.Error("env should be offline when there is no config")
+	}
+	if got.workspaceID != 0 {
+		t.Errorf("workspace_id = %d, want 0 with no config", got.workspaceID)
+	}
+	if got.now.IsZero() || got.loc == nil {
+		t.Errorf("clock/calendar = %v/%v, want them pinned once per invocation", got.now, got.loc)
+	}
+	if want := "No entries. Today: 0h00m\n"; buf.String() != want {
+		t.Errorf("output = %q, want %q written to the given writer", buf.String(), want)
+	}
+	// The database was created inside the state directory rather than anywhere
+	// else, which is what EnsureDir/DBPath are there for.
+	path, err := config.DBPath()
+	if err != nil {
+		t.Fatalf("db path: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("stat %s: %v, want the database created in the state directory", path, err)
+	}
+}
+
+// TestWithEnvUsesStoredCredentials verifies a stored config is what supplies the
+// client and the workspace new entries are filed under.
+func TestWithEnvUsesStoredCredentials(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	cfg := &config.Config{APIToken: "stored-token", WorkspaceID: 4242}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	ran := false
+	if err := withEnvOut(ctx, io.Discard, func(e *cmdEnv) error {
+		ran = true
+		if e.offline() {
+			t.Error("env should carry a client when a config exists")
+		}
+		if e.workspaceID != 4242 {
+			t.Errorf("workspace_id = %d, want 4242 from the stored config", e.workspaceID)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withEnv: %v", err)
+	}
+	if !ran {
+		t.Error("the command never ran")
+	}
+}
+
+// TestWithEnvCorruptedConfig pins the failure path a broken config.json takes:
+// it is reported (naming the config load), which is what keeps a corrupted file
+// from silently reading as "not authenticated" — that would downgrade the
+// invocation to offline mode, hide the real problem behind "run `tg auth`" and
+// invite overwriting the file. The command never runs.
+func TestWithEnvCorruptedConfig(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	if _, err := config.EnsureDir(); err != nil {
+		t.Fatalf("ensure dir: %v", err)
+	}
+	path, err := config.Path()
+	if err != nil {
+		t.Fatalf("config path: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(`{"api_token":`), 0o600); err != nil {
+		t.Fatalf("write truncated config: %v", err)
+	}
+
+	ran := false
+	err = withEnvOut(ctx, io.Discard, func(*cmdEnv) error {
+		ran = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("withEnv on a corrupted config = nil error, want it reported")
+	}
+	if !strings.Contains(err.Error(), "load config") {
+		t.Errorf("err = %v, want it to name the config load", err)
+	}
+	if errors.Is(err, config.ErrNotConfigured) {
+		t.Errorf("err = %v, want it distinct from the not-authenticated error", err)
+	}
+	if ran {
+		t.Error("the command must not run when the config cannot be loaded")
 	}
 }
 
@@ -4336,7 +4584,10 @@ func TestAuthSuccessWritesConfig(t *testing.T) {
 		t.Errorf("output = %q", buf.String())
 	}
 
-	path, _ := config.Path()
+	path, err := config.Path()
+	if err != nil {
+		t.Fatalf("config path: %v", err)
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("config.json missing: %v", err)
@@ -4368,7 +4619,10 @@ func TestAuthForbiddenWritesNothing(t *testing.T) {
 		t.Fatal("expected an error for 403")
 	}
 
-	path, _ := config.Path()
+	path, err := config.Path()
+	if err != nil {
+		t.Fatalf("config path: %v", err)
+	}
 	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
 		t.Errorf("config.json should not exist, stat err = %v", statErr)
 	}

@@ -7,6 +7,7 @@ import (
 )
 
 func TestCompletionZsh(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	if err := cmdCompletion(&buf, "zsh"); err != nil {
 		t.Fatalf("completion: %v", err)
@@ -58,6 +59,7 @@ func TestCompletionZsh(t *testing.T) {
 // TestCompletionCoversDispatch pins the completion script to run()'s dispatch
 // switch: every command word there must appear in the script's command list.
 func TestCompletionCoversDispatch(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	if err := cmdCompletion(&buf, "zsh"); err != nil {
 		t.Fatalf("completion: %v", err)
@@ -78,6 +80,7 @@ func TestCompletionCoversDispatch(t *testing.T) {
 // name fragment (see bindFirstFlag): each of their `_arguments` blocks must
 // offer both spellings, and the commands without a fragment must not.
 func TestCompletionOffersFirstFlag(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	if err := cmdCompletion(&buf, "zsh"); err != nil {
 		t.Fatalf("completion: %v", err)
@@ -115,6 +118,7 @@ func TestCompletionOffersFirstFlag(t *testing.T) {
 }
 
 func TestCompletionUnsupportedShell(t *testing.T) {
+	t.Parallel()
 	for _, shell := range []string{"", "bash", "fish"} {
 		var buf bytes.Buffer
 		if err := cmdCompletion(&buf, shell); err == nil {
