@@ -106,7 +106,7 @@ func runAdd(ctx context.Context, args []string) error {
 	// `<project> <task>` (the first scopes to a project, overriding
 	// TOGGL_PROJECT_ID); one means `<task>` scoped by env.
 	if len(rest) < 2 {
-		return errors.New("usage: tg add <timesign> [project] <task-fragment>")
+		return errors.New(addUsage)
 	}
 	timesign := rest[0]
 	rest = rest[1:]
@@ -447,12 +447,14 @@ func withEnv(ctx context.Context, fn func(env *cmdEnv) error) error {
 // openStore ensures the state directory exists and opens the SQLite database.
 func openStore(ctx context.Context) (*store.Store, error) {
 	if _, err := config.EnsureDir(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create state directory: %w", err)
 	}
 	path, err := config.DBPath()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("locate state directory: %w", err)
 	}
+	// store.Open already names the database file in its own errors, so it is
+	// returned unwrapped rather than prefixed twice.
 	return store.Open(ctx, path)
 }
 
@@ -465,7 +467,7 @@ func optionalConfig() (*config.Config, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load config: %w", err)
 	}
 	return cfg, nil
 }
@@ -646,12 +648,17 @@ func resolveTotalSince(sinceFlag string, now time.Time, loc *time.Location) (tim
 }
 
 // parseSinceFlag parses a --since value, the one date format tg accepts on the
-// command line (YYYY-MM-DD), as midnight of that day in loc. It is shared by
-// `pull` and `total` so both spell the format and the complaint identically.
+// command line (dateLayout, i.e. YYYY-MM-DD), as midnight of that day in loc. It
+// is shared by `pull` and `total` so both spell the format and the complaint
+// identically.
+//
+// The parse error is wrapped rather than dropped: the message keeps saying what
+// tg wants, and what time.ParseInLocation objected to (which component was out
+// of range, say) stays reachable for a caller that inspects the error.
 func parseSinceFlag(value string, loc *time.Location) (time.Time, error) {
-	t, err := time.ParseInLocation("2006-01-02", value, loc)
+	t, err := time.ParseInLocation(dateLayout, value, loc)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("invalid --since %q (want YYYY-MM-DD)", value)
+		return time.Time{}, fmt.Errorf("invalid --since %q (want YYYY-MM-DD): %w", value, err)
 	}
 	return t, nil
 }

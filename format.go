@@ -11,6 +11,12 @@ import (
 	"github.com/mantas6/tg/store"
 )
 
+// dateLayout is the single calendar-date layout tg's interface uses: the shape
+// `--since` is parsed in (see parseSinceFlag) and the shape dates are rendered
+// in (day headers, JSON output, the Reports API's date range), so what tg
+// prints is always what it accepts back.
+const dateLayout = "2006-01-02"
+
 // formatHM renders a duration as "<h>h<mm>m" (e.g. 75m -> "1h15m", 50m ->
 // "0h50m"). Negative durations clamp to zero.
 func formatHM(d time.Duration) string {
@@ -91,14 +97,14 @@ func renderEntryChange(w io.Writer, verb string, e store.Entry, loc *time.Locati
 // status line stays short enough for a status bar.
 const statusNameMax = 60
 
-// truncName hard-cuts s to at most max runes. No ellipsis marker is appended,
-// so the result is a plain prefix of s and never exceeds max runes.
-func truncName(s string, max int) string {
+// truncName hard-cuts s to at most limit runes. No ellipsis marker is appended,
+// so the result is a plain prefix of s and never exceeds limit runes.
+func truncName(s string, limit int) string {
 	r := []rune(s)
-	if len(r) <= max {
+	if len(r) <= limit {
 		return s
 	}
-	return string(r[:max])
+	return string(r[:limit])
 }
 
 // displayDuration is the duration shown for an entry: live (un-rounded) elapsed
@@ -195,31 +201,31 @@ func trailingGap(last store.Entry, now time.Time, loc *time.Location) time.Durat
 }
 
 // refWidth is the width of the leading local-number column for a listing whose
-// highest entry number is max: enough digits for it, so the numbers stay
-// right-aligned. A listing with no numbers still gets a single column.
-func refWidth(max int) int {
-	if max < 1 {
-		max = 1
+// highest entry number is `highest`: enough digits to hold it, so the numbers
+// stay right-aligned. A listing with no numbers still gets a single column.
+func refWidth(highest int) int {
+	if highest < 1 {
+		highest = 1
 	}
-	return len(strconv.Itoa(max))
+	return len(strconv.Itoa(highest))
 }
 
 // maxSeq returns the highest per-day number among entries, which is what sizes
 // the number column. It is not len(entries): numbers are persistent, so a day
 // that has had entries deleted lists fewer entries than its highest number.
 func maxSeq(entries []store.Entry) int {
-	max := 0
+	highest := 0
 	for _, e := range entries {
-		if e.Seq > max {
-			max = e.Seq
+		if e.Seq > highest {
+			highest = e.Seq
 		}
 	}
-	return max
+	return highest
 }
 
 // dayHeader labels a day group in a multi-day listing (see renderToday).
 func dayHeader(t time.Time, loc *time.Location) string {
-	return t.In(loc).Format("Mon 2006-01-02")
+	return t.In(loc).Format("Mon " + dateLayout)
 }
 
 // spansDays reports whether entries fall on more than one calendar day in loc,
@@ -674,7 +680,7 @@ func renderDailyJSON(w io.Writer, rows []dailyRow, target time.Duration, loc *ti
 	}
 	for _, r := range rows {
 		out.Days = append(out.Days, dailyDayJSON{
-			Date:            r.Day.In(loc).Format("2006-01-02"),
+			Date:            r.Day.In(loc).Format(dateLayout),
 			DurationSeconds: int64(r.Tracked / time.Second),
 			OvertimeSeconds: int64((r.Tracked - target) / time.Second),
 			Running:         r.Running,

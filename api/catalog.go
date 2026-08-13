@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 )
@@ -30,7 +31,7 @@ func getPaged[T any](ctx context.Context, c *Client, path string, includeInactiv
 	var out []T
 	for page := 1; ; page++ {
 		var batch []T
-		if err := c.do(ctx, "GET", path+"?"+pageQuery(page, includeInactive).Encode(), nil, &batch); err != nil {
+		if err := c.do(ctx, http.MethodGet, path+"?"+pageQuery(page, includeInactive).Encode(), nil, &batch); err != nil {
 			return nil, err
 		}
 		out = append(out, batch...)
@@ -51,7 +52,7 @@ func (c *Client) Projects(ctx context.Context, workspaceID int64, includeInactiv
 // without listing the whole workspace.
 func (c *Client) Project(ctx context.Context, workspaceID, projectID int64) (Project, error) {
 	var p Project
-	err := c.do(ctx, "GET", fmt.Sprintf("/workspaces/%d/projects/%d", workspaceID, projectID), nil, &p)
+	err := c.do(ctx, http.MethodGet, fmt.Sprintf("/workspaces/%d/projects/%d", workspaceID, projectID), nil, &p)
 	return p, err
 }
 
@@ -71,7 +72,7 @@ func (c *Client) ProjectTasks(ctx context.Context, workspaceID, projectID int64,
 		path += "?active=true"
 	}
 	var tasks []Task
-	if err := c.do(ctx, "GET", path, nil, &tasks); err != nil {
+	if err := c.do(ctx, http.MethodGet, path, nil, &tasks); err != nil {
 		return nil, err
 	}
 	return tasks, nil
@@ -96,7 +97,7 @@ func (c *Client) Tasks(ctx context.Context, workspaceID int64, includeInactive b
 	var out []Task
 	for page := 1; ; page++ {
 		var resp tasksResponse
-		if err := c.do(ctx, "GET", path+"?"+pageQuery(page, includeInactive).Encode(), nil, &resp); err != nil {
+		if err := c.do(ctx, http.MethodGet, path+"?"+pageQuery(page, includeInactive).Encode(), nil, &resp); err != nil {
 			return nil, err
 		}
 		out = append(out, resp.Data...)

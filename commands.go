@@ -96,6 +96,12 @@ func (e *cmdEnv) workspaceFor(task store.Task) (int64, error) {
 	return 0, fmt.Errorf("unknown workspace for task %q: %w", task.Name, config.ErrNotConfigured)
 }
 
+// addUsage is `tg add`'s usage line. Three places reject a call that names no
+// task — the argument peeling in runAdd, cmdAdd's own guard, and the project
+// resolver when only a project was given — so the line lives here once rather
+// than being spelled out (and drifting) in each of them.
+const addUsage = "usage: tg add <timesign> [project] <task-fragment>"
+
 // cmdAdd records a single, already-stopped time entry from a timesign (see the
 // timesig package and docs/timesig.md) and a task-title fragment. The created
 // entry is complete (has a stop and a positive duration); tg has no timer, so
@@ -126,7 +132,7 @@ func cmdAdd(env *cmdEnv, projectID *int64, first bool, timesign, fragment, desc 
 
 	fragment = strings.TrimSpace(fragment)
 	if fragment == "" {
-		return errors.New("usage: tg add <timesign> [project] <task-fragment>")
+		return errors.New(addUsage)
 	}
 
 	// Time is exclusive: refuse to record a span that collides with something
@@ -433,11 +439,11 @@ func cmdTotal(env *cmdEnv, first bool, fragment string, since time.Time, jsonOut
 	}
 	fragment = strings.TrimSpace(fragment)
 
-	startDate := since.In(env.loc).Format("2006-01-02")
-	endDate := env.now.In(env.loc).Format("2006-01-02")
+	startDate := since.In(env.loc).Format(dateLayout)
+	endDate := env.now.In(env.loc).Format(dateLayout)
 	rows, err := c.SummaryByTask(env.ctx, env.workspaceID, startDate, endDate)
 	if err != nil {
-		return err
+		return fmt.Errorf("fetch totals for %s..%s: %w", startDate, endDate, err)
 	}
 
 	// Catalog lookup for display: inactive tasks are included so a row for an
@@ -765,7 +771,7 @@ func cmdUpdate(env *cmdEnv, projectID *int64, first bool, fragment string, since
 	}
 	tasks, err := c.ProjectTasks(env.ctx, env.workspaceID, *pid, all)
 	if err != nil {
-		return err
+		return fmt.Errorf("fetch tasks of project %d: %w", *pid, err)
 	}
 	if err := env.st.ReplaceProjectTasks(env.ctx, *pid, toStoreTasks(tasks)); err != nil {
 		return err
@@ -810,7 +816,7 @@ func cmdUpdateProjects(env *cmdEnv, all, jsonOut bool) error {
 	}
 	projects, err := c.Projects(env.ctx, env.workspaceID, all)
 	if err != nil {
-		return err
+		return fmt.Errorf("fetch projects: %w", err)
 	}
 	for _, p := range projects {
 		if err := env.st.PutProject(env.ctx, toStoreProject(p)); err != nil {
@@ -1011,7 +1017,7 @@ func resolveUpdateProject(ctx context.Context, st *store.Store, projectID *int64
 // one go.
 func resolveAddProject(ctx context.Context, st *store.Store, fragment string, first bool) (*int64, error) {
 	return resolveCachedProject(ctx, st, nil, fragment, first,
-		errors.New("usage: tg add <timesign> [project] <task-fragment>"),
+		errors.New(addUsage),
 		"; run `tg update` to refresh the catalog")
 }
 
@@ -1040,7 +1046,7 @@ func cmdAuth(ctx context.Context, w io.Writer, tokenSource func() (string, error
 
 	cfg := &config.Config{APIToken: token, WorkspaceID: me.DefaultWorkspaceID}
 	if err := cfg.Save(); err != nil {
-		return err
+		return fmt.Errorf("save config: %w", err)
 	}
 	name := me.Fullname
 	if name == "" {

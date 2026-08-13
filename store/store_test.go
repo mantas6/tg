@@ -43,7 +43,7 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := s.migrate(ctx); err != nil {
 		t.Fatalf("second migrate: %v", err)
 	}
-	if v, ok, _ := s.GetMeta(ctx, MetaSchemaVersion); !ok || v != schemaVersion {
+	if v, ok, _ := s.Meta(ctx, MetaSchemaVersion); !ok || v != schemaVersion {
 		t.Fatalf("schema_version = %q ok=%v, want %q", v, ok, schemaVersion)
 	}
 }
@@ -87,7 +87,7 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);`); err != nil {
 			t.Errorf("%s.billable missing after migrate", tbl)
 		}
 	}
-	if v, ok, _ := s.GetMeta(ctx, MetaSchemaVersion); !ok || v != schemaVersion {
+	if v, ok, _ := s.Meta(ctx, MetaSchemaVersion); !ok || v != schemaVersion {
 		t.Errorf("schema_version = %q ok=%v, want %q", v, ok, schemaVersion)
 	}
 
@@ -661,7 +661,7 @@ INSERT INTO meta (key, value) VALUES ('schema_version', '3');`); err != nil {
 	}
 	t.Cleanup(func() { s.Close() })
 
-	if v, ok, _ := s.GetMeta(ctx, MetaSchemaVersion); !ok || v != schemaVersion {
+	if v, ok, _ := s.Meta(ctx, MetaSchemaVersion); !ok || v != schemaVersion {
 		t.Errorf("schema_version = %q ok=%v, want %q", v, ok, schemaVersion)
 	}
 	has, err := s.hasColumn(ctx, "entries", "seq")
@@ -1379,7 +1379,7 @@ func TestFindProjectsByFragment(t *testing.T) {
 
 func TestMetaRoundTrip(t *testing.T) {
 	s := openTest(t)
-	if _, ok, _ := s.GetMeta(ctx, MetaLastPull); ok {
+	if _, ok, _ := s.Meta(ctx, MetaLastPull); ok {
 		t.Fatal("last_pull should be absent initially")
 	}
 	if err := s.SetMeta(ctx, MetaLastPull, "2026-01-01T00:00:00Z"); err != nil {
@@ -1388,7 +1388,7 @@ func TestMetaRoundTrip(t *testing.T) {
 	if err := s.SetMeta(ctx, MetaLastPull, "2026-02-01T00:00:00Z"); err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	v, ok, err := s.GetMeta(ctx, MetaLastPull)
+	v, ok, err := s.Meta(ctx, MetaLastPull)
 	if err != nil || !ok || v != "2026-02-01T00:00:00Z" {
 		t.Fatalf("get = %q ok=%v err=%v", v, ok, err)
 	}

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"net/http"
 )
 
 // reportAllTimeStart is the earliest date the Reports API accepts (its allowed
@@ -69,7 +70,7 @@ func (c *Client) SummaryByTask(ctx context.Context, workspaceID int64, startDate
 	}
 	var resp summaryResponse
 	path := fmt.Sprintf("/workspace/%d/summary/time_entries", workspaceID)
-	if err := c.doReports(ctx, "POST", path, req, &resp); err != nil {
+	if err := c.doReports(ctx, http.MethodPost, path, req, &resp); err != nil {
 		return nil, err
 	}
 

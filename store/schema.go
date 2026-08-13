@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"time"
 )
 
@@ -81,7 +82,7 @@ var addColumns = []struct{ table, column, ddl string }{
 // Open (idempotent).
 func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.ex.ExecContext(ctx, schemaSQL); err != nil {
-		return err
+		return fmt.Errorf("apply schema: %w", err)
 	}
 	for _, c := range addColumns {
 		has, err := s.hasColumn(ctx, c.table, c.column)
@@ -92,12 +93,12 @@ func (s *Store) migrate(ctx context.Context) error {
 			continue
 		}
 		if _, err := s.ex.ExecContext(ctx, c.ddl); err != nil {
-			return err
+			return fmt.Errorf("add column %s.%s: %w", c.table, c.column, err)
 		}
 	}
 	for _, t := range dropTables {
 		if _, err := s.ex.ExecContext(ctx, "DROP TABLE IF EXISTS "+t); err != nil {
-			return err
+			return fmt.Errorf("drop retired table %s: %w", t, err)
 		}
 	}
 	if err := s.backfillSeq(ctx); err != nil {
@@ -115,7 +116,7 @@ func (s *Store) migrate(ctx context.Context) error {
 func (s *Store) backfillSeq(ctx context.Context) error {
 	rows, err := s.ex.QueryContext(ctx, "SELECT id, start FROM entries WHERE seq = 0 ORDER BY id")
 	if err != nil {
-		return err
+		return fmt.Errorf("list unnumbered entries: %w", err)
 	}
 	type pending struct {
 		id    int64
@@ -129,18 +130,18 @@ func (s *Store) backfillSeq(ctx context.Context) error {
 		)
 		if err := rows.Scan(&id, &start); err != nil {
 			rows.Close()
-			return err
+			return fmt.Errorf("scan unnumbered entry: %w", err)
 		}
 		t, err := parseTime(start)
 		if err != nil {
 			rows.Close()
-			return err
+			return fmt.Errorf("entry %d: parse start: %w", id, err)
 		}
 		todo = append(todo, pending{id, t})
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return err
+		return fmt.Errorf("list unnumbered entries: %w", err)
 	}
 	rows.Close()
 
@@ -158,7 +159,7 @@ func (s *Store) backfillSeq(ctx context.Context) error {
 func (s *Store) hasColumn(ctx context.Context, table, column string) (bool, error) {
 	rows, err := s.ex.QueryContext(ctx, "PRAGMA table_info("+table+")")
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("inspect table %s: %w", table, err)
 	}
 	defer rows.Close()
 	for rows.Next() {
@@ -171,11 +172,14 @@ func (s *Store) hasColumn(ctx context.Context, table, column string) (bool, erro
 			pk      int
 		)
 		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			return false, err
+			return false, fmt.Errorf("inspect table %s: %w", table, err)
 		}
 		if name == column {
 			return true, nil
 		}
 	}
-	return false, rows.Err()
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("inspect table %s: %w", table, err)
+	}
+	return false, nil
 }

@@ -22,6 +22,15 @@ const (
 	MetaLastPull      = "last_pull"
 )
 
+// Layouts the store renders calendar days with in its error messages. Stored
+// times are always RFC3339 UTC (see the package doc); these two are for humans
+// only, so a refused edit names the day (and, where it helps, the time) the way
+// the CLI prints it.
+const (
+	dateLayout     = "2006-01-02"
+	dateTimeLayout = "2006-01-02 15:04"
+)
+
 // Store is a handle to the SQLite database. loc is the calendar the store
 // reckons days in: it decides which day an entry's start belongs to, and hence
 // which per-day numbering (see Entry.Seq) it takes part in. It is time.Local
@@ -62,15 +71,21 @@ func (s *Store) WithTx(ctx context.Context, fn func(tx *Store) error) error {
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin transaction: %w", err)
 	}
 	if err := fn(&Store{db: s.db, ex: tx, loc: s.loc}); err != nil {
 		// The rollback's own error is subordinate to what actually went
-		// wrong, so fn's error is the one reported.
+		// wrong, so fn's error is the one reported. It is also passed through
+		// unwrapped: fn's errors already name the operation that failed (and
+		// carry the store's sentinels, which callers test with errors.Is), so
+		// a "transaction:" prefix would add nothing but noise.
 		tx.Rollback()
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	return nil
 }
 
 // Entry is a tracked time entry. RemoteID/ProjectID/TaskID/Stop/SyncedAt are
@@ -159,12 +174,12 @@ func OpenIn(ctx context.Context, path string, loc *time.Location) (*Store, error
 	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open database %s: %w", path, err)
 	}
 	s := &Store{db: db, ex: db, loc: loc}
 	if err := s.migrate(ctx); err != nil {
 		db.Close()
-		return nil, err
+		return nil, fmt.Errorf("migrate database %s: %w", path, err)
 	}
 	return s, nil
 }
@@ -241,24 +256,27 @@ func scanEntry(sc interface{ Scan(...any) error }) (Entry, error) {
 	if taskID.Valid {
 		e.TaskID = &taskID.Int64
 	}
+	// The stored timestamps are named in the parse failures: a row with a
+	// malformed time is a stored-data problem, so which column of which entry
+	// holds it is the whole diagnosis.
 	var err error
 	if e.Start, err = parseTime(start); err != nil {
-		return Entry{}, err
+		return Entry{}, fmt.Errorf("entry %d: parse start: %w", e.ID, err)
 	}
 	if stop.Valid {
 		t, err := parseTime(stop.String)
 		if err != nil {
-			return Entry{}, err
+			return Entry{}, fmt.Errorf("entry %d: parse stop: %w", e.ID, err)
 		}
 		e.Stop = &t
 	}
 	if e.UpdatedAt, err = parseTime(updatedAt); err != nil {
-		return Entry{}, err
+		return Entry{}, fmt.Errorf("entry %d: parse updated_at: %w", e.ID, err)
 	}
 	if syncedAt.Valid {
 		t, err := parseTime(syncedAt.String)
 		if err != nil {
-			return Entry{}, err
+			return Entry{}, fmt.Errorf("entry %d: parse synced_at: %w", e.ID, err)
 		}
 		e.SyncedAt = &t
 	}
@@ -279,7 +297,7 @@ func (s *Store) Running(ctx context.Context) (*Entry, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("running entry: %w", err)
 	}
 	return &e, nil
 }
@@ -314,7 +332,7 @@ ORDER BY e.start DESC, e.id DESC LIMIT 1`, fmtTime(from), fmtTime(now))
 		return nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("last entry: %w", err)
 	}
 	return &e, nil
 }
@@ -326,7 +344,7 @@ func (s *Store) EntriesBetween(ctx context.Context, from, to time.Time) ([]Entry
 		" WHERE e.deleted = 0 AND e.start >= ? AND e.start < ? ORDER BY e.start ASC",
 		fmtTime(from), fmtTime(to))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list entries: %w", err)
 	}
 	defer rows.Close()
 	return collectEntries(rows)
@@ -357,7 +375,7 @@ WHERE e.deleted = 0
 ORDER BY e.start ASC`,
 		excludeID, fmtTime(stop), fmtTime(start))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("find overlapping entries: %w", err)
 	}
 	defer rows.Close()
 	return collectEntries(rows)
@@ -367,7 +385,7 @@ ORDER BY e.start ASC`,
 func (s *Store) DirtyEntries(ctx context.Context) ([]Entry, error) {
 	rows, err := s.ex.QueryContext(ctx, entrySelect+" WHERE e.dirty = 1 ORDER BY e.start ASC")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list dirty entries: %w", err)
 	}
 	defer rows.Close()
 	return collectEntries(rows)
@@ -381,7 +399,7 @@ func (s *Store) EntryByRemoteID(ctx context.Context, remoteID int64) (*Entry, er
 		return nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("entry with remote id %d: %w", remoteID, err)
 	}
 	return &e, nil
 }
@@ -395,7 +413,10 @@ func collectEntries(rows *sql.Rows) ([]Entry, error) {
 		}
 		out = append(out, e)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read entries: %w", err)
+	}
+	return out, nil
 }
 
 // --- entry writes ------------------------------------------------------------
@@ -423,9 +444,46 @@ func dayBounds(t time.Time, loc *time.Location) (from, to time.Time) {
 // is excluded from the maximum so it cannot bump itself.
 func (s *Store) assignSeq(ctx context.Context, id int64, start time.Time) error {
 	from, to := dayBounds(start, s.Location())
-	_, err := s.ex.ExecContext(ctx, "UPDATE entries SET seq = "+nextSeqExpr+" WHERE id = ?",
-		fmtTime(from), fmtTime(to), id, id)
-	return err
+	if _, err := s.ex.ExecContext(ctx, "UPDATE entries SET seq = "+nextSeqExpr+" WHERE id = ?",
+		fmtTime(from), fmtTime(to), id, id); err != nil {
+		return fmt.Errorf("renumber entry %d: %w", id, err)
+	}
+	return nil
+}
+
+// insertStmt accumulates an INSERT one column at a time, keeping each column's
+// value expression AND the arguments that expression consumes together.
+//
+// That pairing is the point. Written out by hand, the entries insert splices a
+// multi-placeholder subquery (nextSeqExpr) into the middle of its VALUES list,
+// so its arguments sit in the middle of a flat argument list too: adding a
+// column, or moving one, silently shifts every later argument onto the wrong
+// placeholder — a bug SQLite cannot catch, since the types still line up. Here a
+// column is added with its arguments in one call, so the correspondence is
+// structural rather than something the reader has to count out.
+type insertStmt struct {
+	table string
+	cols  []string
+	vals  []string
+	args  []any
+}
+
+// set adds a column filled from one bound argument.
+func (i *insertStmt) set(col string, arg any) { i.setExpr(col, "?", arg) }
+
+// setExpr adds a column filled from a SQL expression, together with the
+// arguments its own placeholders consume (none, for a constant expression).
+func (i *insertStmt) setExpr(col, expr string, args ...any) {
+	i.cols = append(i.cols, col)
+	i.vals = append(i.vals, expr)
+	i.args = append(i.args, args...)
+}
+
+// exec renders the statement and runs it against ex.
+func (i *insertStmt) exec(ctx context.Context, ex execer) (sql.Result, error) {
+	q := "INSERT INTO " + i.table + " (" + strings.Join(i.cols, ", ") + ")\n" +
+		"VALUES (" + strings.Join(i.vals, ", ") + ")"
+	return ex.ExecContext(ctx, q, i.args...)
 }
 
 // CreateEntry inserts a new entry and returns its local id. The caller sets all
@@ -438,19 +496,34 @@ func (s *Store) assignSeq(ctx context.Context, id int64, start time.Time) error 
 // the order the pull inserts them. Any Seq set on e is ignored.
 func (s *Store) CreateEntry(ctx context.Context, e Entry) (int64, error) {
 	from, to := dayBounds(e.Start, s.Location())
-	res, err := s.ex.ExecContext(ctx, `
-INSERT INTO entries
-  (remote_id, workspace_id, project_id, task_id, description, start, stop,
-   duration, billable, seq, updated_at, synced_at, dirty, deleted)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, `+nextSeqExpr+`, ?, ?, ?, ?)`,
-		nullInt(e.RemoteID), e.WorkspaceID, nullInt(e.ProjectID), nullInt(e.TaskID),
-		e.Description, fmtTime(e.Start), nullTime(e.Stop), e.Duration, boolToInt(e.Billable),
-		fmtTime(from), fmtTime(to), int64(0),
-		fmtTime(e.UpdatedAt), nullTime(e.SyncedAt), boolToInt(e.Dirty), boolToInt(e.Deleted))
+	ins := insertStmt{table: "entries"}
+	ins.set("remote_id", nullInt(e.RemoteID))
+	ins.set("workspace_id", e.WorkspaceID)
+	ins.set("project_id", nullInt(e.ProjectID))
+	ins.set("task_id", nullInt(e.TaskID))
+	ins.set("description", e.Description)
+	ins.set("start", fmtTime(e.Start))
+	ins.set("stop", nullTime(e.Stop))
+	ins.set("duration", e.Duration)
+	ins.set("billable", boolToInt(e.Billable))
+	// seq is computed by SQL rather than supplied, so the subquery's three
+	// arguments (the day's bounds and the id to exclude — nothing, on an
+	// insert) are attached to the column they belong to.
+	ins.setExpr("seq", nextSeqExpr, fmtTime(from), fmtTime(to), int64(0))
+	ins.set("updated_at", fmtTime(e.UpdatedAt))
+	ins.set("synced_at", nullTime(e.SyncedAt))
+	ins.set("dirty", boolToInt(e.Dirty))
+	ins.set("deleted", boolToInt(e.Deleted))
+
+	res, err := ins.exec(ctx, s.ex)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("create entry: %w", err)
 	}
-	return res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("create entry: %w", err)
+	}
+	return id, nil
 }
 
 // ErrEntryTooOld reports a refusal to edit an entry that belongs to a calendar
@@ -470,7 +543,7 @@ func CheckEditableDay(start, now time.Time, loc *time.Location) error {
 	today := dayStart(now, loc)
 	if start.Before(today) {
 		return fmt.Errorf("%w: %s is before today (%s); only today's entries can be modified",
-			ErrEntryTooOld, start.In(loc).Format("2006-01-02 15:04"), today.Format("2006-01-02"))
+			ErrEntryTooOld, start.In(loc).Format(dateTimeLayout), today.Format(dateLayout))
 	}
 	return nil
 }
@@ -515,8 +588,11 @@ UPDATE entries SET description = ?, start = ?, stop = ?, duration = ?,
 			e.Description, fmtTime(e.Start), nullTime(e.Stop), e.Duration,
 			fmtTime(e.UpdatedAt), e.ID)
 		if err != nil {
-			return err
+			return fmt.Errorf("update entry %d: %w", e.ID, err)
 		}
+		// checkAffected's error already names the entry and carries
+		// ErrEntryNotFound, so it is returned as it is rather than prefixed
+		// with the operation a second time.
 		if err := checkAffected(res, e.ID); err != nil {
 			return err
 		}
@@ -542,9 +618,13 @@ func (s *Store) entryStart(ctx context.Context, id int64) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("%w: no entry with id %d", ErrEntryNotFound, id)
 	}
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, fmt.Errorf("read start of entry %d: %w", id, err)
 	}
-	return parseTime(start)
+	t, err := parseTime(start)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("entry %d: parse start: %w", id, err)
+	}
+	return t, nil
 }
 
 // SoftDeleteEntry marks an entry deleted and dirty, keeping the row so the
@@ -557,18 +637,24 @@ func (s *Store) SoftDeleteEntry(ctx context.Context, id int64, at time.Time) err
 		"UPDATE entries SET deleted = 1, dirty = 1, updated_at = ? WHERE id = ?",
 		fmtTime(at), id)
 	if err != nil {
-		return err
+		return fmt.Errorf("soft-delete entry %d: %w", id, err)
 	}
 	return checkAffected(res, id)
 }
 
 // checkAffected turns an UPDATE that matched no row into an error wrapping
 // ErrEntryNotFound, so a stale entry id fails loudly instead of silently doing
-// nothing. Drivers that cannot report the count are treated as success.
+// nothing.
+//
+// A driver that cannot report the count is an error too, not a pass: the whole
+// point of the check is to know whether the write landed, and answering "it did"
+// when that is precisely what could not be established is how a silent no-op
+// gets through. (The sqlite driver tg uses always reports it, so this is a
+// failsafe rather than a path in practice.)
 func checkAffected(res sql.Result, id int64) error {
 	n, err := res.RowsAffected()
 	if err != nil {
-		return nil
+		return fmt.Errorf("rows affected for entry %d: %w", id, err)
 	}
 	if n == 0 {
 		return fmt.Errorf("%w: no entry with id %d", ErrEntryNotFound, id)
@@ -579,10 +665,12 @@ func checkAffected(res sql.Result, id int64) error {
 // MarkSynced records a successful push: stores the remote id, clears dirty, and
 // aligns updated_at/synced_at to the remote clock so a later pull is a no-op.
 func (s *Store) MarkSynced(ctx context.Context, id, remoteID int64, at time.Time) error {
-	_, err := s.ex.ExecContext(ctx, `
+	if _, err := s.ex.ExecContext(ctx, `
 UPDATE entries SET remote_id = ?, synced_at = ?, updated_at = ?, dirty = 0 WHERE id = ?`,
-		remoteID, fmtTime(at), fmtTime(at), id)
-	return err
+		remoteID, fmtTime(at), fmtTime(at), id); err != nil {
+		return fmt.Errorf("mark entry %d synced: %w", id, err)
+	}
+	return nil
 }
 
 // ErrEntryNotFound reports that an entry a write was aimed at does not exist,
@@ -627,7 +715,7 @@ UPDATE entries SET workspace_id = ?, project_id = ?, task_id = ?, description = 
 			fmtTime(e.Start), nullTime(e.Stop), e.Duration, boolToInt(e.Billable),
 			fmtTime(e.UpdatedAt), nullTime(e.SyncedAt), id)
 		if err != nil {
-			return err
+			return fmt.Errorf("update entry %d from remote: %w", id, err)
 		}
 		if err := checkAffected(res, id); err != nil {
 			return err
@@ -656,11 +744,11 @@ func (s *Store) entryByRemote(ctx context.Context, remoteID *int64) (int64, time
 		return 0, time.Time{}, nil
 	}
 	if err != nil {
-		return 0, time.Time{}, err
+		return 0, time.Time{}, fmt.Errorf("read entry with remote id %d: %w", *remoteID, err)
 	}
 	t, err := parseTime(start)
 	if err != nil {
-		return 0, time.Time{}, err
+		return 0, time.Time{}, fmt.Errorf("entry %d: parse start: %w", id, err)
 	}
 	return id, t, nil
 }
@@ -672,14 +760,18 @@ func sameDay(a, b time.Time, loc *time.Location) bool {
 
 // DeleteRow hard-deletes a local row (used after a remote delete is confirmed).
 func (s *Store) DeleteRow(ctx context.Context, id int64) error {
-	_, err := s.ex.ExecContext(ctx, "DELETE FROM entries WHERE id = ?", id)
-	return err
+	if _, err := s.ex.ExecContext(ctx, "DELETE FROM entries WHERE id = ?", id); err != nil {
+		return fmt.Errorf("delete entry %d: %w", id, err)
+	}
+	return nil
 }
 
 // DeleteByRemoteID hard-deletes the local mirror of a remote-deleted entry.
 func (s *Store) DeleteByRemoteID(ctx context.Context, remoteID int64) error {
-	_, err := s.ex.ExecContext(ctx, "DELETE FROM entries WHERE remote_id = ?", remoteID)
-	return err
+	if _, err := s.ex.ExecContext(ctx, "DELETE FROM entries WHERE remote_id = ?", remoteID); err != nil {
+		return fmt.Errorf("delete entry with remote id %d: %w", remoteID, err)
+	}
+	return nil
 }
 
 // --- entry numbers -----------------------------------------------------------
@@ -704,10 +796,10 @@ LIMIT 1`, num, fmtTime(from), fmtTime(to))
 	e, err := scanEntry(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Entry{}, fmt.Errorf("%w %d on %s; run `tg ls` to list entries",
-			ErrNoEntryNum, num, from.Format("2006-01-02"))
+			ErrNoEntryNum, num, from.Format(dateLayout))
 	}
 	if err != nil {
-		return Entry{}, err
+		return Entry{}, fmt.Errorf("entry number %d: %w", num, err)
 	}
 	return e, nil
 }
@@ -718,7 +810,7 @@ LIMIT 1`, num, fmtTime(from), fmtTime(to))
 func (s *Store) ReplaceProjects(ctx context.Context, projects []Project) error {
 	return s.WithTx(ctx, func(tx *Store) error {
 		if _, err := tx.ex.ExecContext(ctx, "DELETE FROM projects"); err != nil {
-			return err
+			return fmt.Errorf("clear projects: %w", err)
 		}
 		for _, p := range projects {
 			if _, err := tx.ex.ExecContext(ctx, `
@@ -726,7 +818,7 @@ INSERT INTO projects (id, workspace_id, name, color, client_name, active, billab
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 				p.ID, p.WorkspaceID, p.Name, p.Color, p.ClientName,
 				boolToInt(p.Active), boolToInt(p.Billable), p.At); err != nil {
-				return err
+				return fmt.Errorf("insert project %d: %w", p.ID, err)
 			}
 		}
 		return nil
@@ -739,7 +831,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 func (s *Store) ReplaceProjectTasks(ctx context.Context, projectID int64, tasks []Task) error {
 	return s.WithTx(ctx, func(tx *Store) error {
 		if _, err := tx.ex.ExecContext(ctx, "DELETE FROM tasks WHERE project_id = ?", projectID); err != nil {
-			return err
+			return fmt.Errorf("clear tasks of project %d: %w", projectID, err)
 		}
 		return tx.insertTasks(ctx, tasks)
 	})
@@ -749,7 +841,7 @@ func (s *Store) ReplaceProjectTasks(ctx context.Context, projectID int64, tasks 
 func (s *Store) ReplaceTasks(ctx context.Context, tasks []Task) error {
 	return s.WithTx(ctx, func(tx *Store) error {
 		if _, err := tx.ex.ExecContext(ctx, "DELETE FROM tasks"); err != nil {
-			return err
+			return fmt.Errorf("clear tasks: %w", err)
 		}
 		return tx.insertTasks(ctx, tasks)
 	})
@@ -763,7 +855,7 @@ func (s *Store) insertTasks(ctx context.Context, tasks []Task) error {
 INSERT INTO tasks (id, workspace_id, project_id, name, active, at)
 VALUES (?, ?, ?, ?, ?, ?)`,
 			t.ID, t.WorkspaceID, t.ProjectID, t.Name, boolToInt(t.Active), t.At); err != nil {
-			return err
+			return fmt.Errorf("insert task %d: %w", t.ID, err)
 		}
 	}
 	return nil
@@ -774,7 +866,7 @@ VALUES (?, ?, ?, ?, ?, ?)`,
 // Unlike UpsertProject (which is a conservative self-heal from meta pulls),
 // this is authoritative and backs the project-scoped `tg update`.
 func (s *Store) PutProject(ctx context.Context, p Project) error {
-	_, err := s.ex.ExecContext(ctx, `
+	if _, err := s.ex.ExecContext(ctx, `
 INSERT INTO projects (id, workspace_id, name, color, client_name, active, billable, at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
@@ -782,8 +874,10 @@ ON CONFLICT(id) DO UPDATE SET
   client_name = excluded.client_name, active = excluded.active,
   billable = excluded.billable, at = excluded.at`,
 		p.ID, p.WorkspaceID, p.Name, p.Color, p.ClientName,
-		boolToInt(p.Active), boolToInt(p.Billable), p.At)
-	return err
+		boolToInt(p.Active), boolToInt(p.Billable), p.At); err != nil {
+		return fmt.Errorf("put project %d: %w", p.ID, err)
+	}
+	return nil
 }
 
 // UpsertProject inserts or updates a single project row by id, refreshing the
@@ -794,28 +888,32 @@ ON CONFLICT(id) DO UPDATE SET
 // non-empty value is supplied, so a meta payload lacking a color never clobbers
 // a color already stored by an authoritative update.
 func (s *Store) UpsertProject(ctx context.Context, p Project) error {
-	_, err := s.ex.ExecContext(ctx, `
+	if _, err := s.ex.ExecContext(ctx, `
 INSERT INTO projects (id, workspace_id, name, color, client_name, active, billable, at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
   workspace_id = excluded.workspace_id, name = excluded.name,
   color = COALESCE(NULLIF(excluded.color, ''), color)`,
 		p.ID, p.WorkspaceID, p.Name, p.Color, p.ClientName,
-		boolToInt(p.Active), boolToInt(p.Billable), p.At)
-	return err
+		boolToInt(p.Active), boolToInt(p.Billable), p.At); err != nil {
+		return fmt.Errorf("upsert project %d: %w", p.ID, err)
+	}
+	return nil
 }
 
 // UpsertTask inserts or updates a single task row by id, refreshing the display
 // fields (see UpsertProject for the rationale).
 func (s *Store) UpsertTask(ctx context.Context, t Task) error {
-	_, err := s.ex.ExecContext(ctx, `
+	if _, err := s.ex.ExecContext(ctx, `
 INSERT INTO tasks (id, workspace_id, project_id, name, active, at)
 VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
   workspace_id = excluded.workspace_id, project_id = excluded.project_id,
   name = excluded.name`,
-		t.ID, t.WorkspaceID, t.ProjectID, t.Name, boolToInt(t.Active), t.At)
-	return err
+		t.ID, t.WorkspaceID, t.ProjectID, t.Name, boolToInt(t.Active), t.At); err != nil {
+		return fmt.Errorf("upsert task %d: %w", t.ID, err)
+	}
+	return nil
 }
 
 // activeTasks loads every active task for matching.
@@ -823,14 +921,14 @@ func (s *Store) activeTasks(ctx context.Context) ([]Task, error) {
 	rows, err := s.ex.QueryContext(ctx,
 		"SELECT id, workspace_id, project_id, name, active, at FROM tasks WHERE active = 1")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list active tasks: %w", err)
 	}
 	defer rows.Close()
 	var out []Task
 	for rows.Next() {
 		var t Task
 		if err := rows.Scan(&t.ID, &t.WorkspaceID, &t.ProjectID, &t.Name, &t.Active, &t.At); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan task: %w", err)
 		}
 		out = append(out, t)
 	}
@@ -851,7 +949,7 @@ FROM projects`
 
 	rows, err := s.ex.QueryContext(ctx, q)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list projects: %w", err)
 	}
 	defer rows.Close()
 	var out []Project
@@ -859,7 +957,7 @@ FROM projects`
 		var p Project
 		if err := rows.Scan(&p.ID, &p.WorkspaceID, &p.Name, &p.Color,
 			&p.ClientName, &p.Active, &p.Billable, &p.At); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan project: %w", err)
 		}
 		out = append(out, p)
 	}
@@ -881,7 +979,7 @@ FROM projects WHERE id = ?`, id)
 		return nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("project %d: %w", id, err)
 	}
 	return &p, nil
 }
@@ -911,7 +1009,7 @@ LEFT JOIN projects p ON p.id = t.project_id`
 
 	rows, err := s.ex.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list tasks: %w", err)
 	}
 	defer rows.Close()
 	var out []Task
@@ -919,7 +1017,7 @@ LEFT JOIN projects p ON p.id = t.project_id`
 		var t Task
 		if err := rows.Scan(&t.ID, &t.WorkspaceID, &t.ProjectID, &t.Name,
 			&t.Active, &t.At, &t.ProjectName); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan task: %w", err)
 		}
 		out = append(out, t)
 	}
@@ -1017,25 +1115,27 @@ func matchTasks(tasks []Task, fragment string, projectID *int64) []Task {
 
 // --- meta --------------------------------------------------------------------
 
-// GetMeta returns the value for key and whether it was present.
-func (s *Store) GetMeta(ctx context.Context, key string) (string, bool, error) {
+// Meta returns the value for key and whether it was present.
+func (s *Store) Meta(ctx context.Context, key string) (string, bool, error) {
 	var v string
 	err := s.ex.QueryRowContext(ctx, "SELECT value FROM meta WHERE key = ?", key).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
 	if err != nil {
-		return "", false, err
+		return "", false, fmt.Errorf("read meta %q: %w", key, err)
 	}
 	return v, true, nil
 }
 
 // SetMeta upserts a meta key/value pair.
 func (s *Store) SetMeta(ctx context.Context, key, value string) error {
-	_, err := s.ex.ExecContext(ctx,
+	if _, err := s.ex.ExecContext(ctx,
 		"INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-		key, value)
-	return err
+		key, value); err != nil {
+		return fmt.Errorf("write meta %q: %w", key, err)
+	}
+	return nil
 }
 
 func boolToInt(b bool) int {

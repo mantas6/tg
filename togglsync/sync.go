@@ -92,7 +92,8 @@ func (f PushFailure) describe() string {
 func Pull(ctx context.Context, st *store.Store, c *api.Client, projectID *int64, since, now time.Time) (PullResult, error) {
 	remotes, err := c.List(ctx, since)
 	if err != nil {
-		return PullResult{}, err
+		return PullResult{}, fmt.Errorf("fetch entries modified since %s: %w",
+			since.UTC().Format(time.RFC3339), err)
 	}
 
 	var res PullResult
@@ -225,7 +226,7 @@ func remoteWins(remote, local store.Entry) bool {
 // An absent (or unparsable) watermark bootstraps to true: there is no coverage
 // claim yet that this pull could invalidate.
 func canAdvanceWatermark(ctx context.Context, st *store.Store, since time.Time) (bool, error) {
-	v, ok, err := st.GetMeta(ctx, store.MetaLastPull)
+	v, ok, err := st.Meta(ctx, store.MetaLastPull)
 	if err != nil {
 		return false, err
 	}
@@ -367,14 +368,18 @@ func healCatalog(ctx context.Context, st *store.Store, r api.TimeEntry) error {
 
 // toStoreEntry maps a remote entry to a clean local entry whose LWW clocks
 // (updated_at, synced_at) are pinned to the remote `at`.
+//
+// A timestamp the server sent but tg cannot read aborts the pull, and the
+// failures say which field of which remote entry was unreadable: the offending
+// row is on Toggl's side, so naming it is the only way to act on the report.
 func toStoreEntry(r api.TimeEntry) (store.Entry, error) {
 	start, err := time.Parse(time.RFC3339, r.Start)
 	if err != nil {
-		return store.Entry{}, err
+		return store.Entry{}, fmt.Errorf("remote entry %d: parse start %q: %w", r.ID, r.Start, err)
 	}
 	at, err := time.Parse(time.RFC3339, r.At)
 	if err != nil {
-		return store.Entry{}, err
+		return store.Entry{}, fmt.Errorf("remote entry %d: parse at %q: %w", r.ID, r.At, err)
 	}
 	e := store.Entry{
 		RemoteID:    &r.ID,
@@ -393,7 +398,7 @@ func toStoreEntry(r api.TimeEntry) (store.Entry, error) {
 	if r.Stop != nil && *r.Stop != "" {
 		stop, err := time.Parse(time.RFC3339, *r.Stop)
 		if err != nil {
-			return store.Entry{}, err
+			return store.Entry{}, fmt.Errorf("remote entry %d: parse stop %q: %w", r.ID, *r.Stop, err)
 		}
 		e.Stop = &stop
 	}

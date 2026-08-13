@@ -499,7 +499,7 @@ func TestPullProjectScope(t *testing.T) {
 		t.Error("entry with no project should be ignored")
 	}
 	// A scoped pull is partial: the watermark must not advance.
-	if _, ok, _ := st.GetMeta(ctx, store.MetaLastPull); ok {
+	if _, ok, _ := st.Meta(ctx, store.MetaLastPull); ok {
 		t.Error("scoped pull should not advance last_pull")
 	}
 }
@@ -512,7 +512,7 @@ func TestPullAdvancesLastPull(t *testing.T) {
 	if _, err := Pull(ctx, st, c, nil, ts("2026-01-01T00:00:00Z"), now); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
-	v, ok, _ := st.GetMeta(ctx, store.MetaLastPull)
+	v, ok, _ := st.Meta(ctx, store.MetaLastPull)
 	if !ok || v != "2026-01-02T12:00:00Z" {
 		t.Errorf("last_pull = %q ok=%v, want now", v, ok)
 	}
@@ -533,7 +533,7 @@ func TestPullChainedWindowAdvancesLastPull(t *testing.T) {
 	if _, err := Pull(ctx, st, c, nil, ts("2026-01-02T00:00:00Z"), now); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
-	v, _, _ := st.GetMeta(ctx, store.MetaLastPull)
+	v, _, _ := st.Meta(ctx, store.MetaLastPull)
 	if v != "2026-01-02T12:00:00Z" {
 		t.Errorf("last_pull = %q, want now (window reaches back past the watermark)", v)
 	}
@@ -554,7 +554,7 @@ func TestPullPartialWindowKeepsLastPull(t *testing.T) {
 	if _, err := Pull(ctx, st, c, nil, ts("2026-01-02T00:00:00Z"), now); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
-	v, _, _ := st.GetMeta(ctx, store.MetaLastPull)
+	v, _, _ := st.Meta(ctx, store.MetaLastPull)
 	if v != "2025-12-28T09:00:00Z" {
 		t.Errorf("last_pull = %q, want the untouched watermark", v)
 	}
@@ -574,7 +574,7 @@ func TestPullUnparsableWatermarkAdvances(t *testing.T) {
 	if _, err := Pull(ctx, st, c, nil, ts("2026-01-02T00:00:00Z"), now); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
-	v, _, _ := st.GetMeta(ctx, store.MetaLastPull)
+	v, _, _ := st.Meta(ctx, store.MetaLastPull)
 	if v != "2026-01-02T12:00:00Z" {
 		t.Errorf("last_pull = %q, want now", v)
 	}
@@ -872,7 +872,7 @@ func TestPullRollsBackOnFailure(t *testing.T) {
 	if got, _ := st.EntryByRemoteID(ctx, 910); got != nil {
 		t.Errorf("entry = %+v, want it rolled back with the failed pull", got)
 	}
-	if _, ok, _ := st.GetMeta(ctx, store.MetaLastPull); ok {
+	if _, ok, _ := st.Meta(ctx, store.MetaLastPull); ok {
 		t.Error("a failed pull must not advance last_pull")
 	}
 }

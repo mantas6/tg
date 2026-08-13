@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"time"
@@ -45,7 +46,7 @@ func payloadFrom(e TimeEntry, withCreatedWith bool) entryPayload {
 // default workspace).
 func (c *Client) Me(ctx context.Context) (*Me, error) {
 	var me Me
-	if err := c.do(ctx, "GET", "/me", nil, &me); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/me", nil, &me); err != nil {
 		return nil, err
 	}
 	return &me, nil
@@ -54,7 +55,7 @@ func (c *Client) Me(ctx context.Context) (*Me, error) {
 // Current returns the running time entry, or nil if none is running.
 func (c *Client) Current(ctx context.Context) (*TimeEntry, error) {
 	var te *TimeEntry
-	if err := c.do(ctx, "GET", "/me/time_entries/current", nil, &te); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/me/time_entries/current", nil, &te); err != nil {
 		return nil, err
 	}
 	return te, nil
@@ -67,7 +68,7 @@ func (c *Client) List(ctx context.Context, since time.Time) ([]TimeEntry, error)
 	q.Set("since", strconv.FormatInt(since.UTC().Unix(), 10))
 	q.Set("meta", "true")
 	var entries []TimeEntry
-	if err := c.do(ctx, "GET", "/me/time_entries?"+q.Encode(), nil, &entries); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/me/time_entries?"+q.Encode(), nil, &entries); err != nil {
 		return nil, err
 	}
 	return entries, nil
@@ -78,7 +79,7 @@ func (c *Client) List(ctx context.Context, since time.Time) ([]TimeEntry, error)
 func (c *Client) Create(ctx context.Context, e TimeEntry) (*TimeEntry, error) {
 	var out TimeEntry
 	path := fmt.Sprintf("/workspaces/%d/time_entries", e.WorkspaceID)
-	if err := c.do(ctx, "POST", path, payloadFrom(e, true), &out); err != nil {
+	if err := c.do(ctx, http.MethodPost, path, payloadFrom(e, true), &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -88,7 +89,7 @@ func (c *Client) Create(ctx context.Context, e TimeEntry) (*TimeEntry, error) {
 func (c *Client) Update(ctx context.Context, e TimeEntry) (*TimeEntry, error) {
 	var out TimeEntry
 	path := fmt.Sprintf("/workspaces/%d/time_entries/%d", e.WorkspaceID, e.ID)
-	if err := c.do(ctx, "PUT", path, payloadFrom(e, false), &out); err != nil {
+	if err := c.do(ctx, http.MethodPut, path, payloadFrom(e, false), &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -98,7 +99,7 @@ func (c *Client) Update(ctx context.Context, e TimeEntry) (*TimeEntry, error) {
 func (c *Client) Stop(ctx context.Context, workspaceID, id int64) (*TimeEntry, error) {
 	var out TimeEntry
 	path := fmt.Sprintf("/workspaces/%d/time_entries/%d/stop", workspaceID, id)
-	if err := c.do(ctx, "PATCH", path, nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodPatch, path, nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -107,5 +108,5 @@ func (c *Client) Stop(ctx context.Context, workspaceID, id int64) (*TimeEntry, e
 // Delete removes a time entry.
 func (c *Client) Delete(ctx context.Context, workspaceID, id int64) error {
 	path := fmt.Sprintf("/workspaces/%d/time_entries/%d", workspaceID, id)
-	return c.do(ctx, "DELETE", path, nil, nil)
+	return c.do(ctx, http.MethodDelete, path, nil, nil)
 }

@@ -2449,7 +2449,7 @@ func TestPullAllProjectsUnscoped(t *testing.T) {
 		t.Error("project 2 entry should be inserted")
 	}
 	// A full (unscoped) pull advances the watermark.
-	if _, ok, _ := s.GetMeta(ctx, store.MetaLastPull); !ok {
+	if _, ok, _ := s.Meta(ctx, store.MetaLastPull); !ok {
 		t.Error("unscoped pull should advance last_pull")
 	}
 }
@@ -2486,7 +2486,7 @@ func TestPullScopedByFragment(t *testing.T) {
 		t.Error("payments entry should be ignored under a backend-scoped pull")
 	}
 	// A scoped pull is partial and must not advance the watermark.
-	if _, ok, _ := s.GetMeta(ctx, store.MetaLastPull); ok {
+	if _, ok, _ := s.Meta(ctx, store.MetaLastPull); ok {
 		t.Error("scoped pull should not advance last_pull")
 	}
 }
@@ -2533,7 +2533,7 @@ func TestPullIgnoresProjectEnv(t *testing.T) {
 		t.Error("project 2 entry should be inserted despite TOGGL_PROJECT_ID=1")
 	}
 	// Ignoring the env means this is a full pull: the watermark advances.
-	if _, ok, _ := s.GetMeta(ctx, store.MetaLastPull); !ok {
+	if _, ok, _ := s.Meta(ctx, store.MetaLastPull); !ok {
 		t.Error("pull ignoring env should be a full pull and advance last_pull")
 	}
 }
@@ -3015,7 +3015,7 @@ func TestUpdatePullsRecentEntries(t *testing.T) {
 		t.Error("backend entry should be ignored by a project-2 update")
 	}
 	// A scoped pull is partial: the watermark must stay untouched.
-	if _, ok, _ := s.GetMeta(ctx, store.MetaLastPull); ok {
+	if _, ok, _ := s.Meta(ctx, store.MetaLastPull); ok {
 		t.Error("update should not advance last_pull (it is a scoped pull)")
 	}
 }
@@ -3468,7 +3468,7 @@ func TestPullTodayWindowKeepsStaleWatermark(t *testing.T) {
 	if err := cmdPull(env(&buf, s, c, now, time.UTC), false, "", since, false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
-	v, _, _ := s.GetMeta(ctx, store.MetaLastPull)
+	v, _, _ := s.Meta(ctx, store.MetaLastPull)
 	if v != "2026-01-01T09:00:00Z" {
 		t.Errorf("last_pull = %q, want the untouched watermark", v)
 	}

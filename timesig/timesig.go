@@ -228,27 +228,27 @@ func Floor5(t time.Time) time.Time {
 // parseClockPart parses one side of a timesign ("H", "H:MM", or, when
 // allowMinuteOnly, ":MM") into an hour and minute. A minutes-only part inherits
 // inheritHour for its hour.
-func parseClockPart(s string, allowMinuteOnly bool, inheritHour int) (hour, min int, err error) {
+func parseClockPart(s string, allowMinuteOnly bool, inheritHour int) (hour, minute int, err error) {
 	if strings.HasPrefix(s, ":") {
 		if !allowMinuteOnly {
 			return 0, 0, errors.New("minutes-only form is not allowed here")
 		}
-		min, err = parseMinute(s[1:])
+		minute, err = parseMinute(s[1:])
 		if err != nil {
 			return 0, 0, err
 		}
-		return inheritHour, min, nil
+		return inheritHour, minute, nil
 	}
 	if i := strings.IndexByte(s, ':'); i >= 0 {
 		hour, err = parseHour(s[:i])
 		if err != nil {
 			return 0, 0, err
 		}
-		min, err = parseMinute(s[i+1:])
+		minute, err = parseMinute(s[i+1:])
 		if err != nil {
 			return 0, 0, err
 		}
-		return hour, min, nil
+		return hour, minute, nil
 	}
 	hour, err = parseHour(s)
 	if err != nil {
