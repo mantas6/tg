@@ -55,8 +55,19 @@ type Entry struct {
 	ProjectColor string // joined, display only; "#RRGGBB" hex
 }
 
-// Running reports whether the entry is currently running.
+// Running reports whether the entry is currently running: it has no stop time
+// yet, or it carries Toggl's negative-duration running marker (see the package
+// doc). Either signal on its own is enough, since a pull can bring down a row
+// that only has one of them.
+//
+// This is the single definition of "running" in tg: runningWhere is its SQL
+// twin, and every query that needs the predicate is built from it, so the Go
+// and SQL answers can never drift apart.
 func (e Entry) Running() bool { return e.Duration < 0 || e.Stop == nil }
+
+// runningWhere is Entry.Running as a SQL predicate over the `e` alias of
+// entrySelect. Keep the two in lockstep.
+const runningWhere = "(e.stop IS NULL OR e.duration < 0)"
 
 // Project mirrors a Toggl project. Billable is carried through to entries
 // created against the project so workspaces that forbid non-billable entries in
@@ -210,10 +221,12 @@ func scanEntry(sc interface{ Scan(...any) error }) (Entry, error) {
 	return e, nil
 }
 
-// Running returns the single running entry (stop IS NULL, not deleted) or nil.
+// Running returns the single running entry (see Entry.Running; deleted rows are
+// ignored) or nil. Should the store hold more than one — running rows only
+// arrive from pulls, which cannot rule that out — the newest by start wins.
 func (s *Store) Running() (*Entry, error) {
 	row := s.db.QueryRow(entrySelect +
-		" WHERE e.stop IS NULL AND e.deleted = 0 ORDER BY e.start DESC LIMIT 1")
+		" WHERE " + runningWhere + " AND e.deleted = 0 ORDER BY e.start DESC LIMIT 1")
 	e, err := scanEntry(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -278,8 +291,8 @@ func (s *Store) EntriesBetween(from, to time.Time) ([]Entry, error) {
 //
 // Intervals are half-open, so entries that merely touch the range do not
 // overlap it (an entry ending exactly at start, or starting exactly at stop, is
-// fine). A running entry (stop NULL or duration -1) has no end yet, so it is
-// treated as open-ended and overlaps whenever it began before stop.
+// fine). A running entry (see Entry.Running) has no end yet, so it is treated
+// as open-ended and overlaps whenever it began before stop.
 func (s *Store) FindOverlapping(start, stop time.Time) ([]Entry, error) {
 	return s.FindOverlappingExcluding(start, stop, 0)
 }
@@ -293,7 +306,7 @@ func (s *Store) FindOverlappingExcluding(start, stop time.Time, excludeID int64)
 WHERE e.deleted = 0
   AND e.id <> ?
   AND e.start < ?
-  AND (e.stop IS NULL OR e.duration < 0 OR e.stop > ?)
+  AND (`+runningWhere+` OR e.stop > ?)
 ORDER BY e.start ASC`,
 		excludeID, fmtTime(stop), fmtTime(start))
 	if err != nil {
@@ -472,7 +485,7 @@ func (s *Store) entryStart(id int64) (time.Time, error) {
 	var start string
 	err := s.db.QueryRow("SELECT start FROM entries WHERE id = ?", id).Scan(&start)
 	if errors.Is(err, sql.ErrNoRows) {
-		return time.Time{}, fmt.Errorf("no entry with id %d", id)
+		return time.Time{}, fmt.Errorf("%w: no entry with id %d", ErrEntryNotFound, id)
 	}
 	if err != nil {
 		return time.Time{}, err
@@ -495,16 +508,16 @@ func (s *Store) SoftDeleteEntry(id int64, at time.Time) error {
 	return checkAffected(res, id)
 }
 
-// checkAffected turns an UPDATE that matched no row into an error, so a stale
-// entry id fails loudly instead of silently doing nothing. Drivers that cannot
-// report the count are treated as success.
+// checkAffected turns an UPDATE that matched no row into an error wrapping
+// ErrEntryNotFound, so a stale entry id fails loudly instead of silently doing
+// nothing. Drivers that cannot report the count are treated as success.
 func checkAffected(res sql.Result, id int64) error {
 	n, err := res.RowsAffected()
 	if err != nil {
 		return nil
 	}
 	if n == 0 {
-		return fmt.Errorf("no entry with id %d", id)
+		return fmt.Errorf("%w: no entry with id %d", ErrEntryNotFound, id)
 	}
 	return nil
 }
@@ -518,8 +531,18 @@ UPDATE entries SET remote_id = ?, synced_at = ?, updated_at = ?, dirty = 0 WHERE
 	return err
 }
 
+// ErrEntryNotFound reports that an entry a write was aimed at does not exist,
+// so the write matched nothing. Callers that can carry on (sync.Pull re-creates
+// a mirror that vanished under it) should test for it with errors.Is; the point
+// of the sentinel is that a lookup miss fails loudly instead of passing for a
+// successful update.
+var ErrEntryNotFound = errors.New("entry not found")
+
 // UpdateFromRemote overwrites a local entry with remote state (remote wins) and
-// marks it clean, aligning the LWW clocks to the remote at.
+// marks it clean, aligning the LWW clocks to the remote at. The entry is found
+// by its remote id; a remote id that no local row mirrors (or a nil one) is an
+// error wrapping ErrEntryNotFound rather than a silent no-op, so a caller
+// counting updates never counts a write that never happened.
 //
 // A remote edit is the only thing that can move an entry to another calendar
 // day, which would strand its number in the day it no longer belongs to, so the
@@ -530,24 +553,34 @@ func (s *Store) UpdateFromRemote(e Entry) error {
 	if err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(`
+	if id == 0 {
+		if e.RemoteID == nil {
+			return fmt.Errorf("%w: entry has no remote id", ErrEntryNotFound)
+		}
+		return fmt.Errorf("%w: no local entry mirrors remote id %d", ErrEntryNotFound, *e.RemoteID)
+	}
+	res, err := s.db.Exec(`
 UPDATE entries SET workspace_id = ?, project_id = ?, task_id = ?, description = ?,
   start = ?, stop = ?, duration = ?, billable = ?, updated_at = ?, synced_at = ?,
-  dirty = 0, deleted = 0 WHERE remote_id = ?`,
+  dirty = 0, deleted = 0 WHERE id = ?`,
 		e.WorkspaceID, nullInt(e.ProjectID), nullInt(e.TaskID), e.Description,
 		fmtTime(e.Start), nullTime(e.Stop), e.Duration, boolToInt(e.Billable),
-		fmtTime(e.UpdatedAt), nullTime(e.SyncedAt), nullInt(e.RemoteID)); err != nil {
+		fmtTime(e.UpdatedAt), nullTime(e.SyncedAt), id)
+	if err != nil {
 		return err
 	}
-	if id == 0 || sameDay(oldStart, e.Start, s.Location()) {
+	if err := checkAffected(res, id); err != nil {
+		return err
+	}
+	if sameDay(oldStart, e.Start, s.Location()) {
 		return nil
 	}
 	return s.assignSeq(id, e.Start)
 }
 
 // entryByRemote reads the local id and stored start of the mirror of a remote
-// entry. A remote id that is unknown (or nil) yields id 0 and no error, since
-// callers only use it to decide whether an existing row needs follow-up work.
+// entry. A remote id that is unknown (or nil) yields id 0 and no error; it is
+// the caller's job to decide whether that is fatal (see UpdateFromRemote).
 func (s *Store) entryByRemote(remoteID *int64) (int64, time.Time, error) {
 	if remoteID == nil {
 		return 0, time.Time{}, nil

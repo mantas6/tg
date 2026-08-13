@@ -157,6 +157,103 @@ func TestRunningPicksNewest(t *testing.T) {
 	}
 }
 
+// TestRunningPredicateIsUnified pins the one definition of "running" tg has:
+// Entry.Running, Store.Running's SQL and the overlap guard must all answer the
+// same for the same row. Store.Running used to test stop IS NULL alone, so a
+// pulled row carrying only Toggl's negative-duration marker was invisible to
+// `tg status` yet open-ended to `tg add`'s overlap check.
+func TestRunningPredicateIsUnified(t *testing.T) {
+	start := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		e    Entry
+		want bool
+	}{
+		{"no stop", Entry{WorkspaceID: 1, Start: start, Duration: 3600, UpdatedAt: start}, true},
+		{"negative duration", Entry{
+			WorkspaceID: 1, Start: start, Stop: ptrTime(start.Add(time.Hour)),
+			Duration: -1, UpdatedAt: start,
+		}, true},
+		{"finished", Entry{
+			WorkspaceID: 1, Start: start, Stop: ptrTime(start.Add(time.Hour)),
+			Duration: 3600, UpdatedAt: start,
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openTest(t)
+			id := mustCreate(t, s, tc.e)
+
+			if got := tc.e.Running(); got != tc.want {
+				t.Errorf("Entry.Running() = %v, want %v", got, tc.want)
+			}
+
+			r, err := s.Running()
+			if err != nil {
+				t.Fatalf("Running: %v", err)
+			}
+			if got := r != nil && r.ID == id; got != tc.want {
+				t.Errorf("Store.Running() = %+v, want running=%v", r, tc.want)
+			}
+
+			// The overlap guard reads the same predicate: a running entry has no
+			// end, so it still conflicts with a range hours later.
+			over, err := s.FindOverlapping(start.Add(4*time.Hour), start.Add(5*time.Hour))
+			if err != nil {
+				t.Fatalf("FindOverlapping: %v", err)
+			}
+			if got := len(over) == 1 && over[0].ID == id; got != tc.want {
+				t.Errorf("FindOverlapping = %+v, want open-ended=%v", over, tc.want)
+			}
+		})
+	}
+}
+
+// TestUpdateFromRemoteUnknownRemoteID pins that a remote id nothing mirrors is
+// an error wrapping ErrEntryNotFound, not a silent no-op: sync counts the result
+// of this call, so an UPDATE that matched no row must not pass for an update.
+func TestUpdateFromRemoteUnknownRemoteID(t *testing.T) {
+	s := openTest(t)
+	start := time.Date(2026, 1, 2, 9, 0, 0, 0, time.UTC)
+	remote := Entry{
+		RemoteID: ptrInt(4242), WorkspaceID: 1, Start: start,
+		Stop: ptrTime(start.Add(time.Hour)), Duration: 3600,
+		UpdatedAt: start, SyncedAt: ptrTime(start),
+	}
+
+	err := s.UpdateFromRemote(remote)
+	if !errors.Is(err, ErrEntryNotFound) {
+		t.Fatalf("UpdateFromRemote(unknown) = %v, want ErrEntryNotFound", err)
+	}
+	if !strings.Contains(err.Error(), "4242") {
+		t.Errorf("error = %v, want it to name remote id 4242", err)
+	}
+	// Nothing was written, so the miss cannot be mistaken for a stored entry.
+	if got, err := s.EntryByRemoteID(4242); err != nil || got != nil {
+		t.Errorf("EntryByRemoteID = %+v err=%v, want no row", got, err)
+	}
+
+	// An entry with no remote id at all cannot be matched either.
+	remote.RemoteID = nil
+	if err := s.UpdateFromRemote(remote); !errors.Is(err, ErrEntryNotFound) {
+		t.Errorf("UpdateFromRemote(no remote id) = %v, want ErrEntryNotFound", err)
+	}
+
+	// The known-id path still succeeds, so the guard only rejects real misses.
+	mustCreate(t, s, Entry{
+		RemoteID: ptrInt(4242), WorkspaceID: 1, Description: "old", Start: start,
+		Stop: ptrTime(start.Add(time.Hour)), Duration: 3600, UpdatedAt: start,
+	})
+	remote.RemoteID = ptrInt(4242)
+	remote.Description = "new"
+	if err := s.UpdateFromRemote(remote); err != nil {
+		t.Fatalf("UpdateFromRemote(known): %v", err)
+	}
+	got, err := s.EntryByRemoteID(4242)
+	if err != nil || got == nil || got.Description != "new" {
+		t.Errorf("entry = %+v err=%v, want the remote description", got, err)
+	}
+}
+
 func TestEntriesBetweenOrdering(t *testing.T) {
 	s := openTest(t)
 	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)

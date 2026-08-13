@@ -108,7 +108,10 @@ func runAdd(args []string) error {
 	}
 	timesign := rest[0]
 	rest = rest[1:]
-	projectID := projectIDFromEnv()
+	projectID, err := projectIDFromEnv()
+	if err != nil {
+		return err
+	}
 	fragment := strings.Join(rest, " ")
 	if len(rest) == 2 {
 		pid, err := resolveAddProject(st, rest[0], first)
@@ -247,7 +250,11 @@ func runTasks(args []string) error {
 		return err
 	}
 	defer st.Close()
-	return cmdTasks(os.Stdout, st, *all, projectIDFromEnv(), *jsonOut)
+	projectID, err := projectIDFromEnv()
+	if err != nil {
+		return err
+	}
+	return cmdTasks(os.Stdout, st, *all, projectID, *jsonOut)
 }
 
 func runGrep(args []string) error {
@@ -267,9 +274,13 @@ func runGrep(args []string) error {
 		return err
 	}
 	defer st.Close()
+	projectID, err := projectIDFromEnv()
+	if err != nil {
+		return err
+	}
 	// All positionals form ONE fragment, exactly like `tg add`/`tg total`.
 	fragment := strings.Join(rest, " ")
-	return cmdGrep(os.Stdout, st, *all, projectIDFromEnv(), first, fragment, *jsonOut)
+	return cmdGrep(os.Stdout, st, *all, projectID, first, fragment, *jsonOut)
 }
 
 func runProjects(args []string) error {
@@ -348,9 +359,13 @@ func runUpdate(args []string) error {
 		return err
 	}
 	defer st.Close()
+	projectID, err := projectIDFromEnv()
+	if err != nil {
+		return err
+	}
 	now := time.Now()
 	since := resolveUpdateSince(days, now, time.Local)
-	return cmdUpdate(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectIDFromEnv(), first, fragment, since, now, *all, *jsonOut)
+	return cmdUpdate(os.Stdout, st, api.New(cfg.APIToken), cfg.WorkspaceID, projectID, first, fragment, since, now, *all, *jsonOut)
 }
 
 func runPush(args []string) error {
@@ -579,17 +594,23 @@ func isDigits(s string) bool {
 	return true
 }
 
-// projectIDFromEnv parses TOGGL_PROJECT_ID, returning nil when unset/invalid.
-func projectIDFromEnv() *int64 {
+// projectIDFromEnv parses TOGGL_PROJECT_ID, returning nil when it is unset (or
+// empty, which is how a shell spells "unset" for an exported variable).
+//
+// A value that is not a project id is an error rather than a silent nil: the
+// variable is what scopes `add`, `tasks`, `grep` and `update` to one project, so
+// treating a typo as "unset" would quietly widen the scope — and file entries
+// added under it against no project at all.
+func projectIDFromEnv() (*int64, error) {
 	v := strings.TrimSpace(os.Getenv("TOGGL_PROJECT_ID"))
 	if v == "" {
-		return nil
+		return nil, nil
 	}
 	id, err := strconv.ParseInt(v, 10, 64)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("invalid TOGGL_PROJECT_ID %q: want a numeric project id", v)
 	}
-	return &id
+	return &id, nil
 }
 
 // resolvePullSince determines `tg pull`'s window start. An explicit --since

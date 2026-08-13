@@ -452,7 +452,9 @@ task count and pull counters.
 ### Environment
 
 - `TOGGL_PROJECT_ID` scopes `add`, `tasks`, `grep`, and `update` to one project (and
-  sets the project on entries created by `add`). `pull` ignores it and always
+  sets the project on entries created by `add`). A value that is not a numeric
+  project id is an error, not a silent "unset", so a typo cannot quietly widen
+  the scope. `pull` ignores it and always
   reconciles every project; pass a `<project>` name to `pull` to scope it
   explicitly. When unset, `update` requires a `<project>` fragment (positional
   or `--project`/`-p`) that matches exactly one cached project — or several with

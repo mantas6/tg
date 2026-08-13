@@ -15,6 +15,8 @@ import (
 
 func ptrInt(v int64) *int64 { return &v }
 
+func ptrTime(v time.Time) *time.Time { return &v }
+
 func ts(s string) time.Time {
 	t, err := time.Parse(time.RFC3339, s)
 	if err != nil {
@@ -310,6 +312,70 @@ func TestPullLWWLocalNewer(t *testing.T) {
 	}
 }
 
+// TestPullLWWTieKeepsDirtyLocal is the regression test for the tie-break: the
+// remote `at` and the local updated_at are equal (Toggl's second-granular clock
+// is what MarkSynced stored, so an edit made in the same second collides with
+// it) and the local entry has unsynced changes. The remote used to win the tie
+// and drop the edit before `tg push` ever ran.
+func TestPullLWWTieKeepsDirtyLocal(t *testing.T) {
+	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"id":905,"workspace_id":1,"description":"remote",
+		  "start":"2026-01-02T09:00:00Z","stop":"2026-01-02T09:30:00Z",
+		  "duration":1800,"at":"2026-01-02T10:00:00Z"}]`))
+	})
+	at := ts("2026-01-02T10:00:00Z")
+	st.CreateEntry(store.Entry{
+		RemoteID: ptrInt(905), WorkspaceID: 1, Description: "local edit",
+		Start: ts("2026-01-02T09:00:00Z"), Stop: ptrTime(ts("2026-01-02T09:45:00Z")),
+		Duration: 2700, UpdatedAt: at, SyncedAt: &at, Dirty: true,
+	})
+
+	res, err := Pull(st, c, nil, ts("2026-01-01T00:00:00Z"), ts("2026-01-02T12:00:00Z"))
+	if err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	if res.Updated != 0 || res.Skipped != 1 {
+		t.Errorf("res = %+v, want the dirty entry skipped, not updated", res)
+	}
+	got, _ := st.EntryByRemoteID(905)
+	if got == nil || got.Description != "local edit" || got.Duration != 2700 {
+		t.Fatalf("entry = %+v, want the local edit kept", got)
+	}
+	// And it is still dirty, so the very next push sends it.
+	if !got.Dirty {
+		t.Error("entry should stay dirty for the next push")
+	}
+}
+
+// TestPullLWWTieOverwritesCleanLocal is the other half of the tie-break: a clean
+// entry holds nothing the server does not, so a tie may re-apply remote state.
+// That is what keeps `tg pull` right after `tg push` idempotent instead of
+// leaving the entry looking locally newer forever.
+func TestPullLWWTieOverwritesCleanLocal(t *testing.T) {
+	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"id":906,"workspace_id":1,"description":"remote",
+		  "start":"2026-01-02T09:00:00Z","stop":"2026-01-02T09:30:00Z",
+		  "duration":1800,"at":"2026-01-02T10:00:00Z"}]`))
+	})
+	at := ts("2026-01-02T10:00:00Z")
+	st.CreateEntry(store.Entry{
+		RemoteID: ptrInt(906), WorkspaceID: 1, Description: "stale",
+		Start: ts("2026-01-02T09:00:00Z"), Stop: ptrTime(ts("2026-01-02T09:30:00Z")),
+		Duration: 1800, UpdatedAt: at, SyncedAt: &at, Dirty: false,
+	})
+
+	res, err := Pull(st, c, nil, ts("2026-01-01T00:00:00Z"), ts("2026-01-02T12:00:00Z"))
+	if err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	if res.Updated != 1 {
+		t.Errorf("res = %+v, want the clean entry updated", res)
+	}
+	if got, _ := st.EntryByRemoteID(906); got == nil || got.Description != "remote" {
+		t.Errorf("entry = %+v, want remote state", got)
+	}
+}
+
 func TestPullRemoteDeleted(t *testing.T) {
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`[{"id":902,"workspace_id":1,"start":"2026-01-02T09:00:00Z",
@@ -504,6 +570,58 @@ func TestPullUnparsableWatermarkAdvances(t *testing.T) {
 	v, _, _ := st.GetMeta(store.MetaLastPull)
 	if v != "2026-01-02T12:00:00Z" {
 		t.Errorf("last_pull = %q, want now", v)
+	}
+}
+
+// TestRemoteAt covers the clock a push records: an absent `at` falls back to
+// now, a well-formed one is parsed, and a malformed one is an error instead of
+// silently becoming now (which would store a local clock as if the server had
+// sent it and skew every later LWW comparison).
+func TestRemoteAt(t *testing.T) {
+	now := ts("2026-01-02T12:00:00Z")
+
+	got, err := remoteAt("", now)
+	if err != nil || !got.Equal(now) {
+		t.Errorf("remoteAt(\"\") = %v err=%v, want now", got, err)
+	}
+	got, err = remoteAt("2026-01-02T10:00:00Z", now)
+	if err != nil || !got.Equal(ts("2026-01-02T10:00:00Z")) {
+		t.Errorf("remoteAt(valid) = %v err=%v, want the parsed remote at", got, err)
+	}
+	for _, bad := range []string{"not-a-timestamp", "2026-01-02 10:00:00", "1767355200"} {
+		if got, err := remoteAt(bad, now); err == nil {
+			t.Errorf("remoteAt(%q) = %v, want an error", bad, got)
+		}
+	}
+}
+
+// TestPushInvalidRemoteAt verifies the malformed timestamp surfaces from Push
+// rather than being papered over: the entry keeps its own clock and stays dirty,
+// so nothing converges on a fabricated `at`.
+func TestPushInvalidRemoteAt(t *testing.T) {
+	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"id":557,"at":"yesterday"}`))
+	})
+	start := ts("2026-01-02T09:00:00Z")
+	stop := start.Add(5 * time.Minute)
+	id, _ := st.CreateEntry(store.Entry{
+		WorkspaceID: 1, Start: start, Stop: &stop, Duration: 300,
+		UpdatedAt: stop, Dirty: true,
+	})
+
+	res, err := Push(st, c, ts("2026-01-02T12:00:00Z"))
+	if err == nil {
+		t.Fatalf("push = %+v, want an error for the malformed remote at", res)
+	}
+	if res.Created != 0 {
+		t.Errorf("created = %d, want 0", res.Created)
+	}
+	dirty, _ := st.DirtyEntries()
+	if len(dirty) != 1 || dirty[0].ID != id {
+		t.Fatalf("dirty = %+v, want the entry left for a later push", dirty)
+	}
+	if !dirty[0].UpdatedAt.Equal(stop) {
+		t.Errorf("updated_at = %v, want the untouched local clock %v", dirty[0].UpdatedAt, stop)
 	}
 }
 

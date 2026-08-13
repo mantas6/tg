@@ -523,7 +523,10 @@ func cmdCurrent(w io.Writer, st *store.Store, now time.Time, loc *time.Location,
 		}
 	}
 	dayStart := startOfDay(now, loc)
-	entries, err := st.EntriesBetween(dayStart, dayStart.Add(24*time.Hour))
+	// A calendar day is not always 24 hours long: AddDate walks to the next
+	// midnight in loc, so a DST transition day neither leaks an hour of
+	// tomorrow into today's total nor drops one of its own (see cmdDaily).
+	entries, err := st.EntriesBetween(dayStart, dayStart.AddDate(0, 0, 1))
 	if err != nil {
 		return err
 	}
@@ -548,7 +551,10 @@ func cmdToday(w io.Writer, st *store.Store, now time.Time, loc *time.Location, d
 	}
 	dayStart := startOfDay(now, loc)
 	from := dayStart.AddDate(0, 0, -(days - 1))
-	to := dayStart.Add(24 * time.Hour)
+	// Both bounds are walked by calendar days rather than by 24-hour steps, so
+	// the window ends at tomorrow's midnight in loc even on a 23- or 25-hour
+	// DST transition day (see cmdCurrent).
+	to := dayStart.AddDate(0, 0, 1)
 
 	entries, err := st.EntriesBetween(from, to)
 	if err != nil {

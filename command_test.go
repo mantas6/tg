@@ -26,7 +26,14 @@ import (
 // invocation and its listing must agree on.
 func newStore(t *testing.T) *store.Store {
 	t.Helper()
-	s, err := store.OpenIn(filepath.Join(t.TempDir(), "tg.db"), time.UTC)
+	return newStoreIn(t, time.UTC)
+}
+
+// newStoreIn is newStore with an explicit calendar, for the tests that have to
+// reckon days somewhere other than UTC (see the DST window tests).
+func newStoreIn(t *testing.T, loc *time.Location) *store.Store {
+	t.Helper()
+	s, err := store.OpenIn(filepath.Join(t.TempDir(), "tg.db"), loc)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -72,16 +79,34 @@ func seedRunning(t *testing.T, s *store.Store, taskID int64, start time.Time) {
 
 func TestProjectIDFromEnv(t *testing.T) {
 	t.Setenv("TOGGL_PROJECT_ID", "42")
-	if got := projectIDFromEnv(); got == nil || *got != 42 {
-		t.Errorf("projectIDFromEnv = %v, want 42", got)
+	got, err := projectIDFromEnv()
+	if err != nil || got == nil || *got != 42 {
+		t.Errorf("projectIDFromEnv = %v err=%v, want 42", got, err)
 	}
 	t.Setenv("TOGGL_PROJECT_ID", "")
-	if got := projectIDFromEnv(); got != nil {
-		t.Errorf("projectIDFromEnv (unset) = %v, want nil", got)
+	got, err = projectIDFromEnv()
+	if err != nil || got != nil {
+		t.Errorf("projectIDFromEnv (unset) = %v err=%v, want nil", got, err)
 	}
-	t.Setenv("TOGGL_PROJECT_ID", "abc")
-	if got := projectIDFromEnv(); got != nil {
-		t.Errorf("projectIDFromEnv (invalid) = %v, want nil", got)
+}
+
+// TestProjectIDFromEnvInvalid pins that a malformed TOGGL_PROJECT_ID fails
+// loudly: it used to parse as nil, i.e. as "unset", so a typo silently unscoped
+// `add`/`update` and added entries with no project instead of refusing.
+func TestProjectIDFromEnvInvalid(t *testing.T) {
+	for _, v := range []string{"abc", "1x", "3.5", "42,"} {
+		t.Setenv("TOGGL_PROJECT_ID", v)
+		got, err := projectIDFromEnv()
+		if err == nil {
+			t.Errorf("projectIDFromEnv(%q) = %v, want an error", v, got)
+			continue
+		}
+		if !strings.Contains(err.Error(), "TOGGL_PROJECT_ID") || !strings.Contains(err.Error(), v) {
+			t.Errorf("projectIDFromEnv(%q) error = %v, want it to name the variable and value", v, err)
+		}
+		if got != nil {
+			t.Errorf("projectIDFromEnv(%q) = %v, want nil alongside the error", v, got)
+		}
 	}
 }
 
@@ -3917,6 +3942,106 @@ func TestCurrentCommandRunningWinsOverNewerEntry(t *testing.T) {
 	want := "run Code review [Backend] (0h30m) Today: 1h30m\n"
 	if buf.String() != want {
 		t.Errorf("status = %q, want %q", buf.String(), want)
+	}
+}
+
+// dstLoc loads a zone that observes DST, for the day-window tests below. It
+// skips the test when the machine has no zone database rather than failing on
+// something the code under test cannot influence.
+func dstLoc(t *testing.T) *time.Location {
+	t.Helper()
+	loc, err := time.LoadLocation("Europe/Vilnius")
+	if err != nil {
+		t.Skipf("no tzdata for Europe/Vilnius: %v", err)
+	}
+	return loc
+}
+
+// TestDayWindowSpringForward covers the 23-hour day: on 2026-03-29 Vilnius jumps
+// 03:00 -> 04:00, so midnight + 24h lands at 01:00 the NEXT day and used to pull
+// an hour of tomorrow into today. `tg ls` must list only today's entry and
+// `tg status`'s day total must ignore tomorrow's 00:30 one.
+func TestDayWindowSpringForward(t *testing.T) {
+	loc := dstLoc(t)
+	s := newStoreIn(t, loc)
+	seedCatalog(t, s)
+
+	today := time.Date(2026, 3, 29, 10, 0, 0, 0, loc)
+	todayStop := today.Add(time.Hour)
+	// 00:30 on the 30th: inside midnight+24h (01:00), outside the calendar day.
+	tomorrow := time.Date(2026, 3, 30, 0, 30, 0, 0, loc)
+	tomorrowStop := tomorrow.Add(30 * time.Minute)
+	for _, e := range []store.Entry{
+		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(10), Start: today, Stop: &todayStop, Duration: 3600, UpdatedAt: todayStop},
+		{WorkspaceID: 1, ProjectID: p(1), TaskID: p(12), Start: tomorrow, Stop: &tomorrowStop, Duration: 1800, UpdatedAt: tomorrowStop},
+	} {
+		if _, err := s.CreateEntry(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	now := time.Date(2026, 3, 29, 12, 0, 0, 0, loc)
+	var buf bytes.Buffer
+	if err := cmdToday(&buf, s, now, loc, 1, true, false); err != nil {
+		t.Fatalf("today: %v", err)
+	}
+	var listing todayJSON
+	if err := json.Unmarshal(buf.Bytes(), &listing); err != nil {
+		t.Fatalf("today json: %v", err)
+	}
+	if len(listing.Entries) != 1 || listing.Entries[0].Task != "Fix login bug" {
+		t.Errorf("entries = %+v, want only today's", listing.Entries)
+	}
+	if listing.TotalSeconds != 3600 {
+		t.Errorf("total = %ds, want 3600 (tomorrow's entry excluded)", listing.TotalSeconds)
+	}
+
+	buf.Reset()
+	if err := cmdCurrent(&buf, s, now, loc, true); err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	if !strings.Contains(buf.String(), `"day_total_seconds":3600`) {
+		t.Errorf("status json = %s, want day_total_seconds 3600", buf.String())
+	}
+}
+
+// TestDayWindowFallBack covers the 25-hour day: on 2026-10-25 Vilnius falls back
+// 04:00 -> 03:00, so midnight + 24h lands at 23:00 the same day and used to drop
+// the final hour. An entry at 23:15 belongs to the day and must be listed and
+// counted.
+func TestDayWindowFallBack(t *testing.T) {
+	loc := dstLoc(t)
+	s := newStoreIn(t, loc)
+	seedCatalog(t, s)
+
+	late := time.Date(2026, 10, 25, 23, 15, 0, 0, loc)
+	lateStop := late.Add(30 * time.Minute)
+	if _, err := s.CreateEntry(store.Entry{
+		WorkspaceID: 1, ProjectID: p(1), TaskID: p(10),
+		Start: late, Stop: &lateStop, Duration: 1800, UpdatedAt: lateStop,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 10, 25, 23, 50, 0, 0, loc)
+	var buf bytes.Buffer
+	if err := cmdToday(&buf, s, now, loc, 1, true, false); err != nil {
+		t.Fatalf("today: %v", err)
+	}
+	var listing todayJSON
+	if err := json.Unmarshal(buf.Bytes(), &listing); err != nil {
+		t.Fatalf("today json: %v", err)
+	}
+	if len(listing.Entries) != 1 || listing.TotalSeconds != 1800 {
+		t.Errorf("listing = %+v, want the 23:15 entry (the day's 25th hour)", listing)
+	}
+
+	buf.Reset()
+	if err := cmdCurrent(&buf, s, now, loc, true); err != nil {
+		t.Fatalf("current: %v", err)
+	}
+	if !strings.Contains(buf.String(), `"day_total_seconds":1800`) {
+		t.Errorf("status json = %s, want day_total_seconds 1800", buf.String())
 	}
 }
 

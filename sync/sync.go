@@ -5,6 +5,8 @@
 package sync
 
 import (
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/mantas6/tg/api"
@@ -77,7 +79,7 @@ func Pull(st *store.Store, c *api.Client, projectID *int64, since, now time.Time
 			}
 			res.Inserted++
 
-		case !mapped.UpdatedAt.Before(local.UpdatedAt): // remote at >= local updated_at
+		case remoteWins(mapped, *local):
 			if r.Deleted() {
 				if err := st.DeleteByRemoteID(r.ID); err != nil {
 					return res, err
@@ -85,10 +87,21 @@ func Pull(st *store.Store, c *api.Client, projectID *int64, since, now time.Time
 				res.Deleted++
 				continue
 			}
-			if err := st.UpdateFromRemote(mapped); err != nil {
+			switch err := st.UpdateFromRemote(mapped); {
+			case err == nil:
+				res.Updated++
+			case errors.Is(err, store.ErrEntryNotFound):
+				// The mirror read above vanished before this write (only a
+				// concurrent tg dropping the row can do that). The remote entry
+				// is still authoritative, so re-create it rather than counting
+				// an update that never landed.
+				if _, err := st.CreateEntry(mapped); err != nil {
+					return res, err
+				}
+				res.Inserted++
+			default:
 				return res, err
 			}
-			res.Updated++
 
 		default: // local is newer; keep it for push
 			res.Skipped++
@@ -111,6 +124,28 @@ func Pull(st *store.Store, c *api.Client, projectID *int64, since, now time.Time
 		}
 	}
 	return res, nil
+}
+
+// remoteWins decides the LWW comparison behind Pull: it reports whether the
+// remote version of an entry may overwrite the local one.
+//
+// The clocks it compares are only second-accurate — Toggl's `at` has no
+// sub-second part and store.MarkSynced copies it onto updated_at — so ties are
+// common rather than exotic: an edit made in the same second the entry was last
+// synced carries the very timestamp the push just wrote. A tie is therefore not
+// evidence that the remote is newer, and letting it win would drop a local edit
+// before `tg push` ever saw it. So a dirty entry (one with unsynced local
+// changes) only yields to a STRICTLY newer remote and is otherwise kept for the
+// next push.
+//
+// A clean entry has nothing to lose: its state came from the server, so a tie
+// re-applies what it already holds and the remote is allowed to win, which keeps
+// a pull idempotent right after a push.
+func remoteWins(remote, local store.Entry) bool {
+	if local.Dirty {
+		return remote.UpdatedAt.After(local.UpdatedAt)
+	}
+	return !remote.UpdatedAt.Before(local.UpdatedAt)
 }
 
 // canAdvanceWatermark reports whether a pull whose window starts at `since` may
@@ -138,7 +173,9 @@ func canAdvanceWatermark(st *store.Store, since time.Time) (bool, error) {
 
 // Push sends every dirty local entry to Toggl: deletions are DELETEd then
 // dropped, new entries are POSTed, existing entries are PUT. now is the fallback
-// clock used if the server omits an `at` timestamp.
+// clock used if the server omits an `at` timestamp; a server timestamp that is
+// present but malformed aborts the push with an error and leaves the entry dirty
+// (see remoteAt) rather than recording a made-up clock.
 func Push(st *store.Store, c *api.Client, now time.Time) (PushResult, error) {
 	var res PushResult
 	dirty, err := st.DirtyEntries()
@@ -164,7 +201,11 @@ func Push(st *store.Store, c *api.Client, now time.Time) (PushResult, error) {
 			if err != nil {
 				return res, err
 			}
-			if err := st.MarkSynced(e.ID, created.ID, remoteAt(created.At, now)); err != nil {
+			at, err := remoteAt(created.At, now)
+			if err != nil {
+				return res, err
+			}
+			if err := st.MarkSynced(e.ID, created.ID, at); err != nil {
 				return res, err
 			}
 			res.Created++
@@ -174,7 +215,11 @@ func Push(st *store.Store, c *api.Client, now time.Time) (PushResult, error) {
 			if err != nil {
 				return res, err
 			}
-			if err := st.MarkSynced(e.ID, updated.ID, remoteAt(updated.At, now)); err != nil {
+			at, err := remoteAt(updated.At, now)
+			if err != nil {
+				return res, err
+			}
+			if err := st.MarkSynced(e.ID, updated.ID, at); err != nil {
 				return res, err
 			}
 			res.Updated++
@@ -274,14 +319,22 @@ func toAPIEntry(e store.Entry) api.TimeEntry {
 	return te
 }
 
-// remoteAt parses the server's `at`, falling back to now when absent/invalid.
-func remoteAt(at string, now time.Time) time.Time {
+// remoteAt parses the server's `at` into the clock a push records locally. An
+// absent `at` falls back to now: the server reported no timestamp, so the local
+// one is the best available and is at least in the same order of events.
+//
+// A malformed `at` is an error instead. Substituting now for a timestamp the
+// server DID send would invent an LWW clock unrelated to the server's, and
+// MarkSynced would store it as both updated_at and synced_at — poisoning every
+// later comparison against the real remote `at` (see remoteWins), silently and
+// in whichever direction the skew happens to point.
+func remoteAt(at string, now time.Time) (time.Time, error) {
 	if at == "" {
-		return now
+		return now, nil
 	}
 	t, err := time.Parse(time.RFC3339, at)
 	if err != nil {
-		return now
+		return time.Time{}, fmt.Errorf("invalid remote timestamp %q: %w", at, err)
 	}
-	return t
+	return t, nil
 }
