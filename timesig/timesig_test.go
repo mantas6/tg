@@ -194,6 +194,122 @@ func TestParseRelativeErrors(t *testing.T) {
 	}
 }
 
+// TestParseNegativeValid covers the negative form's grammar and, above all, its
+// sign: the result is negative, so adding it to a time moves that time earlier.
+func TestParseNegativeValid(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"-:20", -20 * time.Minute},                  // minutes only
+		{"-1:20", -80 * time.Minute},                 // hours and minutes
+		{"-1", -time.Hour},                           // bare hour count
+		{"-2", -2 * time.Hour},                       // several hours
+		{"-:05", -5 * time.Minute},                   // zero-padded minutes
+		{"-01:05", -65 * time.Minute},                // zero-padded hour
+		{"-23:59", -(23*time.Hour + 59*time.Minute)}, // longest expressible length
+		{"-0:01", -time.Minute},                      // smallest length
+		{" - 1:20 ", -80 * time.Minute},              // surrounding whitespace tolerated
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			t.Parallel()
+			got, err := ParseNegative(tc.in)
+			if err != nil {
+				t.Fatalf("ParseNegative(%q): %v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Errorf("ParseNegative(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseNegativeErrors(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"zero minutes", "-:00"},
+		{"zero hours", "-0"},
+		{"zero hours and minutes", "-0:00"},
+		{"empty duration", "-"},
+		{"only whitespace", "- "},
+		{"hours out of range", "-24"},
+		{"minutes out of range", "-1:60"},
+		{"non-numeric hours", "-a"},
+		{"non-numeric minutes", "-:ab"},
+		{"missing minutes", "-1:"},
+		{"double sign", "--1"},
+		{"relative sign", "+1"},
+		{"unsigned duration", "1:30"},
+		{"range not allowed", "-9-10"},
+		{"trailing garbage", "-1:20x"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := ParseNegative(tc.in); err == nil {
+				t.Errorf("ParseNegative(%q) = nil error, want an error", tc.in)
+			}
+		})
+	}
+}
+
+// TestParseNegativeHasNoAnchor pins the point of the negative form: like the
+// bare duration it is a length only, so neither now nor a location can influence
+// it — and it yields no Span, so Parse refuses it outright rather than resolving
+// one.
+func TestParseNegativeHasNoAnchor(t *testing.T) {
+	t.Parallel()
+	got, err := ParseNegative("-1:30")
+	if err != nil {
+		t.Fatalf("ParseNegative: %v", err)
+	}
+	if got != -90*time.Minute {
+		t.Errorf("ParseNegative(\"-1:30\") = %v, want -1h30m", got)
+	}
+	if _, err := Parse("-1:30", now, time.UTC); err == nil {
+		t.Error("Parse(\"-1:30\") = nil error, want an error: a negative sign has no span")
+	}
+}
+
+func TestIsNegative(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"-30", true},
+		{"-1:20", true},
+		{"-:20", true},
+		{" -1 ", true},
+		{"- 1", true},     // the inner space is trimmed like the "+" form's
+		{"-99:99", true},  // shape only; ParseNegative still rejects it
+		{"-1:", true},     // shape only; ParseNegative still rejects it
+		{"-0", true},      // shape only; ParseNegative still rejects it
+		{"-", false},      // no digits: a (malformed) absolute range
+		{"-:", false},     // no digits either
+		{"-desc", false},  // a flag, not a timesign
+		{"-1x", false},    // trailing garbage is not a shape
+		{"-1:2:3", false}, // one ":" at most
+		{"--desc", false}, // a long flag
+		{"--1", false},    // the -1/--first flag spelling, not a timesign
+		{"9-10", false},   // an absolute range
+		{"+30", false},    // the relative form
+		{"30", false},     // a bare duration
+		{"", false},
+		{" ", false},
+	}
+	for _, tc := range cases {
+		if got := IsNegative(tc.in); got != tc.want {
+			t.Errorf("IsNegative(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestParseDurationValid(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

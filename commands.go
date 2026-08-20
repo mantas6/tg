@@ -259,6 +259,10 @@ func addSpan(ctx context.Context, st *store.Store, timesign string, now time.Tim
 //	                    Topping up the entry you just finished is what mod is
 //	                    for, so a relative timesign is neither re-anchored to
 //	                    now (unlike `add`) nor read as an absolute length.
+//	negative (-:20)     the mirror image: the start is kept and the stop moves
+//	                    to stop-duration, SHORTENING the entry. Trimming an
+//	                    entry that ran shorter than recorded is the correction
+//	                    `+` cannot express (see modShift).
 //
 // setDesc distinguishes an omitted --desc from an explicit empty one, so a
 // description can be cleared with --desc "".
@@ -345,28 +349,12 @@ func modTarget(ctx context.Context, st *store.Store, ref int, now time.Time) (st
 }
 
 // modSpan computes an entry's new [start, stop) from a timesign: an absolute
-// sign is resolved on the entry's own calendar day, while a relative sign
-// contributes only its duration, which is ADDED to the entry's stop — the start
-// never moves (see cmdMod). A running entry has no stop to add to, so extending
-// one is refused; it can still be retimed with an absolute sign.
+// sign is resolved on the entry's own calendar day, while a relative (+) or
+// negative (-) sign contributes only its duration, which MOVES the entry's stop
+// (see modShift).
 func modSpan(e store.Entry, timesign string, now time.Time, loc *time.Location) (time.Time, time.Time, error) {
-	if timesig.IsRelative(timesign) {
-		relative := timesign
-		raw := strings.TrimSpace(timesign)
-		body := strings.TrimSpace(strings.TrimPrefix(raw, timesig.RelativePrefix))
-		// mod's unitless shorthand is minutes; the shared parser uses hours.
-		if isDigits(body) {
-			relative = timesig.RelativePrefix + ":" + body
-		}
-		span, err := timesig.ParseRelative(relative, now, loc)
-		if err != nil {
-			return time.Time{}, time.Time{}, err
-		}
-		if e.Stop == nil {
-			return time.Time{}, time.Time{}, errors.New(
-				"entry is still running: it has no end time to extend, give an absolute timesign (e.g. 9-10:30) instead")
-		}
-		return e.Start, e.Stop.Add(span.Duration()), nil
+	if timesig.IsRelative(timesign) || timesig.IsNegative(timesign) {
+		return modShift(e, timesign, now, loc)
 	}
 	// e.Start stands in for "now" so the range lands on the entry's day.
 	span, err := timesig.ParseAbsolute(timesign, e.Start, loc)
@@ -374,6 +362,72 @@ func modSpan(e store.Entry, timesign string, now time.Time, loc *time.Location) 
 		return time.Time{}, time.Time{}, err
 	}
 	return span.Start, span.Stop, nil
+}
+
+// modShift moves an entry's stop by a signed timesign's duration, keeping the
+// start: "+" pushes it later, "-" pulls it back (see cmdMod). The two are
+// symmetric, so `tg mod +30` followed by `tg mod -30` is a round trip.
+//
+// Two shifts are refused rather than guessed at:
+//
+//   - a RUNNING entry has no stop to move at all;
+//   - a subtraction of at least the entry's whole length, which would leave it
+//     empty or inside out. An entry always spans some time, and "delete it" is
+//     `tg del`, not a mod.
+//
+// Both name the absolute form, which can retime such an entry outright.
+func modShift(e store.Entry, timesign string, now time.Time, loc *time.Location) (time.Time, time.Time, error) {
+	shift, err := modShiftDuration(timesign, now, loc)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	if e.Stop == nil {
+		verb := "extend"
+		if shift < 0 {
+			verb = "shorten"
+		}
+		return time.Time{}, time.Time{}, fmt.Errorf(
+			"entry is still running: it has no end time to %s, give an absolute timesign (e.g. 9-10:30) instead", verb)
+	}
+	stop := e.Stop.Add(shift)
+	// Only a subtraction can reach the start; a positive shift always lands
+	// after the stop it moved.
+	if !stop.After(e.Start) {
+		return time.Time{}, time.Time{}, fmt.Errorf(
+			"cannot take %s off a %s entry: an entry must keep some length, use `tg del` to remove it or an absolute timesign (e.g. 9-10:30) to retime it",
+			formatHM(-shift), formatHM(e.Stop.Sub(e.Start)))
+	}
+	return e.Start, stop, nil
+}
+
+// modShiftDuration reads the DURATION out of a relative or negative timesign and
+// returns it signed the way modShift adds it to the entry's stop: positive for
+// "+", negative for "-".
+//
+// mod's unitless shorthand is minutes while the shared parser reads a bare
+// number as hours, so a digits-only body is rewritten as ":MM" first: `mod +30`
+// and `mod -30` are half an hour, not half a day.
+func modShiftDuration(timesign string, now time.Time, loc *time.Location) (time.Duration, error) {
+	prefix := timesig.RelativePrefix
+	if timesig.IsNegative(timesign) {
+		prefix = timesig.NegativePrefix
+	}
+	raw := strings.TrimSpace(timesign)
+	body := strings.TrimSpace(strings.TrimPrefix(raw, prefix))
+	if isDigits(body) {
+		body = ":" + body
+	}
+	if prefix == timesig.NegativePrefix {
+		return timesig.ParseNegative(prefix + body)
+	}
+	// The span's own times are irrelevant here (mod never re-anchors to now);
+	// only its length is, but the anchored parser is what spells the "+" form's
+	// grammar and its error messages.
+	span, err := timesig.ParseRelative(prefix+body, now, loc)
+	if err != nil {
+		return 0, err
+	}
+	return span.Duration(), nil
 }
 
 // cmdDel deletes the entry addressed by the local number ref, resolved on

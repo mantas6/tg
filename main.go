@@ -20,6 +20,7 @@ import (
 	"github.com/mantas6/tg/api"
 	"github.com/mantas6/tg/config"
 	"github.com/mantas6/tg/store"
+	"github.com/mantas6/tg/timesig"
 )
 
 func main() {
@@ -94,9 +95,10 @@ func runAdd(ctx context.Context, args []string) error {
 	var first bool
 	bindFirstFlag(fs, &first, "task or project")
 	// Flags may follow the timesign and the fragment (`tg add 9-10 login -1`),
-	// so positionals are peeled off the same way `tg mod` does it. No timesign
-	// form starts with "-" (an absolute one needs a digit first), so nothing
-	// positional is mistaken for a flag.
+	// so positionals are peeled off the same way `tg mod` does it. None of the
+	// forms `add` accepts starts with "-" (an absolute one needs a digit
+	// first), so nothing positional is mistaken for a flag — and unlike
+	// `tg mod -30`, `tg add ... -1` stays the --first flag.
 	rest, err := parseArgsAndFlags(fs, args)
 	if err != nil {
 		return err
@@ -135,13 +137,18 @@ func runMod(ctx context.Context, args []string) error {
 	// separately (see descWasSet).
 	var desc string
 	bindDescFlag(fs, &desc, "new entry description")
+	// A negative timesign ("-30") is a positional argument that looks exactly
+	// like an undefined flag, so it is peeled off before the flag package sees
+	// it and put back with the other positionals afterwards. parseModArgs takes
+	// them in any order, so appending is enough.
+	args, negative := splitNegativeTimesigns(fs, args)
 	rest, err := parseArgsAndFlags(fs, args)
 	if err != nil {
 		return err
 	}
 	setDesc := descWasSet(fs)
 
-	ref, timesign, err := parseModArgs(rest)
+	ref, timesign, err := parseModArgs(append(rest, negative...))
 	if err != nil {
 		return err
 	}
@@ -594,11 +601,58 @@ func parseArgsAndFlags(fs *flag.FlagSet, args []string) ([]string, error) {
 	}
 }
 
+// splitNegativeTimesigns separates `tg mod`'s negative timesigns ("-30",
+// "-1:20") from the rest of its command line. They are positional arguments that
+// begin with "-", so flag.Parse would report them as undefined flags; pulling
+// them out first is what lets `tg mod -30` be written the obvious way instead of
+// needing `tg mod -- -30`.
+//
+// Only genuine timesign shapes are taken (see timesig.IsNegative), so real flags
+// pass through untouched, and the argument after a flag that consumes one is
+// skipped so a description can still be the text "-30" (`tg mod --desc -30`).
+// Anything else that starts with "-" is left to the flag package, which reports
+// it as the typo it almost certainly is.
+func splitNegativeTimesigns(fs *flag.FlagSet, args []string) (rest, negative []string) {
+	for i := 0; i < len(args); i++ {
+		if timesig.IsNegative(args[i]) {
+			negative = append(negative, args[i])
+			continue
+		}
+		rest = append(rest, args[i])
+		if flagWantsValue(fs, args[i]) && i+1 < len(args) {
+			i++
+			rest = append(rest, args[i])
+		}
+	}
+	return rest, negative
+}
+
+// flagWantsValue reports whether arg is a flag declared on fs that takes the
+// NEXT argument as its value. The joined "--flag=value" form carries its own, and
+// a boolean flag never takes one (the flag package spells that with the
+// unexported IsBoolFlag interface, which is why it is asserted here rather than
+// looked up).
+func flagWantsValue(fs *flag.FlagSet, arg string) bool {
+	if !strings.HasPrefix(arg, "-") {
+		return false
+	}
+	name := strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "-")
+	if name == "" || strings.ContainsRune(name, '=') {
+		return false
+	}
+	f := fs.Lookup(name)
+	if f == nil {
+		return false
+	}
+	b, ok := f.Value.(interface{ IsBoolFlag() bool })
+	return !ok || !b.IsBoolFlag()
+}
+
 // parseModArgs classifies `tg mod`'s positional arguments. An all-digits
 // argument is a local entry number (0 when absent, meaning the last entry);
-// anything else is the timesign, since neither timesign form is bare digits (an
-// absolute one needs a `-`, a relative one a leading `+`). Order does not
-// matter, and neither may be given twice.
+// anything else is the timesign, since no timesign form is bare digits (an
+// absolute one needs an inner `-`, a relative one a leading `+` and a negative
+// one a leading `-`). Order does not matter, and neither may be given twice.
 func parseModArgs(args []string) (ref int, timesign string, err error) {
 	for _, a := range args {
 		if isDigits(a) {
@@ -776,7 +830,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "commands:")
 	fmt.Fprintln(w, "  auth [token]              verify a Toggl API token and store config")
 	fmt.Fprintln(w, "  add <timesign> [project] <task>  add a finished entry [--desc TEXT] [-1]")
-	fmt.Fprintln(w, "  mod [num] [timesign]      retime/rename an entry (default: last) [--desc TEXT]")
+	fmt.Fprintln(w, "  mod [num] [timesign]      retime/rename an entry (default: last), e.g.")
+	fmt.Fprintln(w, "                            +30 / -30 minutes                  [--desc TEXT]")
 	fmt.Fprintln(w, "  del <num>                 delete the entry numbered by `tg ls`")
 	fmt.Fprintln(w, "  current | status          last entry, gap, day total        [--json]")
 	fmt.Fprintln(w, "  today   | list | ls       show today's entries     [--days N] [--json]")
@@ -796,16 +851,19 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  completion zsh            print the zsh completion script")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "timesign: absolute 9-:30, 10-11, 10:30-11:15 (today), relative +:20,")
-	fmt.Fprintln(w, "      +1, +1:20 (that long, ending at the last 5m mark), or a bare")
-	fmt.Fprintln(w, "      duration 1:30, :45 (that long, starting where the last entry")
-	fmt.Fprintln(w, "      ended; `add` only). Full spec: docs/timesig.md")
+	fmt.Fprintln(w, "      +1, +1:20 (that long, ending at the last 5m mark), negative")
+	fmt.Fprintln(w, "      -:20, -1:20 (that much LESS; `mod` only), or a bare duration")
+	fmt.Fprintln(w, "      1:30, :45 (that long, starting where the last entry ended;")
+	fmt.Fprintln(w, "      `add` only). Full spec: docs/timesig.md")
 	fmt.Fprintln(w, "mod:  numbers are the per-day ones shown by `tg ls` (assigned when an")
 	fmt.Fprintln(w, "      entry is added, never reused); without one the last entry is")
 	fmt.Fprintln(w, "      modified: today's newest already-started entry, the same one")
 	fmt.Fprintln(w, "      `tg status` shows. An absolute timesign sets the range on the")
-	fmt.Fprintln(w, "      entry's own day; a relative one EXTENDS the entry, keeping the")
-	fmt.Fprintln(w, "      start (`tg mod +30` pushes the end 30m later); unlike other")
-	fmt.Fprintln(w, "      relative timesigns, a number without `:` is minutes for `mod`.")
+	fmt.Fprintln(w, "      entry's own day; a signed one moves its END, keeping the start:")
+	fmt.Fprintln(w, "      `tg mod +30` pushes the end 30m later, `tg mod -30` pulls it")
+	fmt.Fprintln(w, "      30m back (never past the start; use `tg del` to remove an")
+	fmt.Fprintln(w, "      entry). Unlike other timesigns, a number without `:` is")
+	fmt.Fprintln(w, "      minutes for `mod`.")
 	fmt.Fprintln(w, "-1:   `add`/`grep`/`total`/`update`/`pull` match tasks and projects by")
 	fmt.Fprintln(w, "      name fragment; a fragment matching several of them normally")
 	fmt.Fprintln(w, "      fails with the candidates listed. `-1` (alias `--first`) takes")

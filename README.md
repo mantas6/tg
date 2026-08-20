@@ -51,7 +51,9 @@ tg status                   # last entry, idle gap, today's total
 There is no timer: time is always recorded as a finished block with `add` and a
 *timesign* — an absolute `START-STOP` range on today's clock, a relative
 `+DURATION` span counted back from now, or a bare `DURATION` that continues from
-the last entry.
+the last entry. (`tg mod` reads the same notation against an existing entry and
+adds a fourth form, `-DURATION`, to take time back off it; see
+[Fixing and removing entries](#fixing-and-removing-entries).)
 
 ```sh
 tg add 9-:30 <task>         # 09:00-09:30
@@ -140,7 +142,9 @@ that has already started (see below).
 
 ```sh
 tg mod +30                       # the last entry ran 30 minutes longer
+tg mod -10                       # ...or 10 minutes shorter
 tg mod 2 +1:15                   # push entry 2's end 1h15m later
+tg mod 2 -1:20                   # pull entry 2's end 1h20m back
 tg mod 2 9-10:30                 # set entry 2's range explicitly
 tg mod --desc "reset password"   # only change the last entry's description
 tg mod 2 +:45 --desc "rebased"   # extend and re-describe entry 2
@@ -151,17 +155,24 @@ A timesign is read relative to the entry, not to today:
 
 - an **absolute** range (`9-10:30`) sets start and stop on the entry's *own*
   calendar day, so an edit never drags an entry onto another day;
-- a **relative** timesign (`+30`) *extends* the entry by that duration: the
-  start is kept and the stop moves to stop + duration, so an entry ending at
-  14:00 ends at 14:30 after `tg mod +30`. An all-digit duration without `:` is
-  minutes for `mod`, so `+20` adds 20 minutes; `+1:20` still adds 1h20m. It does
-  **not** re-anchor the entry to now the way `tg add` does, and it is not an
-  absolute length — repeating it
-  keeps adding time. A still-running entry has no end to extend, so `mod +`
-  refuses it; retime it with an absolute range instead.
+- a **signed** timesign moves the entry's *end* by that duration, keeping the
+  start: `+30` *extends* it (an entry ending at 14:00 ends at 14:30) and `-30`
+  *shortens* it (that entry ends at 13:30 instead). An all-digit duration
+  without `:` is minutes for `mod`, so `+20`/`-20` are 20 minutes; `+1:20` and
+  `-1:20` are 1h20m. Neither re-anchors the entry to now the way `tg add` does,
+  and neither is an absolute length — repeating one keeps moving the end, and
+  `+30 -30` is a round trip. A still-running entry has no end to move, so both
+  refuse it; retime it with an absolute range instead.
+
+Subtracting is capped by the entry itself: taking off its whole length (or more)
+would leave nothing, so it is refused rather than producing an empty or
+inside-out entry (`tg del` removes an entry, and an absolute range retimes one
+outright).
 
 `mod` does not take `add`'s bare duration form: it never moves an entry's start,
-and `+DURATION` already says "this ran longer".
+and `+DURATION`/`-DURATION` already say "this ran longer/shorter". Note that a
+negative timesign is *not* the `-1` first-match flag other commands take: `mod`
+has no such flag, so `tg mod -1` takes one minute off the last entry.
 
 **Only today's entries can be modified.** Once an entry's calendar day is over
 it is history: `tg mod` refuses it outright ("refusing to update an entry older
@@ -369,7 +380,8 @@ usage: tg <command> [flags]
 commands:
   auth [token]              verify a Toggl API token and store config
   add <timesign> [project] <task>  add a finished entry [--desc TEXT] [-1]
-  mod [num] [timesign]      retime/rename an entry (default: last) [--desc TEXT]
+  mod [num] [timesign]      retime/rename an entry (default: last), e.g.
+                            +30 / -30 minutes                  [--desc TEXT]
   del <num>                 delete the entry numbered by `tg ls`
   current | status          last entry, gap, day total        [--json]
   today   | list | ls       show today's entries     [--days N] [--json]
@@ -389,15 +401,17 @@ commands:
   completion zsh            print the zsh completion script
 
 timesign: absolute 9-:30, 10-11, 10:30-11:15 (today), relative +:20,
-      +1, +1:20 (that long, ending at the last 5m mark), or a bare
-      duration 1:30, :45 (that long, starting where the last entry
-      ended; `add` only). Full spec: docs/timesig.md
+      +1, +1:20 (that long, ending at the last 5m mark), negative
+      -:20, -1:20 (that much LESS; `mod` only), or a bare duration
+      1:30, :45 (that long, starting where the last entry ended;
+      `add` only). Full spec: docs/timesig.md
 mod:  numbers are the per-day ones shown by `tg ls`; without one the
       last entry is modified: today's newest already-started entry, the
       same one `tg status` shows. Only TODAY's entries can be modified.
       An absolute timesign sets the range on the entry's own day; a
-      relative one EXTENDS the entry, keeping the start (`tg mod +30`
-      pushes the end 30m later); a number without `:` is minutes for `mod`.
+      signed one moves its END, keeping the start: `tg mod +30` pushes
+      the end 30m later, `tg mod -30` pulls it 30m back (never past the
+      start); a number without `:` is minutes for `mod`.
 -1:   `add`/`grep`/`total`/`update`/`pull` match tasks and projects by
       name fragment; a fragment matching several of them normally
       fails with the candidates listed. `-1` (alias `--first`) takes

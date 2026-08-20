@@ -1,13 +1,15 @@
 // Package timesig parses the time signatures ("timesigns") that tg commands
-// accept in place of full timestamps. Three forms exist:
+// accept in place of full timestamps. Four forms exist:
 //
 //	ABSOLUTE  START "-" STOP   an explicit same-day wall-clock range ("9-:30")
 //	RELATIVE  "+" DURATION     a span ending at the current 5-minute mark ("+:20")
+//	NEGATIVE  "-" DURATION     a length to take AWAY from a span ("-:20")
 //	DURATION  DURATION         a bare length with no times of its own ("1:30")
 //
-// The first two resolve to a Span on their own; the bare duration form does
-// not, so ParseDuration returns just the length and the caller anchors it (see
-// `tg add`, which starts the entry at the last entry's end).
+// The first two resolve to a Span on their own; the last two do not, so
+// ParseNegative and ParseDuration return just the length and the caller anchors
+// it (see `tg add`, which starts the entry at the last entry's end, and
+// `tg mod`, which pulls an entry's end back by a negative sign's length).
 //
 // The full grammar, rounding rules and error cases are documented in
 // docs/timesig.md; keep the two in sync.
@@ -22,8 +24,8 @@ import (
 )
 
 // Kind distinguishes the two timesign forms that resolve to a Span. The bare
-// duration form has no times of its own, so it never yields a Span (see
-// ParseDuration).
+// duration and negative forms have no times of their own, so they never yield a
+// Span (see ParseDuration and ParseNegative).
 type Kind int
 
 const (
@@ -78,6 +80,47 @@ func IsDuration(s string) bool {
 	return s != "" && !strings.HasPrefix(s, RelativePrefix) && !strings.Contains(s, "-")
 }
 
+// NegativePrefix marks a negative timesign.
+const NegativePrefix = "-"
+
+// IsNegative reports whether s is a negative timesign: the "-" prefix followed
+// by something SHAPED like a duration ("-30", "-1:20"), i.e. digits with at most
+// one ":" and nothing else.
+//
+// Unlike IsRelative and IsDuration it inspects the whole string rather than just
+// the punctuation in front, because "-" is overloaded three ways: it separates
+// an absolute range ("9-10"), it starts a negative sign ("-30"), and it starts a
+// command-line flag ("-desc"). Only the shape tells them apart, so the check has
+// to be tight enough for `tg mod` to pick its arguments out of a command line
+// before the flag package sees them (see splitNegativeTimesigns).
+//
+// It is still only a shape test, not a validator: IsNegative("-99:99") is true
+// while ParseNegative("-99:99") errors.
+func IsNegative(s string) bool {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, NegativePrefix) {
+		return false
+	}
+	return isDurationShape(strings.TrimSpace(strings.TrimPrefix(s, NegativePrefix)))
+}
+
+// isDurationShape reports whether s is written like a DURATION ("H", "H:MM" or
+// ":MM"): at least one ASCII digit, at most one ":", and nothing else.
+func isDurationShape(s string) bool {
+	digits, colons := 0, 0
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c >= '0' && c <= '9':
+			digits++
+		case c == ':':
+			colons++
+		default:
+			return false
+		}
+	}
+	return digits > 0 && colons <= 1
+}
+
 // Parse resolves a self-contained timesign — absolute or relative — into a
 // Span. now is the reference instant (the calendar day for absolute signs, the
 // anchor for relative ones) and loc is the location whose wall clock the sign
@@ -87,6 +130,14 @@ func IsDuration(s string) bool {
 func Parse(s string, now time.Time, loc *time.Location) (Span, error) {
 	if IsRelative(s) {
 		return ParseRelative(s, now, loc)
+	}
+	if IsNegative(s) {
+		// A negative sign names a length to take away from a span that
+		// already exists, so on its own there is nothing for it to resolve
+		// to. Saying so beats reporting it as a range with an empty START.
+		return Span{}, fmt.Errorf(
+			"invalid timesign %q: a negative timesign only subtracts from an existing entry (`tg mod`)",
+			strings.TrimSpace(s))
 	}
 	return ParseAbsolute(s, now, loc)
 }
@@ -166,6 +217,37 @@ func ParseRelative(s string, now time.Time, loc *time.Location) (Span, error) {
 
 	stop := Floor5(now.In(loc))
 	return Span{Kind: Relative, Start: stop.Add(-dur), Stop: stop}, nil
+}
+
+// ParseNegative parses a negative timesign — a length of time to take AWAY from
+// a span that already exists — into a NEGATIVE time.Duration. The grammar is the
+// DURATION of the relative form with a "-" instead of the "+":
+//
+//	timesign = "-" DURATION
+//	DURATION = H | H ":" MM | ":" MM
+//	H        = hours   0-23
+//	MM       = minutes 0-59
+//
+// So "-1:20" is -1h20m, "-:45" is -45 minutes and "-2" is minus two hours. The
+// sign is kept in the result so a caller shortens a span by ADDING it to a time,
+// which is the same arithmetic the relative form's duration gets and so cannot
+// be applied the wrong way round by accident.
+//
+// Like the bare duration form it carries no anchor, so neither now nor a
+// location is needed: the caller decides what the length is taken off (`tg mod`
+// pulls the entry's end back by it). The magnitude must be greater than zero, so
+// "-0", "-:00" and "-0:00" are errors, as is a missing or malformed one.
+func ParseNegative(s string) (time.Duration, error) {
+	raw := strings.TrimSpace(s)
+	if !strings.HasPrefix(raw, NegativePrefix) {
+		return 0, fmt.Errorf("invalid timesign %q: expected -DURATION", raw)
+	}
+	body := strings.TrimSpace(strings.TrimPrefix(raw, NegativePrefix))
+	dur, err := parseDurationBody(body, raw)
+	if err != nil {
+		return 0, err
+	}
+	return -dur, nil
 }
 
 // ParseDuration parses a bare duration timesign — a length of time with no

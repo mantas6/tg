@@ -1121,9 +1121,176 @@ func TestModRelativeAddsToTheEnd(t *testing.T) {
 	}
 }
 
-// TestModRelativeRefusesRunningEntry covers the one entry a relative timesign
-// cannot act on: a running entry has no end to add to, so mod says so instead
-// of inventing one from now. An absolute sign still gives it a finished span.
+// TestModNegativeSubtractsFromTheEnd is the mirror of
+// TestModRelativeAddsToTheEnd: a negative timesign takes its duration OFF the
+// entry's current end, keeping the start, so the 1h entry ending at 11:00 loses
+// 30 minutes and then 15 more. Like "+" it is not re-anchored to modNow (15:07)
+// and not read as an absolute length, so repeating it keeps trimming.
+func TestModNegativeSubtractsFromTheEnd(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+	last := entries[1] // 10:00-11:00 Code review
+
+	var buf bytes.Buffer
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 0, "-:30", "", false); err != nil {
+		t.Fatalf("first mod: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"Modified: Code review", "10:00-10:30", "0h30m"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output = %q, want %q", out, want)
+		}
+	}
+	buf.Reset()
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 2, "-:15", "", false); err != nil {
+		t.Fatalf("second mod: %v", err)
+	}
+
+	got := entryByID(t, s, last.ID)
+	if !got.Start.Equal(last.Start) {
+		t.Errorf("start = %v, want it unchanged at %v", got.Start, last.Start)
+	}
+	wantStop := time.Date(2026, 1, 2, 10, 15, 0, 0, time.UTC)
+	if got.Stop == nil || !got.Stop.Equal(wantStop) {
+		t.Errorf("stop = %v, want %v (11:00 - 30m - 15m)", got.Stop, wantStop)
+	}
+	if got.Duration != 900 {
+		t.Errorf("duration = %d, want 900 (15m)", got.Duration)
+	}
+	if !got.Dirty {
+		t.Error("modified entry should be dirty for a later push")
+	}
+	if !got.UpdatedAt.Equal(modNow) {
+		t.Errorf("updated_at = %v, want %v", got.UpdatedAt, modNow)
+	}
+	// The remote identity survives, so the push is an update, not a re-create.
+	if got.RemoteID == nil || *got.RemoteID != 9002 {
+		t.Errorf("remote_id = %v, want 9002", got.RemoteID)
+	}
+	// The untargeted entry is untouched.
+	if first := entryByID(t, s, entries[0].ID); first.Dirty {
+		t.Error("mod touched the entry it was not addressing")
+	}
+}
+
+// TestModNegativeSpellings tables the negative form's grammar as `tg mod` reads
+// it, next to the "+" spelling it mirrors: an all-digit sign is MINUTES ("-10"),
+// "-H:MM" is hours and minutes, and "-H" is whole hours. The fixture entry 2 is
+// 10:00-11:00, so every case is measured back from 11:00.
+func TestModNegativeSpellings(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		timesign string
+		wantStop time.Time
+	}{
+		{"-10", time.Date(2026, 1, 2, 10, 50, 0, 0, time.UTC)},   // unitless: minutes
+		{"-:10", time.Date(2026, 1, 2, 10, 50, 0, 0, time.UTC)},  // the same, spelled out
+		{"-1", time.Date(2026, 1, 2, 10, 59, 0, 0, time.UTC)},    // unitless again: ONE minute, not one hour
+		{"-30", time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)},   // half the entry
+		{"-59", time.Date(2026, 1, 2, 10, 1, 0, 0, time.UTC)},    // all but a minute
+		{"-0:59", time.Date(2026, 1, 2, 10, 1, 0, 0, time.UTC)},  // the same, zero-padded
+		{" -15 ", time.Date(2026, 1, 2, 10, 45, 0, 0, time.UTC)}, // whitespace tolerated
+	} {
+		t.Run(strings.TrimSpace(tc.timesign), func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
+			entries := seedModDay(t, s)
+
+			var buf bytes.Buffer
+			if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 2, tc.timesign, "", false); err != nil {
+				t.Fatalf("mod %q: %v", tc.timesign, err)
+			}
+			got := entryByID(t, s, entries[1].ID)
+			if !got.Start.Equal(entries[1].Start) {
+				t.Errorf("start = %v, want it unchanged at %v", got.Start, entries[1].Start)
+			}
+			if got.Stop == nil || !got.Stop.Equal(tc.wantStop) {
+				t.Errorf("mod %q: stop = %v, want %v", tc.timesign, got.Stop, tc.wantStop)
+			}
+			if want := int64(tc.wantStop.Sub(got.Start) / time.Second); got.Duration != want {
+				t.Errorf("mod %q: duration = %d, want %d", tc.timesign, got.Duration, want)
+			}
+		})
+	}
+}
+
+// TestModNegativeIsTheInverseOfRelative pins the symmetry the two signs promise:
+// adding a duration and then taking the same one back leaves the entry exactly
+// as it was, whichever spelling is used. A longer subtraction than the entry's
+// original length is what TestModNegativeRefusesEmptyingTheEntry covers.
+func TestModNegativeIsTheInverseOfRelative(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+	entries := seedModDay(t, s)
+	last := entries[1] // 10:00-11:00 Code review
+
+	var buf bytes.Buffer
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 2, "+1:20", "", false); err != nil {
+		t.Fatalf("mod +1:20: %v", err)
+	}
+	buf.Reset()
+	if err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 2, "-1:20", "", false); err != nil {
+		t.Fatalf("mod -1:20: %v", err)
+	}
+
+	got := entryByID(t, s, last.ID)
+	if !got.Start.Equal(last.Start) || got.Stop == nil || !got.Stop.Equal(*last.Stop) {
+		t.Errorf("entry = %v-%v, want the original %v-%v", got.Start, got.Stop, last.Start, last.Stop)
+	}
+	if got.Duration != last.Duration {
+		t.Errorf("duration = %d, want the original %d", got.Duration, last.Duration)
+	}
+}
+
+// TestModNegativeRefusesEmptyingTheEntry covers the edge of the negative form:
+// an entry must keep some length, so taking off exactly its duration (which
+// would leave nothing) or more (which would turn it inside out) is refused and
+// nothing is written. `tg del` is how an entry is removed.
+func TestModNegativeRefusesEmptyingTheEntry(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		timesign string
+	}{
+		{name: "exactly the whole entry", timesign: "-1:00"},
+		{name: "a minute more than the entry", timesign: "-1:01"},
+		{name: "more than the entry", timesign: "-1:30"},
+		{name: "far more than the entry", timesign: "-23:59"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
+			entries := seedModDay(t, s)
+
+			var buf bytes.Buffer
+			err := cmdMod(env(&buf, s, nil, modNow, time.UTC), 2, tc.timesign, "", false)
+			if err == nil {
+				t.Fatalf("mod %q = nil error, want a refusal", tc.timesign)
+			}
+			for _, want := range []string{"must keep some length", "tg del"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("err = %v, want it to mention %q", err, want)
+				}
+			}
+			if buf.Len() != 0 {
+				t.Errorf("output = %q, want nothing written", buf.String())
+			}
+			got := entryByID(t, s, entries[1].ID)
+			if got.Dirty || got.Duration != 3600 || !got.Start.Equal(entries[1].Start) {
+				t.Errorf("entry = %+v, want the original 1h clean entry", got)
+			}
+		})
+	}
+}
+
+// TestModRelativeRefusesRunningEntry covers the one entry a signed timesign
+// cannot act on: a running entry has no end to move, so mod says so instead of
+// inventing one from now. An absolute sign still gives it a finished span.
 func TestModRelativeRefusesRunningEntry(t *testing.T) {
 	t.Parallel()
 	s := newStore(t)
@@ -1139,18 +1306,25 @@ func TestModRelativeRefusesRunningEntry(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	err = cmdMod(env(&buf, s, nil, modNow, time.UTC), 0, "+:30", "", false)
-	if err == nil {
-		t.Fatal("mod +:30 on a running entry = nil error, want a refusal")
-	}
-	if !strings.Contains(err.Error(), "running") {
-		t.Errorf("err = %v, want it to say the entry is still running", err)
-	}
-	if buf.Len() != 0 {
-		t.Errorf("output = %q, want nothing written", buf.String())
-	}
-	if got := entryByID(t, s, id); got.Stop != nil || got.Duration != -1 {
-		t.Errorf("entry = %+v, want it left running", got)
+	// Both signs move the END, so neither has anything to work with; the
+	// refusal names the direction that was asked for.
+	for timesign, verb := range map[string]string{"+:30": "extend", "-:30": "shorten"} {
+		buf.Reset()
+		err = cmdMod(env(&buf, s, nil, modNow, time.UTC), 0, timesign, "", false)
+		if err == nil {
+			t.Fatalf("mod %s on a running entry = nil error, want a refusal", timesign)
+		}
+		for _, want := range []string{"running", verb} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("mod %s: err = %v, want it to mention %q", timesign, err, want)
+			}
+		}
+		if buf.Len() != 0 {
+			t.Errorf("output = %q, want nothing written", buf.String())
+		}
+		if got := entryByID(t, s, id); got.Stop != nil || got.Duration != -1 {
+			t.Errorf("entry = %+v, want it left running", got)
+		}
 	}
 
 	// An absolute timesign is still accepted and closes the entry.
@@ -1501,6 +1675,11 @@ func TestModRefusals(t *testing.T) {
 			wantErr: []string{"no entry tracked today"},
 		},
 		{name: "zero-length relative timesign", seed: true, ref: 1, timesign: "+:00"},
+		{name: "zero-length negative timesign", seed: true, ref: 1, timesign: "-:00"},
+		{name: "negative timesign out of range", seed: true, ref: 1, timesign: "-1:99"},
+		// Not a duration shape, so it is not a negative sign at all and is
+		// reported as the malformed range it looks like.
+		{name: "negative-looking garbage", seed: true, ref: 1, timesign: "-1:2:3"},
 		{name: "reversed absolute timesign", seed: true, ref: 1, timesign: "10-9"},
 		{name: "unparsable timesign", seed: true, ref: 1, timesign: "nonsense"},
 	} {
@@ -1777,6 +1956,14 @@ func TestRunDispatchValidatesArgs(t *testing.T) {
 		{name: "del with zero", cmd: "del", args: []string{"0"}, wantErr: "invalid entry number"},
 		{name: "mod with two numbers", cmd: "mod", args: []string{"1", "2"}, wantErr: "unexpected second entry number"},
 		{name: "mod with two timesigns", cmd: "mod", args: []string{"+:30", "9-10"}, wantErr: "unexpected second timesign"},
+		// A negative timesign reaches the argument classifier instead of being
+		// reported as an undefined flag, which is what proves the pre-pass runs
+		// on the real command line (see splitNegativeTimesigns).
+		{name: "mod with two negative timesigns", cmd: "mod", args: []string{"-30", "-1:20"}, wantErr: "unexpected second timesign"},
+		{name: "mod with a negative and a positive timesign", cmd: "mod", args: []string{"-30", "+30"}, wantErr: "unexpected second timesign"},
+		// Not a duration shape, so it is not a negative timesign: it stays in
+		// the arguments and the flag package reports the typo.
+		{name: "mod with a negative-looking typo", cmd: "mod", args: []string{"-1:2:3"}, wantErr: "not defined"},
 		{
 			name: "update naming the project twice", cmd: "update",
 			args: []string{"-p", "backend", "payments"}, wantErr: "twice",
@@ -1817,8 +2004,12 @@ func TestParseModArgs(t *testing.T) {
 		{name: "number and timesign", args: []string{"2", "+:30"}, ref: 2, timesign: "+:30"},
 		{name: "reversed", args: []string{"+:30", "2"}, ref: 2, timesign: "+:30"},
 		{name: "absolute timesign", args: []string{"3", "9-10:30"}, ref: 3, timesign: "9-10:30"},
+		{name: "negative timesign only", args: []string{"-30"}, timesign: "-30"},
+		{name: "number and negative timesign", args: []string{"2", "-1:20"}, ref: 2, timesign: "-1:20"},
+		{name: "negative timesign reversed", args: []string{"-1:20", "2"}, ref: 2, timesign: "-1:20"},
 		{name: "two numbers", args: []string{"2", "3"}, wantErr: true},
 		{name: "two timesigns", args: []string{"+:30", "9-10"}, wantErr: true},
+		{name: "two signed timesigns", args: []string{"+:30", "-:30"}, wantErr: true},
 		{name: "zero is not a number", args: []string{"0"}, wantErr: true},
 	}
 	for _, tt := range tests {
@@ -1887,6 +2078,113 @@ func TestParseArgsAndFlags(t *testing.T) {
 				t.Errorf("descWasSet = %v, want %v", set, tt.wantSet)
 			}
 		})
+	}
+}
+
+// TestSplitNegativeTimesigns covers the pre-pass that lets `tg mod -30` be
+// written the obvious way: a negative timesign is a positional that begins with
+// "-", so it is peeled off before flag.Parse can call it an undefined flag.
+//
+// The cases that matter are the ones it must NOT take: the flags themselves, a
+// flag VALUE that happens to look like a timesign (`--desc -30`), and typos,
+// which stay in the arguments so the flag package still reports them.
+func TestSplitNegativeTimesigns(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name         string
+		args         []string
+		wantRest     []string
+		wantNegative []string
+	}{
+		{name: "empty"},
+		{name: "bare negative", args: []string{"-30"}, wantNegative: []string{"-30"}},
+		{name: "with hours", args: []string{"-1:20"}, wantNegative: []string{"-1:20"}},
+		{
+			name: "entry number and negative", args: []string{"2", "-1:20"},
+			wantRest: []string{"2"}, wantNegative: []string{"-1:20"},
+		},
+		{
+			name: "negative before the number", args: []string{"-10", "2"},
+			wantRest: []string{"2"}, wantNegative: []string{"-10"},
+		},
+		{
+			name: "negative and a description", args: []string{"-10", "--desc", "x"},
+			wantRest: []string{"--desc", "x"}, wantNegative: []string{"-10"},
+		},
+		{
+			// The description IS "-30": it is the flag's value, not a timesign.
+			name: "negative-looking flag value", args: []string{"--desc", "-30"},
+			wantRest: []string{"--desc", "-30"},
+		},
+		{
+			name: "negative-looking flag value with the alias", args: []string{"--description", "-30", "2"},
+			wantRest: []string{"--description", "-30", "2"},
+		},
+		{
+			name: "single-dash flag value", args: []string{"-desc", "-30"},
+			wantRest: []string{"-desc", "-30"},
+		},
+		{
+			// A joined value carries its own, so the next argument is free.
+			name: "joined flag value", args: []string{"--desc=x", "-30"},
+			wantRest: []string{"--desc=x"}, wantNegative: []string{"-30"},
+		},
+		{
+			name: "positive timesigns are untouched", args: []string{"2", "+30"},
+			wantRest: []string{"2", "+30"},
+		},
+		{
+			name: "absolute ranges are untouched", args: []string{"9-10:30"},
+			wantRest: []string{"9-10:30"},
+		},
+		{
+			// Left for the flag package to reject as the typo it is.
+			name: "unknown flag", args: []string{"-nope"}, wantRest: []string{"-nope"},
+		},
+		{
+			name: "two negatives are both kept", args: []string{"-10", "-20"},
+			wantNegative: []string{"-10", "-20"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fs := newFlagSet("mod")
+			fs.SetOutput(io.Discard)
+			// The real registration `tg mod` uses, so the value-taking flags
+			// this has to skip past cannot drift out of sync with it.
+			var desc string
+			bindDescFlag(fs, &desc, "new entry description")
+			rest, negative := splitNegativeTimesigns(fs, tc.args)
+			if strings.Join(rest, ",") != strings.Join(tc.wantRest, ",") {
+				t.Errorf("rest = %q, want %q", rest, tc.wantRest)
+			}
+			if strings.Join(negative, ",") != strings.Join(tc.wantNegative, ",") {
+				t.Errorf("negative = %q, want %q", negative, tc.wantNegative)
+			}
+		})
+	}
+}
+
+// TestSplitNegativeTimesignsSkipsOnlyValueFlags pins the rule the pre-pass
+// applies when it decides which argument is shielded by a flag: only a flag that
+// actually consumes the next argument. `tg mod` has no boolean flag today, so
+// one is declared here to keep the distinction covered for the day it gains one
+// — a negative timesign following a boolean flag is still a timesign.
+func TestSplitNegativeTimesignsSkipsOnlyValueFlags(t *testing.T) {
+	t.Parallel()
+	fs := newFlagSet("mod")
+	fs.SetOutput(io.Discard)
+	var desc string
+	bindDescFlag(fs, &desc, "new entry description")
+	var boolean bool
+	fs.BoolVar(&boolean, "flag", false, "a boolean flag, which takes no value")
+
+	rest, negative := splitNegativeTimesigns(fs, []string{"--flag", "-30"})
+	if strings.Join(rest, ",") != "--flag" {
+		t.Errorf("rest = %q, want just the boolean flag", rest)
+	}
+	if strings.Join(negative, ",") != "-30" {
+		t.Errorf("negative = %q, want the timesign after the boolean flag", negative)
 	}
 }
 
