@@ -88,12 +88,7 @@ func run(ctx context.Context, cmd string, args []string) error {
 
 func runAdd(ctx context.Context, args []string) error {
 	fs := newFlagSet("add")
-	// --desc and --description are aliases bound to the same variable, so
-	// either spelling sets the entry's description (empty leaves it blank).
-	var desc string
-	bindDescFlag(fs, &desc, "entry description")
-	var first bool
-	bindFirstFlag(fs, &first, "task or project")
+	f := bindAddFlags(fs)
 	// Flags may follow the timesign and the fragment (`tg add 9-10 login -1`),
 	// so positionals are peeled off the same way `tg mod` does it. None of the
 	// forms `add` accepts starts with "-" (an absolute one needs a digit
@@ -116,27 +111,33 @@ func runAdd(ctx context.Context, args []string) error {
 		return err
 	}
 	// The project-name form is resolved against the cached catalog, so it needs
-	// the store and happens inside withEnv.
+	// the store and happens inside withEnv. --date is resolved there too: it is
+	// judged against the invocation's pinned clock, like `pull`'s and `total`'s
+	// --since (see resolveDateFlag).
 	return withEnv(ctx, func(env *cmdEnv) error {
+		day, err := resolveDateFlag(f.date, env.now, env.loc)
+		if err != nil {
+			return err
+		}
 		pid, fragment := projectID, strings.Join(rest, " ")
 		if len(rest) == 2 {
-			resolved, err := resolveAddProject(env.ctx, env.st, rest[0], first)
+			resolved, err := resolveAddProject(env.ctx, env.st, rest[0], f.first)
 			if err != nil {
 				return err
 			}
 			pid, fragment = resolved, rest[1]
 		}
-		return cmdAdd(env, pid, first, timesign, fragment, desc)
+		return cmdAdd(env.on(day), pid, f.first, timesign, fragment, f.desc)
 	})
 }
 
 func runMod(ctx context.Context, args []string) error {
 	fs := newFlagSet("mod")
-	// Same --desc/--description alias pair as `add`; here an explicitly empty
-	// value clears the description, which is why the flag's presence is tracked
-	// separately (see descWasSet).
-	var desc string
-	bindDescFlag(fs, &desc, "new entry description")
+	// Registered before the pre-pass below, which has to know which of these
+	// flags consume the argument after them (see splitNegativeTimesigns): that
+	// is what keeps `tg mod --date 2026-08-25 -30` reading the date as the
+	// flag's value and the "-30" as the timesign.
+	f := bindModFlags(fs)
 	// A negative timesign ("-30") is a positional argument that looks exactly
 	// like an undefined flag, so it is peeled off before the flag package sees
 	// it and put back with the other positionals afterwards. parseModArgs takes
@@ -153,7 +154,11 @@ func runMod(ctx context.Context, args []string) error {
 		return err
 	}
 	return withEnv(ctx, func(env *cmdEnv) error {
-		return cmdMod(env, ref, timesign, desc, setDesc)
+		day, err := resolveDateFlag(f.date, env.now, env.loc)
+		if err != nil {
+			return err
+		}
+		return cmdMod(env.on(day), ref, timesign, f.desc, setDesc)
 	})
 }
 
@@ -420,7 +425,10 @@ func withEnvOut(ctx context.Context, w io.Writer, fn func(env *cmdEnv) error) er
 	}
 	defer st.Close()
 
-	env := &cmdEnv{ctx: ctx, w: w, st: st, now: time.Now(), loc: time.Local}
+	// The day a command works on starts out as now's; only `add`/`mod` move it,
+	// and only when --date says so (see cmdEnv.day and cmdEnv.on).
+	now := time.Now()
+	env := &cmdEnv{ctx: ctx, w: w, st: st, now: now, day: now, loc: time.Local}
 	if cfg != nil {
 		env.c = api.New(cfg.APIToken)
 		env.workspaceID = cfg.WorkspaceID
@@ -480,6 +488,110 @@ func bindFirstFlag(fs *flag.FlagSet, first *bool, subject string) {
 func bindDescFlag(fs *flag.FlagSet, desc *string, usage string) {
 	fs.StringVar(desc, "desc", "", usage)
 	fs.StringVar(desc, "description", "", usage+" (alias of --desc)")
+}
+
+// bindDateFlag binds --date, the day `add` and `mod` work on instead of today.
+// Both take it (and so spell it identically), since an entry booked for another
+// day has to be editable on that day too.
+//
+// The value is a calendar date in dateLayout (YYYY-MM-DD), the one date format
+// tg's interface uses; an empty value means "today". Only today or a later day
+// is accepted — see resolveDateFlag, which turns the value into the day and is
+// where a past date is refused.
+func bindDateFlag(fs *flag.FlagSet, date *string) {
+	fs.StringVar(date, "date", "",
+		"the day the entry belongs to (YYYY-MM-DD); today or later, default today")
+}
+
+// resolveDateFlag turns `add`'s and `mod`'s --date value into the instant the
+// command reckons its calendar day by (see cmdEnv.day):
+//
+//   - absent, or naming now's own day: now itself, so the ordinary case is
+//     bit-for-bit the behavior tg had before the flag existed;
+//   - naming a later day: the LAST second of that day, so every entry already
+//     booked on it counts as "already started" — which is what lets `tg add`
+//     continue from it with a bare duration and `tg mod` address it at all
+//     (see store.LastEntry and store.EntryByNum).
+//
+// A PAST day is refused rather than accepted: tg only ever writes the day it is
+// tracking (store.CheckEditableDay enforces the same rule on every edit), so
+// letting --date name yesterday would only produce a refusal one layer down —
+// or, for `add`, an entry no `tg mod` could ever touch again.
+//
+// The comparison is by calendar day in loc, not by instant: at 23:30 local,
+// tomorrow's date is still the future even though it is already "today"
+// somewhere else, and the day tg would file the entry under is the local one.
+func resolveDateFlag(value string, now time.Time, loc *time.Location) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return now, nil
+	}
+	parsed, err := time.ParseInLocation(dateLayout, value, loc)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid --date %q (want YYYY-MM-DD): %w", value, err)
+	}
+	// Both sides are day-aligned in loc, so this compares calendar days even
+	// though the operands are instants.
+	day, today := startOfDay(parsed, loc), startOfDay(now, loc)
+	if day.Before(today) {
+		return time.Time{}, fmt.Errorf(
+			"--date %s is in the past (today is %s): only today or a later day can be given, since tg never rewrites a day that is over",
+			day.Format(dateLayout), today.Format(dateLayout))
+	}
+	if day.Equal(today) {
+		return now, nil
+	}
+	return endOfDay(day, loc), nil
+}
+
+// addFlags holds `tg add`'s flag values; see updateFlags for why registration is
+// a function of its own. The timesign and the task fragment are positional and
+// stay out of here.
+type addFlags struct {
+	// desc is the entry's description (--desc/--description), empty when
+	// absent, which leaves the description blank.
+	desc string
+	// first takes the first candidate of an ambiguous fragment (-1/--first).
+	first bool
+	// date is the day the entry belongs to (--date DATE), empty for today;
+	// see resolveDateFlag.
+	date string
+}
+
+func bindAddFlags(fs *flag.FlagSet) *addFlags {
+	f := &addFlags{}
+	// --desc and --description are aliases bound to the same variable, so
+	// either spelling sets the entry's description (empty leaves it blank).
+	bindDescFlag(fs, &f.desc, "entry description")
+	bindFirstFlag(fs, &f.first, "task or project")
+	bindDateFlag(fs, &f.date)
+	return f
+}
+
+// modFlags holds `tg mod`'s flag values; see updateFlags for why registration is
+// a function of its own. The entry number and the timesign are positional (in
+// either order, see parseModArgs) and stay out of here.
+//
+// There is deliberately no -1/--first flag: `tg mod -1` is a negative timesign
+// taking one minute off the entry (see splitNegativeTimesigns).
+type modFlags struct {
+	// desc is the entry's new description (--desc/--description). An
+	// explicitly empty value CLEARS it, so whether the flag appeared at all is
+	// a separate question (see descWasSet).
+	desc string
+	// date is the day whose entry is edited (--date DATE), empty for today;
+	// see resolveDateFlag.
+	date string
+}
+
+func bindModFlags(fs *flag.FlagSet) *modFlags {
+	f := &modFlags{}
+	// Same --desc/--description alias pair as `add`; here an explicitly empty
+	// value clears the description, which is why the flag's presence is tracked
+	// separately (see descWasSet).
+	bindDescFlag(fs, &f.desc, "new entry description")
+	bindDateFlag(fs, &f.date)
+	return f
 }
 
 // descWasSet reports whether either spelling of the description flag actually
@@ -829,9 +941,10 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "commands:")
 	fmt.Fprintln(w, "  auth [token]              verify a Toggl API token and store config")
-	fmt.Fprintln(w, "  add <timesign> [project] <task>  add a finished entry [--desc TEXT] [-1]")
+	fmt.Fprintln(w, "  add <timesign> [project] <task>  add a finished entry")
+	fmt.Fprintln(w, "                            [--desc TEXT] [--date DATE] [-1]")
 	fmt.Fprintln(w, "  mod [num] [timesign]      retime/rename an entry (default: last), e.g.")
-	fmt.Fprintln(w, "                            +30 / -30 minutes                  [--desc TEXT]")
+	fmt.Fprintln(w, "                            +30 / -30 minutes  [--desc TEXT] [--date DATE]")
 	fmt.Fprintln(w, "  del <num>                 delete the entry numbered by `tg ls`")
 	fmt.Fprintln(w, "  current | status          last entry, gap, day total        [--json]")
 	fmt.Fprintln(w, "  today   | list | ls       show today's entries     [--days N] [--json]")
@@ -864,6 +977,12 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "      30m back (never past the start; use `tg del` to remove an")
 	fmt.Fprintln(w, "      entry). Unlike other timesigns, a number without `:` is")
 	fmt.Fprintln(w, "      minutes for `mod`.")
+	fmt.Fprintln(w, "date: `add` and `mod` work on today; `--date YYYY-MM-DD` moves them to")
+	fmt.Fprintln(w, "      another day, which must be today or later (a day that is over")
+	fmt.Fprintln(w, "      is history and is refused). On a moved day the entry numbers,")
+	fmt.Fprintln(w, "      the \"last entry\" and an absolute timesign are all that day's;")
+	fmt.Fprintln(w, "      a relative timesign has no `now` there, so `add` refuses one")
+	fmt.Fprintln(w, "      (`mod` still takes +30/-30, which only move an end).")
 	fmt.Fprintln(w, "-1:   `add`/`grep`/`total`/`update`/`pull` match tasks and projects by")
 	fmt.Fprintln(w, "      name fragment; a fragment matching several of them normally")
 	fmt.Fprintln(w, "      fails with the candidates listed. `-1` (alias `--first`) takes")

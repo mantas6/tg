@@ -71,6 +71,19 @@ func overlapLabel(e store.Entry, loc *time.Location) string {
 	return rng
 }
 
+// dayNote names the calendar day a changed entry sits on (" on 2026-08-25")
+// when that is not now's day in loc, and nothing at all when it is. It is the
+// suffix the one-line confirmations of `add`, `mod` and `del` carry: their
+// wall-clock times alone stopped identifying an entry once `--date` let one live
+// on another day, while the ordinary case — an entry on today — stays as terse
+// as it was.
+func dayNote(start, now time.Time, loc *time.Location) string {
+	if sameDay(start, now, loc) {
+		return ""
+	}
+	return " on " + start.In(loc).Format(dateLayout)
+}
+
 // renderEntryChange writes the one-line confirmation for a command that changed
 // exactly one entry (`mod`, `del`), mirroring `add`'s "Added: ..." shape:
 //
@@ -79,18 +92,23 @@ func overlapLabel(e store.Entry, loc *time.Location) string {
 // verb is the past-tense action ("Modified", "Deleted"). A running entry has no
 // stop, so its range reads "HH:MM-running" and no duration is shown (the stored
 // duration is the -1 running marker, not a length).
-func renderEntryChange(w io.Writer, verb string, e store.Entry, loc *time.Location) {
+//
+// now is the real clock, only so an entry that is not on today's day says which
+// day it is on (see dayNote); it never changes what is rendered for an entry on
+// today.
+func renderEntryChange(w io.Writer, verb string, e store.Entry, now time.Time, loc *time.Location) {
 	label := entryLabel(e)
 	if e.ProjectName != "" {
 		label += " [" + e.ProjectName + "]"
 	}
+	day := dayNote(e.Start, now, loc)
 	if e.Stop == nil {
-		fmt.Fprintf(w, "%s: %s  %s-running\n", verb, label, formatClock(e.Start, loc))
+		fmt.Fprintf(w, "%s: %s  %s-running%s\n", verb, label, formatClock(e.Start, loc), day)
 		return
 	}
-	fmt.Fprintf(w, "%s: %s  %s-%s (%s)\n", verb, label,
+	fmt.Fprintf(w, "%s: %s  %s-%s (%s)%s\n", verb, label,
 		formatClock(e.Start, loc), formatClock(*e.Stop, loc),
-		formatHM(time.Duration(e.Duration)*time.Second))
+		formatHM(time.Duration(e.Duration)*time.Second), day)
 }
 
 // statusNameMax caps the task name shown by `status`/`current` so the terse

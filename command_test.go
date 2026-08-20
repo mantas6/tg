@@ -35,11 +35,29 @@ const testWorkspaceID = 1
 // env builds the cmdEnv the cmd* functions take. A nil client is the offline
 // case (no credentials, or none needed): the local edit still applies and stays
 // dirty for a later push, and nothing is sent (see cmdEnv.offline).
+//
+// The day the command works on starts out as now's, exactly as withEnv builds
+// it: that is the ordinary invocation, with no --date. The tests that pass one
+// move the env with `.on(...)` (see dayAnchor), which is what runAdd/runMod do.
 func env(w io.Writer, s *store.Store, c *api.Client, now time.Time, loc *time.Location) *cmdEnv {
 	return &cmdEnv{
 		ctx: ctx, w: w, st: s, c: c,
-		workspaceID: testWorkspaceID, now: now, loc: loc,
+		workspaceID: testWorkspaceID, now: now, day: now, loc: loc,
 	}
+}
+
+// dayAnchor is the instant `--date DATE` resolves to for the tests that move a
+// command to another day: the last second of that day in loc, the same anchor
+// resolveDateFlag hands the command (see cmdEnv.day). It is built through
+// resolveDateFlag itself rather than by hand, so a test cannot go on passing
+// against an anchor the flag would never produce.
+func dayAnchor(t *testing.T, date string, now time.Time, loc *time.Location) time.Time {
+	t.Helper()
+	anchor, err := resolveDateFlag(date, now, loc)
+	if err != nil {
+		t.Fatalf("resolveDateFlag(%q): %v", date, err)
+	}
+	return anchor
 }
 
 // localEnv is env for the commands that only read the local catalog (tasks,
@@ -679,6 +697,226 @@ func TestAddDurationRejectsOverlap(t *testing.T) {
 	}
 	if out := buf.String(); !strings.Contains(out, "10:00-11:00") {
 		t.Errorf("output = %q, want 10:00-11:00", out)
+	}
+}
+
+// TestAddOnAnotherDay covers `tg add --date`: an absolute timesign is resolved
+// on the day the flag names rather than on today's, the entry is stored there
+// (numbered from 1, since the day has its own numbering) and the confirmation
+// line says which day it landed on — the clock times alone would be ambiguous.
+// Everything else about the entry is unchanged: it is dirty for a push and
+// stamped with the real clock, not with the day it was filed under.
+func TestAddOnAnotherDay(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	// It is 15:00 on 2026-01-02; the entry belongs to the 5th.
+	anchor := dayAnchor(t, "2026-01-05", addNow, time.UTC)
+	var buf bytes.Buffer
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC).on(anchor), nil, false, "9-:30", "login", ""); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	for _, want := range []string{"Added: Fix login bug", "09:00-09:30", "0h30m", "on 2026-01-05"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("output = %q, want it to contain %q", buf.String(), want)
+		}
+	}
+
+	// Nothing landed on today.
+	if got := mustEntries(t, s, startOfDay(addNow, time.UTC), startOfDay(addNow, time.UTC).AddDate(0, 0, 1)); len(got) != 0 {
+		t.Errorf("today's entries = %d, want 0 (the entry belongs to the 5th)", len(got))
+	}
+	day := time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC)
+	entries := mustEntries(t, s, day, day.AddDate(0, 0, 1))
+	if len(entries) != 1 {
+		t.Fatalf("entries on 2026-01-05 = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	wantStart := time.Date(2026, 1, 5, 9, 0, 0, 0, time.UTC)
+	wantStop := time.Date(2026, 1, 5, 9, 30, 0, 0, time.UTC)
+	if !e.Start.Equal(wantStart) || e.Stop == nil || !e.Stop.Equal(wantStop) {
+		t.Errorf("span = %v-%v, want %v-%v", e.Start, e.Stop, wantStart, wantStop)
+	}
+	if e.Duration != 1800 {
+		t.Errorf("duration = %d, want 1800", e.Duration)
+	}
+	if e.Seq != 1 {
+		t.Errorf("seq = %d, want 1 (the moved day numbers from 1)", e.Seq)
+	}
+	if !e.Dirty {
+		t.Error("an entry added on another day should still be dirty for a push")
+	}
+	// The last-writer-wins clock is the real one, not the day named.
+	if !e.UpdatedAt.Equal(addNow) {
+		t.Errorf("updated_at = %v, want the real clock %v", e.UpdatedAt, addNow)
+	}
+}
+
+// TestAddOnAnotherDayAnchorsDurationThere pins which day a bare duration
+// continues from once --date moved the command: that day's last entry, never
+// today's. Today has entries and the moved day does not, so the anchor is
+// missing there — the refusal (naming the day, and offering only the forms that
+// work on it) is what proves today's 14:00-15:00 block was not reached for.
+func TestAddOnAnotherDayAnchorsDurationThere(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	// Tracked today: 14:00-15:00.
+	if err := cmdAdd(env(&bytes.Buffer{}, s, nil, addNow, time.UTC), nil, false, "14-15", "login", ""); err != nil {
+		t.Fatalf("seed today: %v", err)
+	}
+
+	anchor := dayAnchor(t, "2026-01-05", addNow, time.UTC)
+	var buf bytes.Buffer
+	err := cmdAdd(env(&buf, s, nil, addNow, time.UTC).on(anchor), nil, false, ":30", "review", "")
+	if err == nil {
+		t.Fatal("bare duration on an empty day = nil error, want a refusal")
+	}
+	for _, want := range []string{"no entry tracked on 2026-01-05", "9-:30"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to mention %q", err, want)
+		}
+	}
+	// The relative form cannot be used there, so it is not offered either.
+	if strings.Contains(err.Error(), "+1:30") {
+		t.Errorf("err = %v, should not offer a relative timesign on a moved day", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("output = %q, want nothing written", buf.String())
+	}
+
+	// With a block on that day, the duration chains off ITS end (10:00), not
+	// off today's 15:00.
+	buf.Reset()
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC).on(anchor), nil, false, "9-10", "login", ""); err != nil {
+		t.Fatalf("add anchor on the 5th: %v", err)
+	}
+	buf.Reset()
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC).on(anchor), nil, false, ":30", "review", ""); err != nil {
+		t.Fatalf("add duration on the 5th: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "10:00-10:30") || !strings.Contains(out, "on 2026-01-05") {
+		t.Errorf("output = %q, want 10:00-10:30 on 2026-01-05", out)
+	}
+	day := time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC)
+	entries := mustEntries(t, s, day, day.AddDate(0, 0, 1))
+	if len(entries) != 2 {
+		t.Fatalf("entries on 2026-01-05 = %d, want 2", len(entries))
+	}
+	wantStart := time.Date(2026, 1, 5, 10, 0, 0, 0, time.UTC)
+	if !entries[1].Start.Equal(wantStart) {
+		t.Errorf("start = %v, want %v (that day's last entry's end)", entries[1].Start, wantStart)
+	}
+}
+
+// TestAddOnAnotherDayRefusesRelativeTimesign pins the one timesign --date
+// cannot take: a relative one counts back from the current 5-minute mark, which
+// exists only today, so pinning it to some hour of another day would record a
+// span the user never named. The refusal names the day and the forms that do
+// work, and nothing is written.
+func TestAddOnAnotherDayRefusesRelativeTimesign(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	anchor := dayAnchor(t, "2026-01-05", addNow, time.UTC)
+	for _, timesign := range []string{"+:20", "+1:30", "+2"} {
+		var buf bytes.Buffer
+		err := cmdAdd(env(&buf, s, nil, addNow, time.UTC).on(anchor), nil, false, timesign, "login", "")
+		if err == nil {
+			t.Fatalf("add --date %q = nil error, want a refusal", timesign)
+		}
+		for _, want := range []string{"relative timesign", "on 2026-01-05", "9-:30", "1:30"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("add %q err = %v, want it to mention %q", timesign, err, want)
+			}
+		}
+		if buf.Len() != 0 {
+			t.Errorf("output = %q, want nothing written", buf.String())
+		}
+	}
+	// A --date naming TODAY moves nothing, so the same timesign still works.
+	var buf bytes.Buffer
+	today := dayAnchor(t, "2026-01-02", addNow, time.UTC)
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC).on(today), nil, false, "+:20", "login", ""); err != nil {
+		t.Fatalf("add --date today: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "14:40-15:00") || strings.Contains(out, " on ") {
+		t.Errorf("output = %q, want 14:40-15:00 with no day note", out)
+	}
+}
+
+// TestAddOnAnotherDayOverlapGuard keeps the exclusivity rule on the moved day:
+// entries there are checked against each other, while an entry at the same
+// clock time today is no conflict at all — they are different days.
+func TestAddOnAnotherDayOverlapGuard(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	anchor := dayAnchor(t, "2026-01-05", addNow, time.UTC)
+	if err := cmdAdd(env(&bytes.Buffer{}, s, nil, addNow, time.UTC), nil, false, "9-10", "login", ""); err != nil {
+		t.Fatalf("seed today: %v", err)
+	}
+	// Same clock times, another day: accepted.
+	if err := cmdAdd(env(&bytes.Buffer{}, s, nil, addNow, time.UTC).on(anchor), nil, false, "9-10", "login", ""); err != nil {
+		t.Fatalf("add 9-10 on the 5th: %v", err)
+	}
+	// Overlapping something on that day: refused.
+	var buf bytes.Buffer
+	err := cmdAdd(env(&buf, s, nil, addNow, time.UTC).on(anchor), nil, false, "9:30-10:30", "review", "")
+	if err == nil {
+		t.Fatal("overlapping add on the moved day = nil error, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "overlaps existing entry") {
+		t.Errorf("err = %v, want an overlap refusal", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("output = %q, want nothing written", buf.String())
+	}
+}
+
+// TestAddOnAnotherDayAcrossDST puts a moved day on a 23-hour one: Vilnius jumps
+// 03:00 -> 04:00 on 2026-03-29, so the day's anchor must still sit inside that
+// day (a "midnight + 24h" anchor would land at 01:00 on the 30th and file the
+// entry, and its numbering, under the wrong day).
+func TestAddOnAnotherDayAcrossDST(t *testing.T) {
+	t.Parallel()
+	loc := dstLoc(t)
+	s := newStoreIn(t, loc)
+	seedCatalog(t, s)
+
+	now := time.Date(2026, 3, 27, 12, 0, 0, 0, loc)
+	anchor := dayAnchor(t, "2026-03-29", now, loc)
+	wantAnchor := time.Date(2026, 3, 29, 23, 59, 59, 0, loc)
+	if !anchor.Equal(wantAnchor) {
+		t.Fatalf("anchor = %v, want %v (inside the 23-hour day)", anchor, wantAnchor)
+	}
+
+	var buf bytes.Buffer
+	if err := cmdAdd(env(&buf, s, nil, now, loc).on(anchor), nil, false, "9-10", "login", ""); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if !strings.Contains(buf.String(), "on 2026-03-29") {
+		t.Errorf("output = %q, want it to name 2026-03-29", buf.String())
+	}
+	day := time.Date(2026, 3, 29, 0, 0, 0, 0, loc)
+	entries := mustEntries(t, s, day, day.AddDate(0, 0, 1))
+	if len(entries) != 1 {
+		t.Fatalf("entries on the transition day = %d, want 1", len(entries))
+	}
+	if y, m, d := entries[0].Start.In(loc).Date(); y != 2026 || m != time.March || d != 29 {
+		t.Errorf("start = %v, want it on 2026-03-29 in %v", entries[0].Start, loc)
+	}
+	// A bare duration still continues from that day's own last entry.
+	buf.Reset()
+	if err := cmdAdd(env(&buf, s, nil, now, loc).on(anchor), nil, false, ":30", "review", ""); err != nil {
+		t.Fatalf("add duration: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "10:00-10:30") {
+		t.Errorf("output = %q, want 10:00-10:30", out)
 	}
 }
 
@@ -1524,6 +1762,135 @@ func TestModAllowsTodaysEntryAtDayEnd(t *testing.T) {
 	}
 }
 
+// seedFutureDay books two back-to-back entries (09:00-10:00, 10:00-11:00) on
+// the day `--date` names, through `tg add` itself: that is the only way entries
+// land on a later day, and it is also what numbers them 1 and 2 there. It
+// returns the day's anchor and the entries as stored.
+func seedFutureDay(t *testing.T, s *store.Store, date string, now time.Time, loc *time.Location) (time.Time, []store.Entry) {
+	t.Helper()
+	anchor := dayAnchor(t, date, now, loc)
+	for _, timesign := range []string{"9-10", "10-11"} {
+		if err := cmdAdd(env(io.Discard, s, nil, now, loc).on(anchor), nil, false, timesign, "login", ""); err != nil {
+			t.Fatalf("seed %s on %s: %v", timesign, date, err)
+		}
+	}
+	day := startOfDay(anchor, loc)
+	entries := mustEntries(t, s, day, day.AddDate(0, 0, 1))
+	if len(entries) != 2 {
+		t.Fatalf("fixture has %d entries on %s, want 2", len(entries), date)
+	}
+	for i, e := range entries {
+		if e.Seq != i+1 {
+			t.Fatalf("fixture entry %d on %s has seq %d, want %d", i, date, e.Seq, i+1)
+		}
+	}
+	return anchor, entries
+}
+
+// TestModOnAnotherDay covers `tg mod --date`: the entry numbers and the "last
+// entry" are the named day's, an absolute timesign is resolved on that day (it
+// never drags the entry onto today), and a signed one moves its end there. The
+// confirmation names the day, and the entry is left dirty for a push like any
+// other edit.
+func TestModOnAnotherDay(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+	anchor, entries := seedFutureDay(t, s, "2026-01-05", addNow, time.UTC)
+
+	// No number: the last entry of THAT day (10:00-11:00), not of today.
+	var buf bytes.Buffer
+	if err := cmdMod(env(&buf, s, nil, addNow, time.UTC).on(anchor), 0, "+:30", "", false); err != nil {
+		t.Fatalf("mod: %v", err)
+	}
+	for _, want := range []string{"Modified: Fix login bug", "10:00-11:30", "1h30m", "on 2026-01-05"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("output = %q, want it to contain %q", buf.String(), want)
+		}
+	}
+	got := entryByID(t, s, entries[1].ID)
+	if got.Duration != 5400 {
+		t.Errorf("duration = %d, want 5400", got.Duration)
+	}
+	if !got.Dirty {
+		t.Error("a mod on another day should still mark the entry dirty")
+	}
+	if !got.UpdatedAt.Equal(addNow) {
+		t.Errorf("updated_at = %v, want the real clock %v", got.UpdatedAt, addNow)
+	}
+
+	// By number, resolved on that day's own numbering, with an absolute
+	// timesign: it lands on the entry's day, not on today's.
+	buf.Reset()
+	if err := cmdMod(env(&buf, s, nil, addNow, time.UTC).on(anchor), 1, "8-8:30", "", false); err != nil {
+		t.Fatalf("mod 1: %v", err)
+	}
+	got = entryByID(t, s, entries[0].ID)
+	wantStart := time.Date(2026, 1, 5, 8, 0, 0, 0, time.UTC)
+	wantStop := time.Date(2026, 1, 5, 8, 30, 0, 0, time.UTC)
+	if !got.Start.Equal(wantStart) || got.Stop == nil || !got.Stop.Equal(wantStop) {
+		t.Errorf("span = %v-%v, want %v-%v", got.Start, got.Stop, wantStart, wantStop)
+	}
+	if got.Seq != 1 {
+		t.Errorf("seq = %d, want it still 1 on its own day", got.Seq)
+	}
+}
+
+// TestModOnAnotherDayScopesTheDay pins the flip side: without --date the same
+// entries are unreachable, since numbers and the last entry are today's. The
+// refusals name the day they searched, and nothing is written either way.
+func TestModOnAnotherDayScopesTheDay(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+	_, entries := seedFutureDay(t, s, "2026-01-05", addNow, time.UTC)
+
+	// Today: nothing tracked, so a bare mod has no subject...
+	var buf bytes.Buffer
+	err := cmdMod(env(&buf, s, nil, addNow, time.UTC), 0, "+:30", "", false)
+	if err == nil || !strings.Contains(err.Error(), "no entry tracked today to modify") {
+		t.Fatalf("err = %v, want the today-only refusal", err)
+	}
+	// ...and the 5th's numbers are not today's numbers.
+	buf.Reset()
+	err = cmdMod(env(&buf, s, nil, addNow, time.UTC), 1, "+:30", "", false)
+	if !errors.Is(err, store.ErrNoEntryNum) {
+		t.Fatalf("err = %v, want store.ErrNoEntryNum", err)
+	}
+	if !strings.Contains(err.Error(), "2026-01-02") {
+		t.Errorf("err = %v, want it to name the day it searched", err)
+	}
+	// A number that day never handed out is still a miss with --date.
+	buf.Reset()
+	anchor := dayAnchor(t, "2026-01-05", addNow, time.UTC)
+	err = cmdMod(env(&buf, s, nil, addNow, time.UTC).on(anchor), 7, "+:30", "", false)
+	if !errors.Is(err, store.ErrNoEntryNum) {
+		t.Fatalf("err = %v, want store.ErrNoEntryNum", err)
+	}
+	if !strings.Contains(err.Error(), "2026-01-05") {
+		t.Errorf("err = %v, want it to name the moved day", err)
+	}
+	// A day with nothing on it reports so by name.
+	buf.Reset()
+	empty := dayAnchor(t, "2026-01-09", addNow, time.UTC)
+	err = cmdMod(env(&buf, s, nil, addNow, time.UTC).on(empty), 0, "+:30", "", false)
+	if err == nil || !strings.Contains(err.Error(), "no entry tracked on 2026-01-09 to modify") {
+		t.Fatalf("err = %v, want the refusal to name 2026-01-09", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("output = %q, want nothing written", buf.String())
+	}
+	// The fixture entries were created by `tg add`, so they are already dirty;
+	// what a refused mod must not do is change them.
+	for i, e := range entries {
+		got := entryByID(t, s, e.ID)
+		if !got.Start.Equal(e.Start) || got.Duration != e.Duration {
+			t.Errorf("entry %d = %v (%ds), want it unchanged at %v (%ds)",
+				i+1, got.Start, got.Duration, e.Start, e.Duration)
+		}
+	}
+}
+
 // TestModDescriptionOnly verifies --desc alone is a valid change and leaves the
 // times exactly as they were.
 func TestModDescriptionOnly(t *testing.T) {
@@ -2112,6 +2479,20 @@ func TestSplitNegativeTimesigns(t *testing.T) {
 			wantRest: []string{"--desc", "x"}, wantNegative: []string{"-10"},
 		},
 		{
+			name: "negative and a date", args: []string{"--date", "2026-01-05", "-30"},
+			wantRest: []string{"--date", "2026-01-05"}, wantNegative: []string{"-30"},
+		},
+		{
+			name: "negative before the date", args: []string{"-30", "--date", "2026-01-05"},
+			wantRest: []string{"--date", "2026-01-05"}, wantNegative: []string{"-30"},
+		},
+		{
+			// The date IS "-30": it is the flag's value (and a bad one, which
+			// resolveDateFlag reports), not a timesign.
+			name: "negative-looking date value", args: []string{"--date", "-30"},
+			wantRest: []string{"--date", "-30"},
+		},
+		{
 			// The description IS "-30": it is the flag's value, not a timesign.
 			name: "negative-looking flag value", args: []string{"--desc", "-30"},
 			wantRest: []string{"--desc", "-30"},
@@ -2152,8 +2533,7 @@ func TestSplitNegativeTimesigns(t *testing.T) {
 			fs.SetOutput(io.Discard)
 			// The real registration `tg mod` uses, so the value-taking flags
 			// this has to skip past cannot drift out of sync with it.
-			var desc string
-			bindDescFlag(fs, &desc, "new entry description")
+			bindModFlags(fs)
 			rest, negative := splitNegativeTimesigns(fs, tc.args)
 			if strings.Join(rest, ",") != strings.Join(tc.wantRest, ",") {
 				t.Errorf("rest = %q, want %q", rest, tc.wantRest)
@@ -2174,8 +2554,7 @@ func TestSplitNegativeTimesignsSkipsOnlyValueFlags(t *testing.T) {
 	t.Parallel()
 	fs := newFlagSet("mod")
 	fs.SetOutput(io.Discard)
-	var desc string
-	bindDescFlag(fs, &desc, "new entry description")
+	bindModFlags(fs)
 	var boolean bool
 	fs.BoolVar(&boolean, "flag", false, "a boolean flag, which takes no value")
 
@@ -2235,6 +2614,303 @@ func TestFirstFlagParsing(t *testing.T) {
 		if strings.Join(pos, ",") != strings.Join(tc.wantPos, ",") {
 			t.Errorf("parse %q: positional = %q, want %q", tc.args, pos, tc.wantPos)
 		}
+	}
+}
+
+// TestAddFlagRegistration pins runAdd's flag wiring, through the same
+// bindAddFlags the command uses (see TestUpdateFlagRegistration for why the test
+// does not declare its own): --desc/--description are aliases sharing one
+// variable, -1/--first is the shared ambiguity flag, --date takes the day the
+// entry belongs to, and (through parseArgsAndFlags) any of them may sit before,
+// between or after the positional timesign and task fragment.
+func TestAddFlagRegistration(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		args      []string
+		wantPos   []string
+		wantDesc  string
+		wantFirst bool
+		wantDate  string
+		wantErr   string
+	}{
+		{args: nil},
+		{args: []string{"9-10", "login"}, wantPos: []string{"9-10", "login"}},
+		{
+			args:    []string{"9-10", "login", "--date", "2026-01-05"},
+			wantPos: []string{"9-10", "login"}, wantDate: "2026-01-05",
+		},
+		{
+			args:    []string{"--date", "2026-01-05", "9-10", "login"},
+			wantPos: []string{"9-10", "login"}, wantDate: "2026-01-05",
+		},
+		{
+			args:    []string{"9-10", "--date=2026-01-05", "code", "review"},
+			wantPos: []string{"9-10", "code", "review"}, wantDate: "2026-01-05",
+		},
+		{
+			// Everything at once, in the least tidy order a shell allows.
+			args:     []string{"9-10", "--date", "2026-01-05", "code", "-1", "review", "--desc", "pairing"},
+			wantPos:  []string{"9-10", "code", "review"},
+			wantDesc: "pairing", wantFirst: true, wantDate: "2026-01-05",
+		},
+		{
+			args:    []string{"9-10", "login", "--description", "x"},
+			wantPos: []string{"9-10", "login"}, wantDesc: "x",
+		},
+		// A date is not validated here, only collected: resolveDateFlag is what
+		// judges it (see TestResolveDateFlag).
+		{args: []string{"9-10", "login", "--date", "nope"}, wantPos: []string{"9-10", "login"}, wantDate: "nope"},
+		{args: []string{"9-10", "login", "--date"}, wantErr: "needs an argument"},
+		{args: []string{"--nope"}, wantErr: "not defined"},
+	} {
+		t.Run(fmt.Sprint(tc.args), func(t *testing.T) {
+			t.Parallel()
+			fs := flag.NewFlagSet("add", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			f := bindAddFlags(fs)
+
+			rest, err := parseArgsAndFlags(fs, tc.args)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("parse %v: err = %v, want it to contain %q", tc.args, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parse %v: %v", tc.args, err)
+			}
+			if strings.Join(rest, ",") != strings.Join(tc.wantPos, ",") {
+				t.Errorf("positional = %q, want %q", rest, tc.wantPos)
+			}
+			if f.desc != tc.wantDesc {
+				t.Errorf("desc = %q, want %q", f.desc, tc.wantDesc)
+			}
+			if f.first != tc.wantFirst {
+				t.Errorf("first = %v, want %v", f.first, tc.wantFirst)
+			}
+			if f.date != tc.wantDate {
+				t.Errorf("date = %q, want %q", f.date, tc.wantDate)
+			}
+		})
+	}
+}
+
+// TestModFlagRegistration pins runMod's whole argument pipeline, in the order
+// the command runs it: bindModFlags, then the negative-timesign pre-pass, then
+// flag parsing, then parseModArgs. That order is what the interesting cases are
+// about — a --date value is never mistaken for a negative timesign, and a
+// negative timesign next to the flag is never mistaken for its value — so they
+// are checked through the pipeline rather than against its pieces.
+func TestModFlagRegistration(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		args         []string
+		wantRef      int
+		wantTimesign string
+		wantDesc     string
+		wantDate     string
+		wantErr      string
+	}{
+		{args: nil},
+		{args: []string{"2", "+:30"}, wantRef: 2, wantTimesign: "+:30"},
+		{
+			args:    []string{"--date", "2026-01-05", "2", "+:30"},
+			wantRef: 2, wantTimesign: "+:30", wantDate: "2026-01-05",
+		},
+		{
+			args:    []string{"2", "+:30", "--date", "2026-01-05"},
+			wantRef: 2, wantTimesign: "+:30", wantDate: "2026-01-05",
+		},
+		{
+			// The date's value is a date; the "-30" after it is the timesign.
+			args:         []string{"--date", "2026-01-05", "-30"},
+			wantTimesign: "-30", wantDate: "2026-01-05",
+		},
+		{
+			args:         []string{"-30", "--date", "2026-01-05"},
+			wantTimesign: "-30", wantDate: "2026-01-05",
+		},
+		{
+			args:    []string{"2", "-1:20", "--date=2026-01-05", "--desc", "x"},
+			wantRef: 2, wantTimesign: "-1:20", wantDate: "2026-01-05", wantDesc: "x",
+		},
+		{
+			// Here "-30" IS the date's value (a bad one, refused later), so it
+			// is not also a timesign.
+			args: []string{"--date", "-30"}, wantDate: "-30",
+		},
+		{
+			// ...and the same holds for the description.
+			args:     []string{"--desc", "-30", "--date", "2026-01-05"},
+			wantDesc: "-30", wantDate: "2026-01-05",
+		},
+		{args: []string{"--date", "2026-01-05", "-30", "-20"}, wantErr: "unexpected second timesign"},
+		{args: []string{"--nope"}, wantErr: "not defined"},
+	} {
+		t.Run(fmt.Sprint(tc.args), func(t *testing.T) {
+			t.Parallel()
+			fs := flag.NewFlagSet("mod", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			f := bindModFlags(fs)
+
+			args, negative := splitNegativeTimesigns(fs, tc.args)
+			rest, err := parseArgsAndFlags(fs, args)
+			if err == nil {
+				var ref int
+				var timesign string
+				ref, timesign, err = parseModArgs(append(rest, negative...))
+				if err == nil {
+					if ref != tc.wantRef || timesign != tc.wantTimesign {
+						t.Errorf("(ref, timesign) = (%d, %q), want (%d, %q)",
+							ref, timesign, tc.wantRef, tc.wantTimesign)
+					}
+				}
+			}
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("parse %v: err = %v, want it to contain %q", tc.args, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parse %v: %v", tc.args, err)
+			}
+			if f.desc != tc.wantDesc {
+				t.Errorf("desc = %q, want %q", f.desc, tc.wantDesc)
+			}
+			if f.date != tc.wantDate {
+				t.Errorf("date = %q, want %q", f.date, tc.wantDate)
+			}
+		})
+	}
+}
+
+// TestResolveDateFlag tables what `add`/`mod`'s --date resolves to: absent, or
+// naming now's own day, it is exactly now, so the flagless behavior is
+// untouched; a later day resolves to that day's LAST second, the anchor that
+// makes the day's entries count as started; a day that is over is refused,
+// since tg never rewrites one; and a value that is not a date in tg's one
+// format is refused naming the format.
+//
+// "Today" is a calendar day in the command's own location, not in UTC and not a
+// 24-hour window: at 02:00 UTC it is still yesterday at UTC-5, so that zone's
+// date is today's and the UTC one is tomorrow's.
+func TestResolveDateFlag(t *testing.T) {
+	t.Parallel()
+	western := time.FixedZone("UTC-5", -5*60*60)
+	// 2026-03-17T02:00Z is 2026-03-16T21:00 at UTC-5.
+	earlyUTC := time.Date(2026, 3, 17, 2, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name    string
+		flag    string
+		now     time.Time
+		loc     *time.Location
+		want    time.Time
+		wantErr []string
+	}{
+		{name: "absent is now", now: addNow, loc: time.UTC, want: addNow},
+		{name: "blank is now", flag: "   ", now: addNow, loc: time.UTC, want: addNow},
+		{name: "today is now", flag: "2026-01-02", now: addNow, loc: time.UTC, want: addNow},
+		{
+			name: "tomorrow is its last second", flag: "2026-01-03", now: addNow, loc: time.UTC,
+			want: time.Date(2026, 1, 3, 23, 59, 59, 0, time.UTC),
+		},
+		{
+			name: "a month out", flag: "2026-02-01", now: addNow, loc: time.UTC,
+			want: time.Date(2026, 2, 1, 23, 59, 59, 0, time.UTC),
+		},
+		{
+			name: "today is the local day", flag: "2026-03-16", now: earlyUTC, loc: western,
+			want: earlyUTC,
+		},
+		{
+			// Already the 17th in UTC, still the future at UTC-5.
+			name: "the local day's tomorrow", flag: "2026-03-17", now: earlyUTC, loc: western,
+			want: time.Date(2026, 3, 17, 23, 59, 59, 0, western),
+		},
+		{
+			name: "yesterday", flag: "2026-01-01", now: addNow, loc: time.UTC,
+			wantErr: []string{"in the past", "2026-01-01", "2026-01-02"},
+		},
+		{
+			name: "long past", flag: "2020-06-01", now: addNow, loc: time.UTC,
+			wantErr: []string{"in the past"},
+		},
+		{
+			name: "the local day's yesterday", flag: "2026-03-15", now: earlyUTC, loc: western,
+			wantErr: []string{"in the past"},
+		},
+		{
+			name: "day first", flag: "05-01-2026", now: addNow, loc: time.UTC,
+			wantErr: []string{"invalid --date", "YYYY-MM-DD"},
+		},
+		{name: "slashes", flag: "2026/01/05", now: addNow, loc: time.UTC, wantErr: []string{"invalid --date"}},
+		{name: "unpadded", flag: "2026-1-5", now: addNow, loc: time.UTC, wantErr: []string{"invalid --date"}},
+		{name: "month out of range", flag: "2026-13-01", now: addNow, loc: time.UTC, wantErr: []string{"invalid --date"}},
+		{name: "with a time", flag: "2026-01-05 09:00", now: addNow, loc: time.UTC, wantErr: []string{"invalid --date"}},
+		{name: "a word", flag: "tomorrow", now: addNow, loc: time.UTC, wantErr: []string{"invalid --date"}},
+		{name: "a timesign", flag: "9-10", now: addNow, loc: time.UTC, wantErr: []string{"invalid --date"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := resolveDateFlag(tc.flag, tc.now, tc.loc)
+			if len(tc.wantErr) > 0 {
+				if err == nil {
+					t.Fatalf("resolveDateFlag(%q) = %v, want an error", tc.flag, got)
+				}
+				for _, want := range tc.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("err = %v, want it to mention %q", err, want)
+					}
+				}
+				if !got.IsZero() {
+					t.Errorf("day = %v, want the zero Time alongside the error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveDateFlag(%q): %v", tc.flag, err)
+			}
+			if !got.Equal(tc.want) {
+				t.Errorf("day = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveDateFlagAcrossDST anchors a moved day on the two days that are not
+// 24 hours long: the anchor must be the last second of the named day in loc, so
+// a 23-hour day's anchor does not spill into the next day (which would file
+// entries, and their per-day numbers, under the wrong one) and a 25-hour day's
+// anchor still covers its own last hour.
+func TestResolveDateFlagAcrossDST(t *testing.T) {
+	t.Parallel()
+	loc := dstLoc(t)
+	now := time.Date(2026, 3, 20, 12, 0, 0, 0, loc)
+	for _, tc := range []struct {
+		name string
+		flag string
+		want time.Time
+	}{
+		{name: "spring forward (23h)", flag: "2026-03-29", want: time.Date(2026, 3, 29, 23, 59, 59, 0, loc)},
+		{name: "fall back (25h)", flag: "2026-10-25", want: time.Date(2026, 10, 25, 23, 59, 59, 0, loc)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := resolveDateFlag(tc.flag, now, loc)
+			if err != nil {
+				t.Fatalf("resolveDateFlag(%q): %v", tc.flag, err)
+			}
+			if !got.Equal(tc.want) {
+				t.Errorf("day = %v, want %v", got, tc.want)
+			}
+			// The anchor must still fall on the day it names, whichever way
+			// the day's length was bent.
+			if day := got.In(loc).Format(dateLayout); day != tc.flag {
+				t.Errorf("day = %s, want the anchor inside %s", day, tc.flag)
+			}
+		})
 	}
 }
 

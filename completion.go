@@ -110,10 +110,12 @@ _tg() {
           # First positional is the timesign (absolute 9-:30, relative
           # +:20, or a bare duration 1:30 continuing the last entry);
           # later args are task names. --desc/--description set the
-          # entry description, -1/--first resolves an ambiguous fragment.
+          # entry description, --date moves the entry to another (later)
+          # day, -1/--first resolves an ambiguous fragment.
           _arguments \
             '--desc[entry description]:description:' \
             '--description[entry description (alias of --desc)]:description:' \
+            '--date[the day the entry belongs to; today or later]:date (YYYY-MM-DD):' \
             '-1[use the first match on an ambiguous fragment]' \
             '--first[use the first match on an ambiguous fragment (alias of -1)]' \
             '1:timesign:' \
@@ -124,10 +126,12 @@ _tg() {
           # the last entry) and a timesign, in either order; both are transient
           # so only the slots are described, naming the forms mod accepts:
           # absolute (9-10:30) or signed (+30 later, -30 earlier).
-          # --desc/--description retitle the entry.
+          # --desc/--description retitle the entry and --date picks the day
+          # whose entry (and whose numbering) is edited.
           _arguments \
             '--desc[new entry description]:description:' \
             '--description[new entry description (alias of --desc)]:description:' \
+            '--date[the day whose entry is edited; today or later]:date (YYYY-MM-DD):' \
             '1:entry number or timesign (9-10:30, +30, -30):' \
             '2:entry number or timesign (9-10:30, +30, -30):'
           ;;

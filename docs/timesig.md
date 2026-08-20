@@ -5,7 +5,7 @@ needs a finished time range (`tg add`, `tg mod`). Four forms exist:
 
 | Form     | Shape         | Example  | Meaning                                    |
 | -------- | ------------- | -------- | ------------------------------------------ |
-| absolute | `START-STOP`  | `9-:30`  | 09:00-09:30 today                          |
+| absolute | `START-STOP`  | `9-:30`  | 09:00-09:30 on the day worked on (today by default) |
 | relative | `+DURATION`   | `+:20`   | the last 20 minutes, ending at the current 5-minute mark |
 | negative | `-DURATION`   | `-:20`   | 20 minutes to take AWAY from an existing span |
 | duration | `DURATION`    | `1:30`   | a bare 1h30m length; the command supplies the start |
@@ -175,7 +175,9 @@ differently from `tg add`.
 
 The plain reading of the two anchored forms: absolute ranges land on **today**,
 and a relative span **ends at now** (floored to the preceding 5-minute mark) and
-starts `DURATION` earlier. This is the "I just worked that long" case.
+starts `DURATION` earlier. This is the "I just worked that long" case. (`--date`
+moves "today" to a later day; see [The day a timesign lands
+on](#the-day-a-timesign-lands-on).)
 
 A bare duration means "that long, **starting where I left off**": the new entry
 starts at the **end of the last entry** and stops `DURATION` later, so
@@ -183,7 +185,7 @@ starts at the **end of the last entry** and stops `DURATION` later, so
 last entry is resolved exactly as `tg status` reports it and a bare `tg mod`
 edits it (today's newest already-started entry), so:
 
-- an entry from an **earlier day** is never the anchor — on a day with nothing
+- an entry from **another day** is never the anchor — on a day with nothing
   tracked yet the form is refused ("no entry tracked today to continue from")
   instead of starting at now or reaching back into history;
 - a **running** last entry has no end to start from, so it is refused too (the
@@ -225,9 +227,10 @@ A subtraction may not consume the entry: taking off its whole length, or more, i
 refused rather than storing an empty or inside-out entry. Removing an entry is
 `tg del`, and an absolute range retimes one outright.
 
-`mod` only ever edits **today's** entries: an entry whose start falls on an
+`mod` never edits a day that is **over**: an entry whose start falls on an
 earlier calendar day is refused before the timesign is even applied, so the
-"entry's own calendar day" is in practice today's.
+"entry's own calendar day" is in practice today's — or, with `--date`, a later
+one.
 
 Unlike other uses of signed timesigns, an all-digit duration without `:` is
 minutes for `mod`: `mod +20` adds 20 minutes and `mod -20` takes 20 off, while
@@ -244,6 +247,29 @@ that `add`, `grep`, `total`, `update` and `pull` accept.
 (`mod` never moves an entry's start), and the signed forms already cover "this
 ran longer/shorter". A bare `1:30` there is reported as a malformed absolute
 range.
+
+### The day a timesign lands on
+
+Both commands work on **today** unless `--date YYYY-MM-DD` names a later day
+(today or later only: a day that is over is never rewritten). On the day named:
+
+| Form                | With `--date`                                                     |
+| ------------------- | ----------------------------------------------------------------- |
+| absolute `9-10`     | resolved on that day (`add`), or on the entry's own day (`mod`)   |
+| bare duration `1:30`| continues **that day's** last entry (`add`)                        |
+| relative `+:20`     | **refused** by `add`; `mod` still moves the entry's end by it      |
+| negative `-:20`     | unchanged: `mod` moves the entry's end back by it                  |
+
+The relative form is the one exception because it is defined by "now": it ends
+at the current 5-minute mark, which exists only today, and no hour of another
+day is a defensible substitute. `add` therefore refuses it there and names the
+forms that do work; `mod` keeps taking it, since only its `DURATION` is used
+(see the table above).
+
+The refusals that name a day follow the flag too: with `--date 2026-01-05` an
+unanchorable bare duration reads "no entry tracked on 2026-01-05 to continue
+from", and a bare `tg mod` with nothing booked there reads "no entry tracked on
+2026-01-05 to modify".
 
 ## Error cases
 
@@ -296,7 +322,9 @@ Duration:
 `IsDuration`; they are classified as absolute or negative and rejected there.)
 
 Beyond the parser, `tg add` refuses a bare duration it cannot anchor: no entry
-tracked today, or a last entry that is still running. `tg mod` refuses a negative
+tracked on the day it works on, or a last entry that is still running. It also
+refuses a relative timesign on a day `--date` moved it to (see [The day a
+timesign lands on](#the-day-a-timesign-lands-on)). `tg mod` refuses a negative
 timesign that would consume the whole entry, and either sign on a running one.
 
 ## API

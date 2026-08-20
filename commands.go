@@ -41,6 +41,45 @@ type cmdEnv struct {
 
 	now time.Time
 	loc *time.Location
+
+	// day is the instant that stands in for now whenever a command resolves
+	// WHICH calendar day it works on: the day `add` files an entry under, and
+	// the day whose per-entry numbering `tg mod` addresses and whose last entry
+	// it defaults to. It is now itself unless --date moved the command to
+	// another day, in which case it is that day's LAST second, so the entries
+	// already booked on it all count as started — the state today's entries are
+	// in at the moment they are edited (see resolveDateFlag and cmdEnv.on).
+	//
+	// now stays the real clock either way. It is the entry's last-writer-wins
+	// timestamp and what a push is stamped with, neither of which --date moves,
+	// so the two are separate values rather than one clock the flag rewinds.
+	day time.Time
+}
+
+// on returns a copy of env whose day (see cmdEnv.day) is at: env pointed at
+// another calendar day. It is how --date reaches `add` and `mod` without every
+// cmd* function growing a day parameter, and it copies rather than mutates so
+// the env the wiring built keeps describing the real clock.
+func (e *cmdEnv) on(at time.Time) *cmdEnv {
+	moved := *e
+	moved.day = at
+	return &moved
+}
+
+// dayMoved reports whether the command works on a calendar day other than now's
+// (in loc), i.e. whether --date named a later day. Naming today changes nothing
+// about the command, so it does not count as moved.
+func (e *cmdEnv) dayMoved() bool { return !sameDay(e.day, e.now, e.loc) }
+
+// dayPhrase names the day the command works on the way its messages read it:
+// "today" normally and "on 2026-08-25" when --date moved it, so one message
+// serves both ("no entry tracked today to modify" / "no entry tracked on
+// 2026-08-25 to modify").
+func (e *cmdEnv) dayPhrase() string {
+	if !e.dayMoved() {
+		return "today"
+	}
+	return "on " + e.day.In(e.loc).Format(dateLayout)
 }
 
 // offline reports whether this invocation has no Toggl credentials, i.e. `tg
@@ -124,8 +163,14 @@ const addUsage = "usage: tg add <timesign> [project] <task-fragment>"
 //
 // desc is the entry's free-form description (from `--desc`/`--description`); an
 // empty desc leaves the description blank, matching the prior behavior.
+//
+// The entry lands on the day env points at (env.day, i.e. today unless --date
+// named a later one), which is the day an absolute timesign is resolved on and
+// the day a bare duration continues from; the confirmation line names that day
+// when it is not today. Only the relative form has no meaning there, and
+// addSpan refuses it.
 func cmdAdd(env *cmdEnv, projectID *int64, first bool, timesign, fragment, desc string) error {
-	start, stop, err := addSpan(env.ctx, env.st, timesign, env.now, env.loc)
+	start, stop, err := addSpan(env, timesign)
 	if err != nil {
 		return err
 	}
@@ -184,8 +229,9 @@ func cmdAdd(env *cmdEnv, projectID *int64, first bool, timesign, fragment, desc 
 	if task.ProjectName != "" {
 		label += " [" + task.ProjectName + "]"
 	}
-	fmt.Fprintf(env.w, "Added: %s  %s-%s (%s)\n",
-		label, formatClock(start, env.loc), formatClock(stop, env.loc), formatHM(dur))
+	fmt.Fprintf(env.w, "Added: %s  %s-%s (%s)%s\n",
+		label, formatClock(start, env.loc), formatClock(stop, env.loc), formatHM(dur),
+		dayNote(start, env.now, env.loc))
 	// Push the new entry so Toggl reflects it immediately. Best-effort:
 	// keep the local entry dirty for a later `tg push` if the sync fails.
 	env.bestEffortPush()
@@ -213,9 +259,20 @@ func cmdAdd(env *cmdEnv, projectID *int64, first bool, timesign, fragment, desc 
 // applies, which is what catches a duration long enough to run into an entry
 // already booked for later today (LastEntry skips those, so they are never the
 // anchor).
-func addSpan(ctx context.Context, st *store.Store, timesign string, now time.Time, loc *time.Location) (time.Time, time.Time, error) {
+//
+// Every day-reckoning above is env.day's, not now's, so --date moves all of it
+// to the day it names: the absolute form resolves on that day and the anchor is
+// that day's last entry. The relative form is the exception — it counts back
+// from the current 5-minute mark, which only exists today — so it is refused
+// there rather than pinned to some invented hour of another day.
+func addSpan(env *cmdEnv, timesign string) (time.Time, time.Time, error) {
 	if !timesig.IsDuration(timesign) {
-		span, err := timesig.Parse(timesign, now, loc)
+		if timesig.IsRelative(timesign) && env.dayMoved() {
+			return time.Time{}, time.Time{}, fmt.Errorf(
+				"a relative timesign counts back from now, so it cannot record time %s: give an absolute timesign (e.g. 9-:30) or a bare duration (e.g. 1:30) instead",
+				env.dayPhrase())
+		}
+		span, err := timesig.Parse(timesign, env.day, env.loc)
 		if err != nil {
 			return time.Time{}, time.Time{}, err
 		}
@@ -225,20 +282,33 @@ func addSpan(ctx context.Context, st *store.Store, timesign string, now time.Tim
 	if err != nil {
 		return time.Time{}, time.Time{}, err
 	}
-	last, err := st.LastEntry(ctx, now)
+	last, err := env.st.LastEntry(env.ctx, env.day)
 	if err != nil {
 		return time.Time{}, time.Time{}, err
 	}
 	if last == nil {
-		return time.Time{}, time.Time{}, errors.New(
-			"no entry tracked today to continue from: give an absolute timesign (e.g. 9-:30) or a relative one (e.g. +1:30) instead")
+		return time.Time{}, time.Time{}, fmt.Errorf(
+			"no entry tracked %s to continue from: give %s instead",
+			env.dayPhrase(), anchorlessForms(env.dayMoved()))
 	}
 	if last.Running() {
-		return time.Time{}, time.Time{}, errors.New(
-			"the last entry is still running: it has no end time to continue from, give an absolute timesign (e.g. 9-:30) or a relative one (e.g. +1:30) instead")
+		return time.Time{}, time.Time{}, fmt.Errorf(
+			"the last entry is still running: it has no end time to continue from, give %s instead",
+			anchorlessForms(env.dayMoved()))
 	}
 	start := *last.Stop
 	return start, start.Add(dur), nil
+}
+
+// anchorlessForms names the timesigns that carry their own times, which is what
+// `tg add`'s two missing-anchor refusals point the user at. On a day --date
+// moved the command to there is no "now" for the relative form to count back
+// from (see addSpan), so only the absolute one is offered.
+func anchorlessForms(dayMoved bool) string {
+	if dayMoved {
+		return "an absolute timesign (e.g. 9-:30)"
+	}
+	return "an absolute timesign (e.g. 9-:30) or a relative one (e.g. +1:30)"
 }
 
 // cmdMod edits a single existing entry in place: its times (from a timesign),
@@ -247,7 +317,9 @@ func addSpan(ctx context.Context, st *store.Store, timesign string, now time.Tim
 // ref selects the entry: its number on today's listing (see store.EntryByNum;
 // the numbering is per-day and persistent), or 0 meaning "the last entry",
 // resolved by store.LastEntry exactly as `tg status` resolves it — today only
-// and never something that starts later today.
+// and never something that starts later today. --date points both at another
+// (later) day instead, whose numbering and last entry are its own; see
+// modTarget.
 //
 // The timesign is interpreted by form (see docs/timesig.md):
 //
@@ -267,11 +339,13 @@ func addSpan(ctx context.Context, st *store.Store, timesign string, now time.Tim
 // setDesc distinguishes an omitted --desc from an explicit empty one, so a
 // description can be cleared with --desc "".
 //
-// Only today's entries may be edited: an entry that started on an earlier
+// Days that are OVER may not be edited: an entry that started on an earlier
 // calendar day (in loc), or an edit that would move an entry back before
 // today's midnight, is refused with an error wrapping store.ErrEntryTooOld.
 // The same failsafe is enforced again inside store.UpdateEntry, so no code path
-// can write past days.
+// can write past days. It is judged against the real clock, never against
+// --date, which is exactly why --date cannot name a past day either (see
+// resolveDateFlag).
 //
 // Retiming is refused when the new span would overlap another entry (the entry
 // being modified is excluded from the check). The entry is stored dirty so a
@@ -279,10 +353,10 @@ func addSpan(ctx context.Context, st *store.Store, timesign string, now time.Tim
 // immediately, best-effort, exactly like `tg add`.
 func cmdMod(env *cmdEnv, ref int, timesign, desc string, setDesc bool) error {
 	if timesign == "" && !setDesc {
-		return errors.New("usage: tg mod [entry-number] [timesign] [--desc TEXT]")
+		return errors.New("usage: tg mod [entry-number] [timesign] [--desc TEXT] [--date DATE]")
 	}
 
-	e, err := modTarget(env.ctx, env.st, ref, env.now)
+	e, err := modTarget(env, ref)
 	if err != nil {
 		return err
 	}
@@ -323,27 +397,32 @@ func cmdMod(env *cmdEnv, ref int, timesign, desc string, setDesc bool) error {
 	if err := env.st.UpdateEntry(env.ctx, e, env.now, env.loc); err != nil {
 		return err
 	}
-	renderEntryChange(env.w, "Modified", e, env.loc)
+	renderEntryChange(env.w, "Modified", e, env.now, env.loc)
 	env.bestEffortPush()
 	return nil
 }
 
 // modTarget resolves the entry `tg mod` acts on: the local number ref when it
 // is positive, otherwise the last entry (store.LastEntry, the shared
-// resolution `tg status` also reports). Both are scoped to now's calendar day —
-// numbers are per-day (see store.EntryByNum) and the last entry is today's —
-// which is also the only day mod may write to, so an unaddressable entry is
-// reported as missing rather than as a refused edit.
-func modTarget(ctx context.Context, st *store.Store, ref int, now time.Time) (store.Entry, error) {
+// resolution `tg status` also reports). Both are scoped to ONE calendar day —
+// numbers are per-day (see store.EntryByNum) and the last entry is that day's —
+// so an unaddressable entry is reported as missing rather than as a refused
+// edit.
+//
+// That day is env.day: today, or the later day --date named, whose entries are
+// all "already started" as far as the anchor is concerned (see cmdEnv.day). It
+// is also a day mod may write to, since the failsafe only closes days that are
+// over (store.CheckEditableDay).
+func modTarget(env *cmdEnv, ref int) (store.Entry, error) {
 	if ref > 0 {
-		return st.EntryByNum(ctx, ref, now)
+		return env.st.EntryByNum(env.ctx, ref, env.day)
 	}
-	last, err := st.LastEntry(ctx, now)
+	last, err := env.st.LastEntry(env.ctx, env.day)
 	if err != nil {
 		return store.Entry{}, err
 	}
 	if last == nil {
-		return store.Entry{}, errors.New("no entry tracked today to modify")
+		return store.Entry{}, fmt.Errorf("no entry tracked %s to modify", env.dayPhrase())
 	}
 	return *last, nil
 }
@@ -450,7 +529,7 @@ func cmdDel(env *cmdEnv, ref int) error {
 	if err := env.st.SoftDeleteEntry(env.ctx, e.ID, env.now); err != nil {
 		return err
 	}
-	renderEntryChange(env.w, "Deleted", e, env.loc)
+	renderEntryChange(env.w, "Deleted", e, env.now, env.loc)
 	env.bestEffortPush()
 	return nil
 }
@@ -1203,6 +1282,24 @@ func projectBillable(ctx context.Context, st *store.Store, projectID int64) (boo
 func startOfDay(t time.Time, loc *time.Location) time.Time {
 	t = t.In(loc)
 	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, loc)
+}
+
+// endOfDay returns the last whole second of t's calendar day in loc (23:59:59
+// local time). It is the instant --date anchors a moved day at, chosen so every
+// entry on that day counts as already started (see resolveDateFlag), and so is
+// the mirror of startOfDay rather than a "start plus 24h": the next midnight is
+// reached with AddDate, which keeps the result inside the day on a 23- or
+// 25-hour DST transition day. Seconds are the resolution entry timestamps are
+// stored at, so a whole second is as fine as the anchor needs to be.
+func endOfDay(t time.Time, loc *time.Location) time.Time {
+	return startOfDay(t, loc).AddDate(0, 0, 1).Add(-time.Second)
+}
+
+// sameDay reports whether a and b fall on the same calendar day in loc, which
+// is what "today" means everywhere in tg: a day in the local calendar, not a
+// 24-hour window and not a UTC date.
+func sameDay(a, b time.Time, loc *time.Location) bool {
+	return startOfDay(a, loc).Equal(startOfDay(b, loc))
 }
 
 // startOfMonth returns midnight of the first day of t's calendar month in loc.

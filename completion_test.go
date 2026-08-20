@@ -33,6 +33,8 @@ func TestCompletionZsh(t *testing.T) {
 		"        pull)", "        total)",
 		"        completion)",
 		"--desc[", "--description[", "--json[", "--all[", "--since[", "--days[",
+		// `add`/`mod` take the day the entry belongs to.
+		"--date[",
 		// `pull` widens its default today-only window with -a/--all.
 		"--all[pull this month", "-a[pull this month",
 		// `daily` measures each day against -t/--target.
@@ -76,20 +78,16 @@ func TestCompletionCoversDispatch(t *testing.T) {
 	}
 }
 
-// TestCompletionOffersFirstFlag pins -1/--first to the commands that resolve a
-// name fragment (see bindFirstFlag): each of their `_arguments` blocks must
-// offer both spellings, and the commands without a fragment must not.
-func TestCompletionOffersFirstFlag(t *testing.T) {
-	t.Parallel()
-	var buf bytes.Buffer
-	if err := cmdCompletion(&buf, "zsh"); err != nil {
-		t.Fatalf("completion: %v", err)
-	}
-	// The per-command blocks are the "        <words>)" labels of the case
-	// statement, so splitting on them isolates each command's flag list.
+// completionBlocks splits the completion script into its per-command argument
+// blocks, keyed by command word. The blocks are the "        <words>)" labels of
+// the script's case statement, so a label with no space in it starts one and
+// everything up to the next label belongs to it; that is what lets a test assert
+// which flags ONE command offers rather than only that the script mentions them
+// somewhere.
+func completionBlocks(script string) map[string]string {
 	blocks := map[string]string{}
 	var label string
-	for _, line := range strings.Split(buf.String(), "\n") {
+	for _, line := range strings.Split(script, "\n") {
 		if trimmed := strings.TrimPrefix(line, "        "); trimmed != line &&
 			strings.HasSuffix(trimmed, ")") && !strings.Contains(trimmed, " ") {
 			label = strings.TrimSuffix(trimmed, ")")
@@ -99,6 +97,19 @@ func TestCompletionOffersFirstFlag(t *testing.T) {
 			blocks[label] += line + "\n"
 		}
 	}
+	return blocks
+}
+
+// TestCompletionOffersFirstFlag pins -1/--first to the commands that resolve a
+// name fragment (see bindFirstFlag): each of their `_arguments` blocks must
+// offer both spellings, and the commands without a fragment must not.
+func TestCompletionOffersFirstFlag(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	if err := cmdCompletion(&buf, "zsh"); err != nil {
+		t.Fatalf("completion: %v", err)
+	}
+	blocks := completionBlocks(buf.String())
 	for _, cmd := range []string{"add", "grep", "update", "pull", "total"} {
 		block, ok := blocks[cmd]
 		if !ok {
@@ -113,6 +124,36 @@ func TestCompletionOffersFirstFlag(t *testing.T) {
 	for _, cmd := range []string{"mod", "del", "tasks", "daily"} {
 		if strings.Contains(blocks[cmd], "'-1[") {
 			t.Errorf("%s takes no fragment, it should not offer -1:\n%s", cmd, blocks[cmd])
+		}
+	}
+}
+
+// TestCompletionOffersDateFlag pins --date to the two commands that take it
+// (see bindDateFlag): `add` and `mod` are the only ones that write an entry to a
+// particular day, and both must complete it as a date. The other commands must
+// not offer it — `pull`/`total` take a window start, which is --since.
+func TestCompletionOffersDateFlag(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	if err := cmdCompletion(&buf, "zsh"); err != nil {
+		t.Fatalf("completion: %v", err)
+	}
+	blocks := completionBlocks(buf.String())
+	for _, cmd := range []string{"add", "mod"} {
+		block, ok := blocks[cmd]
+		if !ok {
+			t.Fatalf("completion script has no %q block", cmd)
+		}
+		if !strings.Contains(block, "'--date[") {
+			t.Errorf("%s block missing --date:\n%s", cmd, block)
+		}
+		if !strings.Contains(block, "YYYY-MM-DD") {
+			t.Errorf("%s block should name the date format:\n%s", cmd, block)
+		}
+	}
+	for _, cmd := range []string{"del", "tasks", "grep", "daily", "pull", "total", "update"} {
+		if strings.Contains(blocks[cmd], "'--date[") {
+			t.Errorf("%s does not take --date, it should not offer one:\n%s", cmd, blocks[cmd])
 		}
 	}
 }

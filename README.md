@@ -97,7 +97,8 @@ tg add 9-:30 --desc "reset password flow" <task>
 ```
 
 Flags may come before or after the positional arguments, so
-`tg add 9-:30 login --desc "…"` works too.
+`tg add 9-:30 login --desc "…"` works too. `--date` books the entry on another
+day; see [Another day: `--date`](#another-day---date).
 
 ### Ambiguous fragments and `-1`
 
@@ -132,13 +133,70 @@ to the first one instead — for `total`, the first match of *each* of its
 fragments (`grep` orders by project then name and gives an exact name no
 precedence, so its first line is not always the task `add -1` picks).
 
+### Another day: `--date`
+
+`add` and `mod` work on **today**. Pass `--date YYYY-MM-DD` to point either of
+them at a different day — for time you already know you will spend, or to fix
+something you booked ahead earlier:
+
+```sh
+tg add --date 2026-01-05 9-10 <task>     # 09:00-10:00 on the 5th
+tg add --date 2026-01-05 :30 <task>      # continues the 5th's last entry
+tg mod --date 2026-01-05 +30             # extend that day's last entry
+tg mod --date 2026-01-05 2 9-10:30       # retime entry 2 of the 5th
+```
+
+The date must be **today or later**. A day that is over is history: tg never
+rewrites it (the same rule `tg mod` enforces on an old entry, see below), so a
+past `--date` is refused outright rather than producing an entry no later
+command could touch. "Today" is a calendar day in your local zone, not a
+24-hour window.
+
+On the day named, everything a command reckons per day is that day's:
+
+- an **absolute** timesign resolves on it (`9-10` is 09:00-10:00 there);
+- a **bare duration** continues from *that* day's last entry, so booking a
+  block of back-to-back entries on a future day works exactly as it does today
+  — and on a day with nothing on it yet there is nothing to continue from,
+  which is refused;
+- `mod`'s entry **numbers** and its default "last entry" are that day's too, so
+  `tg mod --date … 2` and a bare `tg mod --date …` address what you booked
+  there, not what you tracked today. Today's numbers do not reach it, and its
+  numbers do not reach today.
+
+A **relative** timesign (`+:20`) is the one form `--date` cannot take: it means
+"the last 20 minutes", counted back from the current 5-minute mark, and another
+day has no such mark. `tg add --date … +:20` is therefore refused, naming the
+forms that do work. (`tg mod`'s `+30`/`-30` are fine: they only move an existing
+entry's end by that much.)
+
+Confirmation lines name the day whenever it is not today, since the clock times
+alone no longer identify the entry:
+
+```
+$ tg add --date 2026-01-05 9-10 login
+Added: Fix login bug [Backend]  09:00-10:00 (1h00m) on 2026-01-05
+```
+
+Entries booked ahead behave like any other: they are pushed to Toggl
+immediately (best-effort), they take part in the overlap check *on their own
+day* — an entry at 09:00 today is no conflict for one at 09:00 next week — and
+they are excluded from `tg status`'s "last entry" and day total until their day
+arrives.
+
+Two commands do **not** take `--date` yet: `tg ls` lists today and days *behind*
+it, and `tg del` addresses today's numbers only. Until a booked day comes
+around, its entries are therefore visible (and removable) in the Toggl web app
+rather than through tg — `tg mod --date` can still retime and re-describe them.
+
 ### Fixing and removing entries
 
 `mod` edits an entry that already exists and `del` removes one. Both address
 entries by the small per-day numbers printed by `tg ls` (see below), resolved on
-today's day; `mod` also defaults to *the last entry* when no number is given —
-the same one `tg status` reports, resolved the same way: today's newest entry
-that has already started (see below).
+today's day (`mod` also takes `--date` to resolve them on a later one); `mod`
+also defaults to *the last entry* when no number is given — the same one
+`tg status` reports, resolved the same way: today's newest entry that has
+already started (see below).
 
 ```sh
 tg mod +30                       # the last entry ran 30 minutes longer
@@ -174,11 +232,13 @@ and `+DURATION`/`-DURATION` already say "this ran longer/shorter". Note that a
 negative timesign is *not* the `-1` first-match flag other commands take: `mod`
 has no such flag, so `tg mod -1` takes one minute off the last entry.
 
-**Only today's entries can be modified.** Once an entry's calendar day is over
-it is history: `tg mod` refuses it outright ("refusing to update an entry older
-than today") and nothing is written locally or sent to Toggl. The check is
-enforced again in the storage layer, so no command can rewrite a past day. Use
-the Toggl web app for genuine corrections to older days.
+**A day that is over can never be modified.** Once an entry's calendar day has
+passed it is history: `tg mod` refuses it outright ("refusing to update an entry
+older than today") and nothing is written locally or sent to Toggl. The check is
+enforced again in the storage layer, so no command can rewrite a past day, and
+it is judged against the real clock — never against `--date`, which is why that
+flag cannot name a past day either. Use the Toggl web app for genuine
+corrections to older days.
 
 `mod` requires at least one change (a timesign, `--desc`, or both), refuses a new
 range that would overlap a *different* entry, and `--desc ""` clears the
@@ -273,8 +333,9 @@ status bar. The gap only appears once now has moved past the entry's stop.
 
 **The last entry is always today's**, and it is the single notion of "last
 entry" in tg: `tg status` and a bare `tg mod` resolve it through the same
-function, so they can never disagree about what they are talking about. Two
-things are filtered out:
+function, so they can never disagree about what they are talking about. (A bare
+`tg mod --date` resolves it the same way on the day it names, which is the only
+thing that moves it off today.) Two things are filtered out:
 
 - **earlier days.** A new day starts with no last entry (`No entries. Today:
   0h00m`) rather than showing yesterday's — which `tg mod` could not edit
@@ -379,9 +440,10 @@ usage: tg <command> [flags]
 
 commands:
   auth [token]              verify a Toggl API token and store config
-  add <timesign> [project] <task>  add a finished entry [--desc TEXT] [-1]
+  add <timesign> [project] <task>  add a finished entry
+                            [--desc TEXT] [--date DATE] [-1]
   mod [num] [timesign]      retime/rename an entry (default: last), e.g.
-                            +30 / -30 minutes                  [--desc TEXT]
+                            +30 / -30 minutes  [--desc TEXT] [--date DATE]
   del <num>                 delete the entry numbered by `tg ls`
   current | status          last entry, gap, day total        [--json]
   today   | list | ls       show today's entries     [--days N] [--json]
@@ -407,11 +469,18 @@ timesign: absolute 9-:30, 10-11, 10:30-11:15 (today), relative +:20,
       `add` only). Full spec: docs/timesig.md
 mod:  numbers are the per-day ones shown by `tg ls`; without one the
       last entry is modified: today's newest already-started entry, the
-      same one `tg status` shows. Only TODAY's entries can be modified.
+      same one `tg status` shows. A day that is OVER can never be
+      modified (see `date`).
       An absolute timesign sets the range on the entry's own day; a
       signed one moves its END, keeping the start: `tg mod +30` pushes
       the end 30m later, `tg mod -30` pulls it 30m back (never past the
       start); a number without `:` is minutes for `mod`.
+date: `add` and `mod` work on today; `--date YYYY-MM-DD` moves them to
+      another day, which must be today or later (a day that is over is
+      history and is refused). On a moved day the entry numbers, the
+      "last entry" and an absolute timesign are all that day's; a
+      relative timesign has no `now` there, so `add` refuses one
+      (`mod` still takes +30/-30, which only move an end).
 -1:   `add`/`grep`/`total`/`update`/`pull` match tasks and projects by
       name fragment; a fragment matching several of them normally
       fails with the candidates listed. `-1` (alias `--first`) takes
