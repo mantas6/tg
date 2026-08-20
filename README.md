@@ -126,8 +126,9 @@ project fragments as well as task ones (`tg pull back -1`, `tg update back -1`).
 It only ever resolves *ambiguity*: a fragment matching nothing still fails, and
 on a fragment that already matches one candidate the flag changes nothing.
 `grep` and `total` normally report every match, so there `-1` narrows the output
-to the first one instead (`grep` orders by project then name and gives an exact
-name no precedence, so its first line is not always the task `add -1` picks).
+to the first one instead — for `total`, the first match of *each* of its
+fragments (`grep` orders by project then name and gives an exact name no
+precedence, so its first line is not always the task `add -1` picks).
 
 ### Fixing and removing entries
 
@@ -209,19 +210,44 @@ the start of the range:
 
 ```sh
 tg total login                        # last 3 months for "login"
-tg total code review                  # one fragment: "code review"
+tg total login docs                   # two fragments: one group each
+tg total "code review"                # one fragment: "code review"
 tg total                              # every task with tracked time
 tg total --since 2025-01-01 login     # from 2025-01-01 through today
 tg total write -1                     # only the first matching task
 ```
 
-The arguments are joined into a single task-name fragment, matched against the
-cached tasks the same case-insensitive way as `tg add` (exact name wins over
-substrings), so run `tg update` if the catalog is stale. A fragment matching
-several tasks totals all of them; `-1` narrows it to the first. Without a fragment
-every task with tracked time is listed, including tasks missing from the local
-catalog (shown as `task #<id>` when the API gives no title); those cannot be
-reached by a fragment.
+Each argument is its **own** task-name fragment (unlike `tg add`, which joins
+them), matched against the cached tasks the same case-insensitive way as
+`tg add` (exact name wins over substrings), so run `tg update` if the catalog is
+stale, and quote a multi-word name to keep it one search. A fragment matching
+several tasks totals all of them; `-1` narrows every fragment to its first
+match. Without a fragment every task with tracked time is listed, including
+tasks missing from the local catalog (shown as `task #<id>` when the API gives
+no title); those cannot be reached by a fragment.
+
+With several fragments each gets a header line carrying its own total, its tasks
+indented below it, and the footer sums them:
+
+```
+$ tg total write login
+write  1h15m
+  Write docs   0h15m  [Backend]
+  Write tests  1h00m  [Backend]
+login  1h15m
+  Fix login bug  1h15m  [Backend]
+----------------------------------------
+Total: 2h30m
+```
+
+Fragments are independent searches, so overlapping ones (`tg total write docs`)
+list the shared task under both headers; the footer still counts it once, and so
+stays the tracked time for the range rather than the sum of the headers. Every
+fragment must find tracked time: one matching no cached task, or only tasks with
+nothing tracked in the range, fails the whole command instead of quietly
+dropping out of the report. `--json` adds a `fragments` array (each with its own
+`tasks` and `total_seconds`) next to the usual distinct `tasks` and
+`total_seconds`, and is unchanged for a single fragment.
 
 `status` (alias `current`) is the terse one-glance line: the last entry with its
 wall-clock range, the idle gap since it stopped, and today's tracked total.
@@ -358,7 +384,8 @@ commands:
   push                      send local changes to Toggl       [--json]
   pull [project]            fetch today's changes; all projects, or one
                             [-a|--all this month] [--since DATE] [--json] [-1]
-  total [task]              total tracked hours per task; last 3 months [--since DATE] [--json] [-1]
+  total [task...]           total tracked hours per task, one group per named
+                            task; last 3 months [--since DATE] [--json] [-1]
   completion zsh            print the zsh completion script
 
 timesign: absolute 9-:30, 10-11, 10:30-11:15 (today), relative +:20,

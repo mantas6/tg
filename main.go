@@ -241,7 +241,8 @@ func runGrep(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	// All positionals form ONE fragment, exactly like `tg add`/`tg total`.
+	// All positionals form ONE fragment, exactly like `tg add` (unlike
+	// `tg total`, whose positionals are one fragment each).
 	fragment := strings.Join(rest, " ")
 	return withEnv(ctx, func(env *cmdEnv) error {
 		return cmdGrep(env, *all, projectID, first, fragment, *jsonOut)
@@ -335,28 +336,26 @@ func runPull(ctx context.Context, args []string) error {
 
 func runTotal(ctx context.Context, args []string) error {
 	fs := newFlagSet("total")
-	jsonOut := fs.Bool("json", false, "emit JSON")
-	sinceFlag := fs.String("since", "", "total entries since DATE (YYYY-MM-DD); default 3 months ago")
-	var first bool
-	bindFirstFlag(fs, &first, "task")
-	// Flags may follow the fragment (`tg total login --json`), so positionals
+	f := bindTotalFlags(fs)
+	// Flags may follow the fragments (`tg total login --json`), so positionals
 	// are peeled off the same way `tg grep` does it.
 	rest, err := parseArgsAndFlags(fs, args)
 	if err != nil {
 		return err
 	}
-	// All positionals form ONE fragment, exactly like `tg add` (so
-	// `tg total code review` searches for "code review").
-	fragment := strings.Join(rest, " ")
+	// Each positional is its OWN task-name fragment (`tg total login docs`
+	// reports both, one group each), unlike `tg add`, which joins them: a
+	// multi-word name is therefore a single quoted argument,
+	// `tg total "code review"`.
 	// The store is opened even though the totals come from the Reports API: it
 	// is what resolves the reported task ids to names and what fragments are
 	// matched against (see cmdTotal).
 	return withEnv(ctx, func(env *cmdEnv) error {
-		since, err := resolveTotalSince(*sinceFlag, env.now, env.loc)
+		since, err := resolveTotalSince(f.since, env.now, env.loc)
 		if err != nil {
 			return err
 		}
-		return cmdTotal(env, first, fragment, since, *jsonOut)
+		return cmdTotal(env, f.first, rest, since, f.jsonOut)
 	})
 }
 
@@ -550,6 +549,26 @@ func bindPullFlags(fs *flag.FlagSet) *pullFlags {
 	fs.BoolVar(&f.all, "all", false, "pull this month's entries instead of only today's")
 	fs.BoolVar(&f.all, "a", false, "pull this month's entries (alias of --all)")
 	bindFirstFlag(fs, &f.first, "project")
+	return f
+}
+
+// totalFlags holds `tg total`'s flag values; see updateFlags for why
+// registration is a function of its own. The task fragments are positional and
+// stay out of here: unlike `update`'s project there is no flag spelling for
+// them, and there may be several (see cmdTotal).
+type totalFlags struct {
+	jsonOut bool
+	// since is the explicit window start (--since DATE), empty when absent;
+	// see resolveTotalSince.
+	since string
+	first bool
+}
+
+func bindTotalFlags(fs *flag.FlagSet) *totalFlags {
+	f := &totalFlags{}
+	fs.BoolVar(&f.jsonOut, "json", false, "emit JSON")
+	fs.StringVar(&f.since, "since", "", "total entries since DATE (YYYY-MM-DD); default 3 months ago")
+	bindFirstFlag(fs, &f.first, "task")
 	return f
 }
 
@@ -772,7 +791,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  push                      send local changes to Toggl       [--json]")
 	fmt.Fprintln(w, "  pull [project]            fetch today's changes; all projects, or one")
 	fmt.Fprintln(w, "                            [-a|--all this month] [--since DATE] [--json] [-1]")
-	fmt.Fprintln(w, "  total [task]              total tracked hours per task; last 3 months [--since DATE] [--json] [-1]")
+	fmt.Fprintln(w, "  total [task...]           total tracked hours per task, one group per named")
+	fmt.Fprintln(w, "                            task; last 3 months [--since DATE] [--json] [-1]")
 	fmt.Fprintln(w, "  completion zsh            print the zsh completion script")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "timesign: absolute 9-:30, 10-11, 10:30-11:15 (today), relative +:20,")

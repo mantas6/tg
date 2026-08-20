@@ -539,9 +539,42 @@ type totalTaskJSON struct {
 	DurationSeconds int64  `json:"duration_seconds"`
 }
 
-type totalJSON struct {
+// totalFragmentJSON is one fragment's own totals. It is only present when
+// several fragments were given (`tg total login docs`), so the single-fragment
+// shape stays exactly what it always was.
+type totalFragmentJSON struct {
+	Fragment     string          `json:"fragment"`
 	Tasks        []totalTaskJSON `json:"tasks"`
 	TotalSeconds int64           `json:"total_seconds"`
+}
+
+type totalJSON struct {
+	Fragments    []totalFragmentJSON `json:"fragments,omitempty"`
+	Tasks        []totalTaskJSON     `json:"tasks"`
+	TotalSeconds int64               `json:"total_seconds"`
+}
+
+// totalRowsDuration sums one group's tracked time.
+func totalRowsDuration(rows []totalRow) time.Duration {
+	var total time.Duration
+	for _, r := range rows {
+		total += time.Duration(r.Seconds) * time.Second
+	}
+	return total
+}
+
+// totalNameWidth is the width of the task-name column: the widest name in any
+// group, so the duration column lines up across the whole report.
+func totalNameWidth(groups []totalGroup) int {
+	width := 0
+	for _, g := range groups {
+		for _, r := range g.Rows {
+			if n := len(r.Name); n > width {
+				width = n
+			}
+		}
+	}
+	return width
 }
 
 // renderTotals writes the per-task totals table to w, one line per task with
@@ -549,43 +582,77 @@ type totalJSON struct {
 // are padded to the widest name so the duration column lines up (mirroring
 // renderToday). The project is omitted when the task is not in the local
 // catalog (see cmdTotal).
-func renderTotals(w io.Writer, rows []totalRow) {
+//
+// Several fragments (`tg total login docs`) are reported as one group each,
+// under a header naming the fragment and its own total, with the group's tasks
+// indented beneath it — the same "header per group" shape renderToday uses for
+// a multi-day listing, and equally absent from the single-group output. Since
+// fragments are independent searches that may overlap, a task can be listed
+// under two of them; the footer counts every distinct task once, so it stays
+// the tracked time for the range rather than the sum of the headers.
+func renderTotals(w io.Writer, groups []totalGroup) {
+	rows := distinctTotalRows(groups)
 	if len(rows) == 0 {
 		fmt.Fprintln(w, "No matching tasks.")
 		return
 	}
-	width := 0
-	for _, r := range rows {
-		if n := len(r.Name); n > width {
-			width = n
-		}
+	// Headers (and the indent that goes with them) only appear once there is
+	// more than one fragment to tell apart.
+	grouped := len(groups) > 1
+	indent := ""
+	if grouped {
+		indent = "  "
 	}
-	var total time.Duration
-	for _, r := range rows {
-		d := time.Duration(r.Seconds) * time.Second
-		total += d
-		project := ""
-		if r.ProjectName != "" {
-			project = "  [" + r.ProjectName + "]"
+	width := totalNameWidth(groups)
+	for _, g := range groups {
+		if grouped {
+			fmt.Fprintf(w, "%s  %s\n", g.Fragment, formatHM(totalRowsDuration(g.Rows)))
 		}
-		fmt.Fprintf(w, "%-*s  %s%s\n", width, r.Name, formatHM(d), project)
+		for _, r := range g.Rows {
+			project := ""
+			if r.ProjectName != "" {
+				project = "  [" + r.ProjectName + "]"
+			}
+			d := time.Duration(r.Seconds) * time.Second
+			fmt.Fprintf(w, "%s%-*s  %s%s\n", indent, width, r.Name, formatHM(d), project)
+		}
 	}
 	fmt.Fprintln(w, todayDivider)
-	fmt.Fprintln(w, "Total: "+formatHM(total))
+	fmt.Fprintln(w, "Total: "+formatHM(totalRowsDuration(rows)))
 }
 
-// renderTotalsJSON writes the per-task totals as the stable JSON shape.
-func renderTotalsJSON(w io.Writer, rows []totalRow) error {
-	out := totalJSON{Tasks: make([]totalTaskJSON, 0, len(rows))}
-	var total int64
+// renderTotalsJSON writes the per-task totals as the stable JSON shape: the
+// distinct tasks and the overall total, plus a per-fragment breakdown when
+// several fragments were given (see renderTotals for why the top-level total is
+// not the sum of the fragments').
+func renderTotalsJSON(w io.Writer, groups []totalGroup) error {
+	rows := distinctTotalRows(groups)
+	out := totalJSON{Tasks: totalTasksJSON(rows)}
 	for _, r := range rows {
-		total += r.Seconds
-		out.Tasks = append(out.Tasks, totalTaskJSON{
+		out.TotalSeconds += r.Seconds
+	}
+	if len(groups) > 1 {
+		out.Fragments = make([]totalFragmentJSON, 0, len(groups))
+		for _, g := range groups {
+			f := totalFragmentJSON{Fragment: g.Fragment, Tasks: totalTasksJSON(g.Rows)}
+			for _, r := range g.Rows {
+				f.TotalSeconds += r.Seconds
+			}
+			out.Fragments = append(out.Fragments, f)
+		}
+	}
+	return writeJSON(w, out)
+}
+
+// totalTasksJSON is the JSON task list for one set of report lines.
+func totalTasksJSON(rows []totalRow) []totalTaskJSON {
+	out := make([]totalTaskJSON, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, totalTaskJSON{
 			Task: r.Name, Project: r.ProjectName, DurationSeconds: r.Seconds,
 		})
 	}
-	out.TotalSeconds = total
-	return writeJSON(w, out)
+	return out
 }
 
 // dailyDayJSON / dailyJSON are the stable --json shapes for `daily`. Date is

@@ -765,6 +765,93 @@ func TestRenderProjectsEmpty(t *testing.T) {
 	}
 }
 
+// sampleTotals builds the `tg total` fixture for a single fragment: the one
+// group cmdTotal hands renderTotals after joining the report rows to the
+// catalog, already sorted by task name.
+func sampleTotals() []totalGroup {
+	return []totalGroup{{Fragment: "write", Rows: []totalRow{
+		{TaskID: 14, Name: "Write docs", ProjectName: "Backend", Seconds: 900},
+		{TaskID: 13, Name: "Write tests", ProjectName: "Backend", Seconds: 3600},
+	}}}
+}
+
+// sampleTotalFragments builds the multi-fragment fixture (`tg total write docs
+// legacy`): the first two fragments deliberately overlap (both match "Write
+// docs"), so the goldens pin the per-fragment headers AND the footer counting
+// the shared task once, and the third holds a task the local catalog does not
+// know, which has no project to show.
+func sampleTotalFragments() []totalGroup {
+	return append(sampleTotals(),
+		totalGroup{Fragment: "docs", Rows: []totalRow{
+			{TaskID: 14, Name: "Write docs", ProjectName: "Backend", Seconds: 900},
+		}},
+		totalGroup{Fragment: "legacy", Rows: []totalRow{
+			{TaskID: 98, Name: "Legacy work", Seconds: 600},
+		}},
+	)
+}
+
+func TestRenderTotalsGolden(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	renderTotals(&buf, sampleTotals())
+	assertGolden(t, "total.txt", buf.String())
+}
+
+func TestRenderTotalsJSONGolden(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	if err := renderTotalsJSON(&buf, sampleTotals()); err != nil {
+		t.Fatal(err)
+	}
+	assertGolden(t, "total.json", buf.String())
+}
+
+// TestRenderTotalsFragmentsGolden pins the multi-fragment report: a header per
+// fragment with its own total, its tasks indented beneath it, and a footer that
+// totals the DISTINCT tasks (0h15m + 1h00m + 0h10m), not the sum of the headers.
+func TestRenderTotalsFragmentsGolden(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	renderTotals(&buf, sampleTotalFragments())
+	assertGolden(t, "total_fragments.txt", buf.String())
+}
+
+func TestRenderTotalsFragmentsJSONGolden(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	if err := renderTotalsJSON(&buf, sampleTotalFragments()); err != nil {
+		t.Fatal(err)
+	}
+	assertGolden(t, "total_fragments.json", buf.String())
+}
+
+// TestRenderTotalsSingleFragmentIsUngrouped pins the single-fragment shape: one
+// fragment needs no header to tell it apart, so its rows are neither labelled
+// nor indented (the same way renderToday only dates a multi-day listing).
+func TestRenderTotalsSingleFragmentIsUngrouped(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	renderTotals(&buf, sampleTotals())
+	for _, line := range strings.Split(strings.TrimRight(buf.String(), "\n"), "\n") {
+		if strings.HasPrefix(line, " ") {
+			t.Errorf("line %q is indented, want the ungrouped single-fragment shape", line)
+		}
+	}
+	if strings.Contains(buf.String(), "write  ") {
+		t.Errorf("single fragment should carry no header:\n%s", buf.String())
+	}
+}
+
+func TestRenderTotalsEmpty(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	renderTotals(&buf, nil)
+	if !strings.Contains(buf.String(), "No matching tasks.") {
+		t.Errorf("empty totals = %q, want \"No matching tasks.\"", buf.String())
+	}
+}
+
 func TestRenderCurrentNoneGolden(t *testing.T) {
 	t.Parallel()
 	var human bytes.Buffer

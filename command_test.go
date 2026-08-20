@@ -2511,7 +2511,7 @@ func TestSyncCommandsRequireCredentials(t *testing.T) {
 		{"pull", func(e *cmdEnv) error { return cmdPull(e, false, "", since, false) }},
 		{"update", func(e *cmdEnv) error { return cmdUpdate(e, ptrInt(1), false, "", since, false, false) }},
 		{"projects update", func(e *cmdEnv) error { return cmdUpdateProjects(e, false, false) }},
-		{"total", func(e *cmdEnv) error { return cmdTotal(e, false, "", since, false) }},
+		{"total", func(e *cmdEnv) error { return cmdTotal(e, false, nil, since, false) }},
 	} {
 		var buf bytes.Buffer
 		err := tc.run(unauthenticatedEnv(&buf, s, pushNow, time.UTC))
@@ -2715,44 +2715,70 @@ var totalSince = totalNow.AddDate(0, -3, 0)
 // that the fragment is matched against the LOCAL catalog and the summary rows
 // are joined to it by task id: the report's task sub-groups carry no titles, so
 // anything matching on reported titles would match nothing at all. Beyond that,
-// the positionals form ONE fragment, an exact task name wins over the longer
-// names it is part of, `-1` narrows a many-match fragment to its first
-// candidate, an empty fragment lists everything with tracked time (including
-// rows the local catalog does not know), and a fragment matching no catalogued
-// task — or one with no tracked time — fails without printing anything.
+// EACH positional is its own fragment (reported as its own group, with the
+// overall total counting a task matched twice only once), an exact task name
+// wins over the longer names it is part of, `-1` narrows every fragment to its
+// first candidate, no fragment at all lists everything with tracked time
+// (including rows the local catalog does not know), and a fragment matching no
+// catalogued task — or one with no tracked time — fails without printing
+// anything.
 func TestTotalCommand(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name     string
-		fragment string
-		first    bool
-		want     []string // substrings the report must contain
-		absent   []string // substrings it must not contain
-		wantErr  string
+		name      string
+		fragments []string
+		first     bool
+		want      []string // substrings the report must contain
+		absent    []string // substrings it must not contain
+		wantErr   string
 	}{
 		{
-			name: "unique fragment joined by id", fragment: "login",
+			name: "unique fragment joined by id", fragments: []string{"login"},
 			want:   []string{"Fix login bug", "1h15m", "[Backend]", "Total: 1h15m"},
 			absent: []string{"Code review", "Write tests", "Write docs", "task #99"},
 		},
 		{
-			// runTotal joins the positionals with a space before calling
-			// cmdTotal, so "write docs" is one search and not two.
-			name: "joined multi-word fragment", fragment: strings.Join([]string{"write", "docs"}, " "),
+			// A quoted multi-word argument is still ONE search, so this finds
+			// "Write docs" and not everything matching "write" or "docs".
+			name: "quoted multi-word fragment", fragments: []string{"write docs"},
 			want:   []string{"Write docs", "Total: 0h15m"},
 			absent: []string{"Write tests"},
 		},
 		{
 			// One fragment may match several tasks (the store's substring
 			// semantics); all of them are listed and summed.
-			name: "fragment matching many", fragment: "write",
+			name: "fragment matching many", fragments: []string{"write"},
 			want: []string{"Write tests", "1h00m", "Write docs", "0h15m", "Total: 1h15m"},
+		},
+		{
+			// Two fragments are two searches: each gets a header line with its
+			// own total, and the footer sums both.
+			name: "two fragments grouped", fragments: []string{"login", "review"},
+			want: []string{
+				"login  1h15m", "  Fix login bug", "1h15m",
+				"review  0h45m", "  Code review",
+				"Total: 2h00m",
+			},
+			absent: []string{"Write docs", "Write tests"},
+		},
+		{
+			// Overlapping fragments list the shared task under both headers,
+			// but the footer counts its 15m once: 1h00m (Write tests) + 0h15m.
+			name: "overlapping fragments count a task once", fragments: []string{"write", "docs"},
+			want:   []string{"write  1h15m", "docs  0h15m", "Total: 1h15m"},
+			absent: []string{"Total: 1h30m"},
 		},
 		{
 			// Candidates are ordered by name, so "Write docs" is the first —
 			// the same one `tg add -1` would record against.
-			name: "first match only", fragment: "write", first: true,
+			name: "first match only", fragments: []string{"write"}, first: true,
 			want:   []string{"Write docs", "0h15m", "Total: 0h15m"},
+			absent: []string{"Write tests"},
+		},
+		{
+			// -1 applies to every fragment, not just the first one.
+			name: "first match applies per fragment", fragments: []string{"write", "fix login"}, first: true,
+			want:   []string{"write  0h15m", "  Write docs", "fix login  1h15m", "Total: 1h30m"},
 			absent: []string{"Write tests"},
 		},
 		{
@@ -2765,22 +2791,38 @@ func TestTotalCommand(t *testing.T) {
 			},
 		},
 		{
+			// A blank positional is no search at all, so this is the
+			// unfiltered listing rather than a match-everything fragment.
+			name: "blank fragment ignored", fragments: []string{"  "},
+			want: []string{"Fix login bug", "task #99", "Total: 3h45m"},
+		},
+		{
 			// Task 11 ("Fix") is an exact name and has no tracked time in the
 			// report, so the exact match winning is what makes this an empty
 			// result rather than "Fix login bug".
-			name: "exact name wins", fragment: "fix", wantErr: "no tracked time",
+			name: "exact name wins", fragments: []string{"fix"}, wantErr: "no tracked time",
 		},
 		{
 			// Task 20 (Payment fix) exists locally; the report never mentions
 			// it, which is reported as such rather than as a bogus no-match.
-			name: "matched but untracked", fragment: "payment", wantErr: "no tracked time",
+			name: "matched but untracked", fragments: []string{"payment"}, wantErr: "no tracked time",
+		},
+		{
+			// One bad fragment fails the whole report rather than being
+			// dropped from it, so a typo is never mistaken for "no time".
+			name: "one bad fragment fails all", fragments: []string{"login", "nonexistent"},
+			wantErr: `no task matches "nonexistent"`,
+		},
+		{
+			name: "one untracked fragment fails all", fragments: []string{"login", "payment"},
+			wantErr: `no tracked time for "payment"`,
 		},
 		{
 			// A row only the API named cannot be reached by a fragment:
 			// matching is catalog-only.
-			name: "api-only title not matchable", fragment: "legacy", wantErr: "no task matches",
+			name: "api-only title not matchable", fragments: []string{"legacy"}, wantErr: "no task matches",
 		},
-		{name: "no match", fragment: "nonexistent", wantErr: "no task matches"},
+		{name: "no match", fragments: []string{"nonexistent"}, wantErr: "no task matches"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -2789,7 +2831,7 @@ func TestTotalCommand(t *testing.T) {
 			c, _ := totalReportsServer(t)
 
 			var buf bytes.Buffer
-			err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), tc.first, tc.fragment, totalSince, false)
+			err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), tc.first, tc.fragments, totalSince, false)
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("err = %v, want it to contain %q", err, tc.wantErr)
@@ -2800,7 +2842,7 @@ func TestTotalCommand(t *testing.T) {
 				return
 			}
 			if err != nil {
-				t.Fatalf("total %q: %v", tc.fragment, err)
+				t.Fatalf("total %v: %v", tc.fragments, err)
 			}
 			out := buf.String()
 			for _, want := range tc.want {
@@ -2837,7 +2879,7 @@ func TestTotalWindow(t *testing.T) {
 			c, body := totalReportsServer(t)
 
 			var buf bytes.Buffer
-			if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "login", tc.since, false); err != nil {
+			if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, []string{"login"}, tc.since, false); err != nil {
 				t.Fatalf("total: %v", err)
 			}
 			if got := (*body)["start_date"]; got != tc.wantStart {
@@ -2850,6 +2892,25 @@ func TestTotalWindow(t *testing.T) {
 	}
 }
 
+// totalJSONOut is the shape `tg total --json` is read back as: the distinct
+// tasks and overall total, plus the per-fragment breakdown that only appears
+// once several fragments were given.
+type totalJSONOut struct {
+	Fragments []struct {
+		Fragment     string             `json:"fragment"`
+		Tasks        []totalTaskJSONOut `json:"tasks"`
+		TotalSeconds int64              `json:"total_seconds"`
+	} `json:"fragments"`
+	Tasks        []totalTaskJSONOut `json:"tasks"`
+	TotalSeconds int64              `json:"total_seconds"`
+}
+
+type totalTaskJSONOut struct {
+	Task            string `json:"task"`
+	Project         string `json:"project"`
+	DurationSeconds int64  `json:"duration_seconds"`
+}
+
 func TestTotalJSON(t *testing.T) {
 	t.Parallel()
 	s := newStore(t)
@@ -2857,17 +2918,10 @@ func TestTotalJSON(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, "write", totalSince, true); err != nil {
+	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, []string{"write"}, totalSince, true); err != nil {
 		t.Fatalf("total --json: %v", err)
 	}
-	var got struct {
-		Tasks []struct {
-			Task            string `json:"task"`
-			Project         string `json:"project"`
-			DurationSeconds int64  `json:"duration_seconds"`
-		} `json:"tasks"`
-		TotalSeconds int64 `json:"total_seconds"`
-	}
+	var got totalJSONOut
 	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
 		t.Fatalf("json: %v (%s)", err, buf.String())
 	}
@@ -2884,6 +2938,48 @@ func TestTotalJSON(t *testing.T) {
 	}
 	if got.TotalSeconds != 4500 {
 		t.Errorf("total_seconds = %d, want 4500", got.TotalSeconds)
+	}
+	// One fragment needs no breakdown, so the shape is exactly what it has
+	// always been.
+	if got.Fragments != nil {
+		t.Errorf("fragments = %+v, want none for a single fragment", got.Fragments)
+	}
+}
+
+// TestTotalMultipleFragmentsJSON pins the multi-fragment JSON: one entry per
+// fragment with its own tasks and total, alongside the distinct task list whose
+// total counts the overlapping task ("Write docs" matches both fragments) once.
+func TestTotalMultipleFragmentsJSON(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+	c, _ := totalReportsServer(t)
+
+	var buf bytes.Buffer
+	err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, []string{"write", "docs"}, totalSince, true)
+	if err != nil {
+		t.Fatalf("total --json: %v", err)
+	}
+	var got totalJSONOut
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("json: %v (%s)", err, buf.String())
+	}
+	if len(got.Fragments) != 2 {
+		t.Fatalf("fragments = %+v, want one per fragment", got.Fragments)
+	}
+	if got.Fragments[0].Fragment != "write" || got.Fragments[0].TotalSeconds != 4500 {
+		t.Errorf("fragments[0] = %+v, want write / 4500s", got.Fragments[0])
+	}
+	if len(got.Fragments[0].Tasks) != 2 {
+		t.Errorf("fragments[0].tasks = %+v, want Write docs and Write tests", got.Fragments[0].Tasks)
+	}
+	if got.Fragments[1].Fragment != "docs" || got.Fragments[1].TotalSeconds != 900 {
+		t.Errorf("fragments[1] = %+v, want docs / 900s", got.Fragments[1])
+	}
+	// The distinct list holds Write docs once, so the overall total is the
+	// tracked time (4500s), not the 5400s the fragments add up to.
+	if len(got.Tasks) != 2 || got.TotalSeconds != 4500 {
+		t.Errorf("tasks = %+v, total = %d; want 2 distinct tasks and 4500s", got.Tasks, got.TotalSeconds)
 	}
 }
 
@@ -2917,6 +3013,68 @@ func TestResolveTotalSince(t *testing.T) {
 			}
 			if !got.Equal(tc.want) {
 				t.Errorf("since = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTotalFlagRegistration pins runTotal's own flag wiring: the flags come
+// from bindTotalFlags, the very function the command uses, so renaming or
+// dropping one fails here. The point of the table is the positionals: every one
+// of them is handed to cmdTotal as its OWN fragment (`tg total login docs` is
+// two searches, not the joined "login docs" `tg add` would make of it), a
+// multi-word fragment is therefore a single quoted argument, and the flags may
+// still sit before, between or after them.
+func TestTotalFlagRegistration(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		args      []string
+		wantFrags []string
+		wantSince string
+		wantJSON  bool
+		wantFirst bool
+		wantErr   string
+	}{
+		{args: nil},
+		{args: []string{"login"}, wantFrags: []string{"login"}},
+		{args: []string{"login", "docs"}, wantFrags: []string{"login", "docs"}},
+		{args: []string{"code review"}, wantFrags: []string{"code review"}},
+		{args: []string{"login", "--json"}, wantFrags: []string{"login"}, wantJSON: true},
+		{args: []string{"--json", "login", "docs"}, wantFrags: []string{"login", "docs"}, wantJSON: true},
+		{args: []string{"login", "-1", "docs"}, wantFrags: []string{"login", "docs"}, wantFirst: true},
+		{args: []string{"--first", "login"}, wantFrags: []string{"login"}, wantFirst: true},
+		{
+			args:      []string{"--since", "2025-01-01", "login", "docs", "--json"},
+			wantFrags: []string{"login", "docs"}, wantSince: "2025-01-01", wantJSON: true,
+		},
+		{args: []string{"--since=2025-01-01", "login"}, wantFrags: []string{"login"}, wantSince: "2025-01-01"},
+		{args: []string{"--nope"}, wantErr: "not defined"},
+	} {
+		t.Run(fmt.Sprint(tc.args), func(t *testing.T) {
+			t.Parallel()
+			fs := flag.NewFlagSet("total", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			f := bindTotalFlags(fs)
+
+			rest, err := parseArgsAndFlags(fs, tc.args)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("parse %v: err = %v, want it to contain %q", tc.args, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parse %v: %v", tc.args, err)
+			}
+			if strings.Join(rest, "|") != strings.Join(tc.wantFrags, "|") {
+				t.Errorf("fragments = %q, want %q", rest, tc.wantFrags)
+			}
+			if f.since != tc.wantSince {
+				t.Errorf("since = %q, want %q", f.since, tc.wantSince)
+			}
+			if f.jsonOut != tc.wantJSON || f.first != tc.wantFirst {
+				t.Errorf("json/first = %v/%v, want %v/%v",
+					f.jsonOut, f.first, tc.wantJSON, tc.wantFirst)
 			}
 		})
 	}
@@ -4404,7 +4562,7 @@ func TestSyncCommandsSurfaceUnauthorized(t *testing.T) {
 		{name: "pull", run: func(e *cmdEnv) error { return cmdPull(e, false, "", since, false) }, wantSentinel: true},
 		{name: "update", run: func(e *cmdEnv) error { return cmdUpdate(e, ptrInt(1), false, "", since, false, false) }, wantSentinel: true},
 		{name: "projects update", run: func(e *cmdEnv) error { return cmdUpdateProjects(e, false, false) }, wantSentinel: true},
-		{name: "total", run: func(e *cmdEnv) error { return cmdTotal(e, false, "", since, false) }, wantSentinel: true},
+		{name: "total", run: func(e *cmdEnv) error { return cmdTotal(e, false, nil, since, false) }, wantSentinel: true},
 		{name: "push", run: func(e *cmdEnv) error { return cmdPush(e, false) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

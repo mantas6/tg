@@ -98,7 +98,7 @@ _tg() {
         "update:refresh one project's tasks and pull its recent entries"
         'push:send local changes to Toggl'
         "pull:fetch today's remote changes (-a for this month)"
-        'total:total tracked hours per task (Reports API)'
+        'total:total tracked hours per task, one group per fragment (Reports API)'
         'completion:print a shell completion script'
         'help:show usage'
       )
@@ -184,10 +184,11 @@ _tg() {
             '*:project fragment:__tg_project_names'
           ;;
         total)
+          # Each positional is its own task fragment, so several may be given.
           _arguments '--since[total entries since DATE (default 3 months ago)]:date (YYYY-MM-DD):' \
             '--json[emit JSON]' \
-            '-1[total only the first match]' \
-            '--first[total only the first match (alias of -1)]' \
+            '-1[total only the first match of each fragment]' \
+            '--first[total only the first match of each fragment (alias of -1)]' \
             '*:task fragment:__tg_tasks'
           ;;
         completion)

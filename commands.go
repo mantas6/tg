@@ -410,6 +410,15 @@ type totalRow struct {
 	Seconds     int64
 }
 
+// totalGroup is everything `tg total` reports for ONE task-name fragment: the
+// fragment as it was given (empty for the unfiltered listing) and the rows it
+// matched, already named and sorted. One group per fragment argument is what
+// lets the report show a per-fragment total (see renderTotals).
+type totalGroup struct {
+	Fragment string
+	Rows     []totalRow
+}
+
 // cmdTotal reports per-task tracked totals for the date range [since, now]
 // (both taken as calendar days in loc). The seconds come from the Reports API
 // (see api.SummaryByTask); everything about task identity comes from the local
@@ -417,27 +426,41 @@ type totalRow struct {
 // what makes fragment matching work at all, since the summary sub-groups
 // routinely carry no titles, so matching reported names matched nothing.
 //
-// fragment is a single task-name fragment (`tg total code review` searches for
-// "code review", exactly like `tg add`), matched against the cached task names
-// by the store's own matcher (store.FindTasksByFragment: case-insensitive
-// substring, exact name wins). An empty fragment lists every task with tracked
-// time in the range. Rows whose task id is not in the local catalog cannot
-// match a fragment; unfiltered they are still listed, labelled with whatever
-// title the API supplied or `task #<id>`.
+// Each fragment is a separate task-name search (`tg total login docs` reports
+// "login" and "docs" side by side; a multi-word name is one quoted argument,
+// `tg total "code review"`), matched against the cached task names by the
+// store's own matcher (store.FindTasksByFragment: case-insensitive substring,
+// exact name wins). No fragments at all lists every task with tracked time in
+// the range. Rows whose task id is not in the local catalog cannot match a
+// fragment; unfiltered they are still listed, labelled with whatever title the
+// API supplied or `task #<id>`.
 //
 // A fragment matching several cached tasks totals all of them; first (`-1`)
-// narrows it to the first candidate (the same ordering resolveTaskFragment
-// picks from), so an ambiguous name can be reported on its own.
+// narrows EACH fragment to its first candidate (the same ordering
+// resolveTaskFragment picks from), so an ambiguous name can be reported on its
+// own. Fragments are independent, so a task matched by two of them is listed
+// under both; the report's footer still counts it once (see renderTotals).
+//
+// Every fragment must resolve to tracked time: one matching no cached task, or
+// only tasks with nothing tracked in the range, fails the whole command rather
+// than being silently dropped from the report, exactly as a single fragment
+// always did.
 //
 // The window defaults to the last three months (see runTotal/resolveTotalSince)
-// and can be overridden with `--since`. Output is one line per task with its
-// total, followed by the sum of all listed tasks.
-func cmdTotal(env *cmdEnv, first bool, fragment string, since time.Time, jsonOut bool) error {
+// and can be overridden with `--since`.
+func cmdTotal(env *cmdEnv, first bool, fragments []string, since time.Time, jsonOut bool) error {
 	c, err := env.client()
 	if err != nil {
 		return err
 	}
-	fragment = strings.TrimSpace(fragment)
+	// Blank positionals (`tg total ""`) carry no search intent, so they are
+	// dropped instead of turning into a match-everything fragment.
+	frags := make([]string, 0, len(fragments))
+	for _, f := range fragments {
+		if f = strings.TrimSpace(f); f != "" {
+			frags = append(frags, f)
+		}
+	}
 
 	startDate := since.In(env.loc).Format(dateLayout)
 	endDate := env.now.In(env.loc).Format(dateLayout)
@@ -457,10 +480,17 @@ func cmdTotal(env *cmdEnv, first bool, fragment string, since time.Time, jsonOut
 		byID[t.ID] = t
 	}
 
-	// Fragment matching happens on the local catalog (never on report titles);
-	// the resulting task ids are what filters the summary rows.
-	var keep map[int64]bool
-	if fragment != "" {
+	var groups []totalGroup
+	if len(frags) == 0 {
+		out := totalRowsFor(rows, byID, nil)
+		if len(out) == 0 {
+			return fmt.Errorf("no tracked time in %s..%s", startDate, endDate)
+		}
+		groups = []totalGroup{{Rows: out}}
+	}
+	for _, fragment := range frags {
+		// Fragment matching happens on the local catalog (never on report
+		// titles); the resulting task ids are what filters the summary rows.
 		matched, err := env.st.FindTasksByFragment(env.ctx, fragment, nil)
 		if err != nil {
 			return err
@@ -471,12 +501,29 @@ func cmdTotal(env *cmdEnv, first bool, fragment string, since time.Time, jsonOut
 		if first {
 			matched = matched[:1]
 		}
-		keep = make(map[int64]bool, len(matched))
+		keep := make(map[int64]bool, len(matched))
 		for _, t := range matched {
 			keep[t.ID] = true
 		}
+		out := totalRowsFor(rows, byID, keep)
+		if len(out) == 0 {
+			return fmt.Errorf("no tracked time for %q in %s..%s", fragment, startDate, endDate)
+		}
+		groups = append(groups, totalGroup{Fragment: fragment, Rows: out})
 	}
 
+	if jsonOut {
+		return renderTotalsJSON(env.w, groups)
+	}
+	renderTotals(env.w, groups)
+	return nil
+}
+
+// totalRowsFor turns the Reports API's summary rows into report lines: rows
+// whose task id is not in keep are dropped (a nil keep keeps everything, which
+// is the unfiltered listing), and each kept row is named from the local catalog
+// byID, falling back to the title the API supplied or `task #<id>`.
+func totalRowsFor(rows []api.SummaryTask, byID map[int64]store.Task, keep map[int64]bool) []totalRow {
 	var out []totalRow
 	for _, r := range rows {
 		if keep != nil && !keep[r.TaskID] {
@@ -491,25 +538,40 @@ func cmdTotal(env *cmdEnv, first bool, fragment string, since time.Time, jsonOut
 		}
 		out = append(out, row)
 	}
-	if len(out) == 0 {
-		if fragment != "" {
-			return fmt.Errorf("no tracked time for %q in %s..%s", fragment, startDate, endDate)
-		}
-		return fmt.Errorf("no tracked time in %s..%s", startDate, endDate)
-	}
+	sortTotalRows(out)
+	return out
+}
 
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Name != out[j].Name {
-			return out[i].Name < out[j].Name
+// sortTotalRows orders report lines by task name, then by task id so tasks
+// sharing a name still list in a stable order.
+func sortTotalRows(rows []totalRow) {
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Name != rows[j].Name {
+			return rows[i].Name < rows[j].Name
 		}
-		return out[i].TaskID < out[j].TaskID
+		return rows[i].TaskID < rows[j].TaskID
 	})
+}
 
-	if jsonOut {
-		return renderTotalsJSON(env.w, out)
+// distinctTotalRows flattens the fragment groups into the report's task list:
+// every distinct task once, in the same name order the groups use. Fragments
+// are independent searches and may overlap (both "write" and "docs" match
+// "Write docs"), so this is what keeps the overall total from counting a task
+// twice just because two fragments found it.
+func distinctTotalRows(groups []totalGroup) []totalRow {
+	var out []totalRow
+	seen := map[int64]bool{}
+	for _, g := range groups {
+		for _, r := range g.Rows {
+			if seen[r.TaskID] {
+				continue
+			}
+			seen[r.TaskID] = true
+			out = append(out, r)
+		}
 	}
-	renderTotals(env.w, out)
-	return nil
+	sortTotalRows(out)
+	return out
 }
 
 // dailyRow is one line of `tg daily`: a calendar day with everything tracked on
