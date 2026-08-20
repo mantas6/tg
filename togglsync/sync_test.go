@@ -231,6 +231,171 @@ func TestPushDeleteNeverPushed(t *testing.T) {
 	}
 }
 
+// TestPushSkipsGapEntries pins the sync boundary around gap entries (`tg gap`):
+// a gap is a local marker Toggl has no counterpart for, so a push must send
+// nothing about one — not even a POST creating it — while the tracked entry
+// queued next to it goes out as usual. The gap is deliberately stored dirty, the
+// state an edited or deleted one is left in.
+func TestPushSkipsGapEntries(t *testing.T) {
+	t.Parallel()
+	var bodies []map[string]any
+	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
+		bodies = append(bodies, decodeBody(t, r))
+		w.Write([]byte(`{"id":555,"at":"2026-01-02T13:00:00Z"}`))
+	})
+
+	noon := ts(t, "2026-01-02T12:00:00Z")
+	gapID := mustCreate(t, st, store.Entry{
+		WorkspaceID: 1, Start: noon, Stop: ptrTime(noon.Add(time.Hour)),
+		Duration: 3600, Gap: true, UpdatedAt: noon, Dirty: true,
+	})
+	tracked := ts(t, "2026-01-02T14:00:00Z")
+	trackedID := mustCreate(t, st, store.Entry{
+		WorkspaceID: 1, TaskID: ptrInt(7), Start: tracked,
+		Stop: ptrTime(tracked.Add(30 * time.Minute)), Duration: 1800,
+		UpdatedAt: tracked, Dirty: true,
+	})
+
+	res, err := Push(ctx, st, c, ts(t, "2026-01-02T15:00:00Z"))
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if res.Created != 1 || res.Updated != 0 || res.Deleted != 0 || len(res.Failed) != 0 {
+		t.Errorf("result = %+v, want only the tracked entry created", res)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("sent %d requests, want 1 (the gap must not be sent)", len(bodies))
+	}
+	if v, ok := bodies[0]["task_id"].(float64); !ok || int64(v) != 7 {
+		t.Errorf("sent task_id = %v, want the tracked entry's 7", bodies[0]["task_id"])
+	}
+	// The tracked entry is now synced; the gap is untouched — same row, still a
+	// gap, still without a remote id.
+	if got := mustEntryByRemoteID(t, st, 555); got == nil || got.ID != trackedID {
+		t.Errorf("remote 555 mirrors %+v, want the tracked entry (id %d)", got, trackedID)
+	}
+	entries, err := st.EntriesBetween(ctx, ts(t, "2026-01-02T00:00:00Z"), ts(t, "2026-01-03T00:00:00Z"))
+	if err != nil {
+		t.Fatalf("between: %v", err)
+	}
+	var gap *store.Entry
+	for i := range entries {
+		if entries[i].ID == gapID {
+			gap = &entries[i]
+		}
+	}
+	if gap == nil {
+		t.Fatal("the gap row is gone after a push")
+	}
+	if !gap.Gap || gap.RemoteID != nil {
+		t.Errorf("gap after push = %+v, want an unsynced gap", *gap)
+	}
+}
+
+// TestPushEntryRefusesGap checks the failsafe inside pushEntry itself: handed a
+// gap directly — bypassing the queue that already filters them — it sends
+// nothing, whatever else the entry looks like (new, already carrying a remote
+// id, deleted).
+func TestPushEntryRefusesGap(t *testing.T) {
+	t.Parallel()
+	start := ts(t, "2026-01-02T12:00:00Z")
+	stop := start.Add(time.Hour)
+	for _, tc := range []struct {
+		name  string
+		entry store.Entry
+	}{
+		{
+			name:  "new gap",
+			entry: store.Entry{WorkspaceID: 1, Start: start, Stop: &stop, Duration: 3600, Gap: true, Dirty: true},
+		},
+		{
+			// Impossible in practice (a gap is never synced, so it never gets
+			// an id), which is exactly why it must not be sent either.
+			name: "gap with a remote id",
+			entry: store.Entry{
+				RemoteID: ptrInt(42), WorkspaceID: 1, Start: start, Stop: &stop,
+				Duration: 3600, Gap: true, Dirty: true,
+			},
+		},
+		{
+			name: "deleted gap",
+			entry: store.Entry{
+				WorkspaceID: 1, Start: start, Stop: &stop, Duration: 3600,
+				Gap: true, Dirty: true, Deleted: true,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
+				t.Errorf("unexpected %s %s for a gap entry", r.Method, r.URL.Path)
+				w.WriteHeader(http.StatusOK)
+			})
+			var res PushResult
+			if err := pushEntry(ctx, st, c, tc.entry, ts(t, "2026-01-02T15:00:00Z"), &res); err != nil {
+				t.Fatalf("pushEntry: %v", err)
+			}
+			if res.Created != 0 || res.Updated != 0 || res.Deleted != 0 || len(res.Failed) != 0 {
+				t.Errorf("result = %+v, want nothing counted", res)
+			}
+		})
+	}
+}
+
+// TestPullLeavesGapEntriesAlone pins the other half of the boundary: a pull
+// reconciles by remote id, and a gap has none, so a remote entry can neither
+// overwrite a local gap nor be mistaken for one — even when the two occupy the
+// very same span (tg's overlap guard is a local rule; Toggl knows nothing of the
+// gap). The gap survives the pull unchanged, and the remote entry is inserted
+// beside it.
+func TestPullLeavesGapEntriesAlone(t *testing.T) {
+	t.Parallel()
+	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[{"id":900,"workspace_id":1,"description":"Remote lunch meeting",
+		  "start":"2026-01-02T12:00:00Z","stop":"2026-01-02T13:00:00Z",
+		  "duration":3600,"at":"2026-01-02T13:00:00Z"}]`))
+	})
+
+	noon := ts(t, "2026-01-02T12:00:00Z")
+	gapID := mustCreate(t, st, store.Entry{
+		WorkspaceID: 1, Start: noon, Stop: ptrTime(noon.Add(time.Hour)),
+		Duration: 3600, Gap: true, UpdatedAt: noon,
+	})
+
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-02T00:00:00Z"), ts(t, "2026-01-02T15:00:00Z"))
+	if err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	if res.Inserted != 1 || res.Updated != 0 || res.Deleted != 0 || res.Skipped != 0 {
+		t.Errorf("result = %+v, want a single insert", res)
+	}
+	entries, err := st.EntriesBetween(ctx, ts(t, "2026-01-02T00:00:00Z"), ts(t, "2026-01-03T00:00:00Z"))
+	if err != nil {
+		t.Fatalf("between: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries = %d, want the gap plus the pulled entry", len(entries))
+	}
+	var gaps, pulled int
+	for _, e := range entries {
+		switch {
+		case e.Gap:
+			gaps++
+			if e.ID != gapID || e.RemoteID != nil || e.Description != "" {
+				t.Errorf("gap changed under the pull: %+v", e)
+			}
+		default:
+			pulled++
+			if e.RemoteID == nil || *e.RemoteID != 900 {
+				t.Errorf("pulled entry = %+v, want remote 900", e)
+			}
+		}
+	}
+	if gaps != 1 || pulled != 1 {
+		t.Errorf("got %d gaps and %d pulled entries, want 1 each", gaps, pulled)
+	}
+}
+
 func TestPullInsert(t *testing.T) {
 	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {

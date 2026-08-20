@@ -1183,6 +1183,570 @@ func TestAddSyncFailureIsNonFatal(t *testing.T) {
 	}
 }
 
+// --- gap ---------------------------------------------------------------------
+
+// gapOnly reads the gap entries out of a listing, so the assertions below can
+// talk about "the gap" without indexing into a mixed slice.
+func gapOnly(entries []store.Entry) []store.Entry {
+	var out []store.Entry
+	for _, e := range entries {
+		if e.Gap {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestGapCreatesPlaceholderEntry covers what `tg gap` records: an entry
+// occupying the span with no task, no project and no description, marked as a
+// gap and — unlike `tg add`'s — NOT queued for a push, since Toggl has no
+// counterpart for it.
+func TestGapCreatesPlaceholderEntry(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	if err := cmdGap(env(&buf, s, nil, addNow, time.UTC), "12-13"); err != nil {
+		t.Fatalf("gap: %v", err)
+	}
+	if want := "Added: (gap)  12:00-13:00 (1h00m)\n"; buf.String() != want {
+		t.Errorf("output = %q, want %q", buf.String(), want)
+	}
+
+	entries := addWindow(t, s, addNow)
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	if !e.Gap {
+		t.Error("entry should be marked as a gap")
+	}
+	if e.TaskID != nil || e.ProjectID != nil || e.Description != "" {
+		t.Errorf("gap = (task %v, project %v, desc %q), want an empty marker",
+			e.TaskID, e.ProjectID, e.Description)
+	}
+	wantStart := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+	if !e.Start.Equal(wantStart) || e.Stop == nil || !e.Stop.Equal(wantStart.Add(time.Hour)) {
+		t.Errorf("span = %v-%v, want %v-%v", e.Start, e.Stop, wantStart, wantStart.Add(time.Hour))
+	}
+	if e.Duration != 3600 {
+		t.Errorf("duration = %d, want 3600", e.Duration)
+	}
+	if e.Seq != 1 {
+		t.Errorf("seq = %d, want 1: a gap takes part in the day's numbering", e.Seq)
+	}
+	if e.Dirty {
+		t.Error("a gap is never pushed, so it should not be queued dirty")
+	}
+	if dirty := mustDirtyEntries(t, s); len(dirty) != 0 {
+		t.Errorf("push queue = %+v, want it empty", dirty)
+	}
+}
+
+// TestGapSpanForms tables the timesign forms `tg gap` accepts, which are `add`'s
+// (they share addSpan): an absolute range, a relative span ending at the current
+// 5-minute mark, and a bare duration continuing from the last entry — the last
+// of which is the point of the command, since "the last entry" is what a gap
+// keeps the day anchored to.
+func TestGapSpanForms(t *testing.T) {
+	t.Parallel()
+	// 15:07 floors to 15:05, which is what the relative form ends at.
+	now := time.Date(2026, 1, 2, 15, 7, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		// anchored seeds a 09:00-10:00 tracked entry the bare duration
+		// continues from.
+		anchored  bool
+		timesign  string
+		wantRange string
+	}{
+		{name: "absolute", timesign: "12-13", wantRange: "12:00-13:00"},
+		{name: "absolute inheriting the hour", timesign: "12-:30", wantRange: "12:00-12:30"},
+		{name: "relative", timesign: "+:20", wantRange: "14:45-15:05"},
+		{name: "bare duration continues the last entry", anchored: true, timesign: ":30", wantRange: "10:00-10:30"},
+		{name: "bare duration in hours", anchored: true, timesign: "1:30", wantRange: "10:00-11:30"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
+			if tc.anchored {
+				if err := cmdAdd(env(io.Discard, s, nil, now, time.UTC), nil, false, "9-10", "login", ""); err != nil {
+					t.Fatalf("seed anchor: %v", err)
+				}
+			}
+			var buf bytes.Buffer
+			if err := cmdGap(env(&buf, s, nil, now, time.UTC), tc.timesign); err != nil {
+				t.Fatalf("gap %q: %v", tc.timesign, err)
+			}
+			if !strings.Contains(buf.String(), tc.wantRange) {
+				t.Errorf("output = %q, want the span %s", buf.String(), tc.wantRange)
+			}
+			gaps := gapOnly(addWindow(t, s, now))
+			if len(gaps) != 1 {
+				t.Fatalf("gap entries = %d, want 1", len(gaps))
+			}
+			got := formatClock(gaps[0].Start, time.UTC) + "-" + formatClock(*gaps[0].Stop, time.UTC)
+			if got != tc.wantRange {
+				t.Errorf("stored span = %s, want %s", got, tc.wantRange)
+			}
+		})
+	}
+}
+
+// TestGapRefusals tables the calls `tg gap` declines. They are `add`'s refusals
+// minus the task ones: a malformed or unanchorable timesign, a span that
+// overlaps something already recorded (a gap occupies its span as exclusively as
+// an entry), and the relative form on a day --date moved the command to. None of
+// them may record anything.
+func TestGapRefusals(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		// anchored seeds a 09:00-10:00 tracked entry; gapped seeds a
+		// 12:00-13:00 gap.
+		anchored bool
+		gapped   bool
+		date     string
+		timesign string
+		wantErr  []string
+	}{
+		{name: "no timesign", timesign: "  ", wantErr: []string{gapUsage}},
+		{name: "unparsable timesign", timesign: "nope", wantErr: []string{"timesign"}},
+		{name: "zero-length span", timesign: "12-12", wantErr: []string{"timesign"}},
+		{name: "negative timesign", timesign: "-30", wantErr: []string{"timesign", "tg mod"}},
+		{
+			name: "bare duration with nothing to continue from", timesign: ":30",
+			wantErr: []string{"no entry tracked today to continue from"},
+		},
+		{
+			name: "overlapping a tracked entry", anchored: true, timesign: "9:30-10:30",
+			wantErr: []string{"overlaps existing entry", "09:00-10:00", "Fix login bug"},
+		},
+		{
+			// A gap is just as exclusive as an entry, and the conflict names it
+			// as the marker it is.
+			name: "overlapping another gap", gapped: true, timesign: "12:30-14",
+			wantErr: []string{"overlaps existing entry", "12:00-13:00", gapLabel},
+		},
+		{
+			name: "relative timesign on another day", date: "2026-01-05", timesign: "+:20",
+			wantErr: []string{"relative timesign", "on 2026-01-05", "9-:30"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
+			wantEntries := 0
+			if tc.anchored {
+				if err := cmdAdd(env(io.Discard, s, nil, addNow, time.UTC), nil, false, "9-10", "login", ""); err != nil {
+					t.Fatalf("seed anchor: %v", err)
+				}
+				wantEntries++
+			}
+			if tc.gapped {
+				if err := cmdGap(env(io.Discard, s, nil, addNow, time.UTC), "12-13"); err != nil {
+					t.Fatalf("seed gap: %v", err)
+				}
+				wantEntries++
+			}
+
+			var buf bytes.Buffer
+			e := env(&buf, s, nil, addNow, time.UTC)
+			if tc.date != "" {
+				e = e.on(dayAnchor(t, tc.date, addNow, time.UTC))
+			}
+			err := cmdGap(e, tc.timesign)
+			if err == nil {
+				t.Fatalf("gap %q = nil error, want a refusal", tc.timesign)
+			}
+			for _, want := range tc.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("err = %v, want it to mention %q", err, want)
+				}
+			}
+			if buf.Len() != 0 {
+				t.Errorf("output = %q, want nothing written", buf.String())
+			}
+			if got := addWindow(t, s, addNow); len(got) != wantEntries {
+				t.Errorf("entries = %d, want %d (a refused gap records nothing)", len(got), wantEntries)
+			}
+		})
+	}
+}
+
+// TestGapOnAnotherDay covers --date: the gap lands on the day named, is numbered
+// there, and the confirmation says which day it is on — exactly as `tg add`
+// behaves, since the two share the flag and the span logic.
+func TestGapOnAnotherDay(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+	anchor := dayAnchor(t, "2026-01-05", addNow, time.UTC)
+
+	var buf bytes.Buffer
+	if err := cmdGap(env(&buf, s, nil, addNow, time.UTC).on(anchor), "12-13"); err != nil {
+		t.Fatalf("gap: %v", err)
+	}
+	if want := "Added: (gap)  12:00-13:00 (1h00m) on 2026-01-05\n"; buf.String() != want {
+		t.Errorf("output = %q, want %q", buf.String(), want)
+	}
+	day := time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC)
+	entries := mustEntries(t, s, day, day.AddDate(0, 0, 1))
+	if len(entries) != 1 || !entries[0].Gap || entries[0].Seq != 1 {
+		t.Fatalf("entries on 2026-01-05 = %+v, want one gap numbered 1", entries)
+	}
+	// Nothing landed on today.
+	if got := mustEntries(t, s, startOfDay(addNow, time.UTC), day); len(got) != 0 {
+		t.Errorf("today's entries = %+v, want none", got)
+	}
+}
+
+// TestAddContinuesFromGap is the reason gaps exist: a bare duration anchors
+// after a gap exactly as it does after a tracked entry, so marking lunch and
+// then logging the afternoon back to back needs no clock times at all.
+func TestAddContinuesFromGap(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+	e := env(io.Discard, s, nil, addNow, time.UTC)
+
+	if err := cmdAdd(e, nil, false, "9-12", "login", ""); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := cmdGap(e, ":30"); err != nil { // 12:00-12:30
+		t.Fatalf("gap: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := cmdAdd(env(&buf, s, nil, addNow, time.UTC), nil, false, "1:00", "review", ""); err != nil {
+		t.Fatalf("add after gap: %v", err)
+	}
+	if !strings.Contains(buf.String(), "12:30-13:30") {
+		t.Errorf("output = %q, want the entry to start where the gap ended (12:30)", buf.String())
+	}
+
+	entries := addWindow(t, s, addNow)
+	if len(entries) != 3 {
+		t.Fatalf("entries = %d, want 3", len(entries))
+	}
+	last := entries[2]
+	if last.Gap {
+		t.Error("the third entry should be the tracked one, not a gap")
+	}
+	if want := time.Date(2026, 1, 2, 12, 30, 0, 0, time.UTC); !last.Start.Equal(want) {
+		t.Errorf("start = %v, want %v", last.Start, want)
+	}
+	if last.Seq != 3 {
+		t.Errorf("seq = %d, want 3: the gap consumed number 2", last.Seq)
+	}
+}
+
+// TestGapExcludedFromTotals pins the one place a gap is not like an entry: its
+// span is accounted for, not tracked. `tg ls` lists it and notes its time
+// separately, `tg status`'s day total leaves it out, and `tg daily` neither
+// counts it nor lists a day that holds only gaps.
+func TestGapExcludedFromTotals(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+	now := time.Date(2026, 1, 2, 13, 30, 0, 0, time.UTC)
+	e := env(io.Discard, s, nil, now, time.UTC)
+	if err := cmdAdd(e, nil, false, "9-12", "login", ""); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := cmdGap(e, "12-13"); err != nil {
+		t.Fatalf("gap: %v", err)
+	}
+
+	// ls: the gap is a line of its own, its time is noted, the total is 3h.
+	var buf bytes.Buffer
+	if err := cmdToday(env(&buf, s, nil, now, time.UTC), 1, false, false); err != nil {
+		t.Fatalf("today: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"1  09:00-12:00 3h00m  Fix login bug",
+		"2  12:00-13:00 1h00m  (gap)",
+		"Total: 3h00m   (gap 1h00m)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("listing = %q, want %q", out, want)
+		}
+	}
+
+	// ls --json: the flag is there and the total excludes the gap.
+	buf.Reset()
+	if err := cmdToday(env(&buf, s, nil, now, time.UTC), 1, true, false); err != nil {
+		t.Fatalf("today --json: %v", err)
+	}
+	var listing todayJSON
+	if err := json.Unmarshal(buf.Bytes(), &listing); err != nil {
+		t.Fatalf("decode listing: %v", err)
+	}
+	if len(listing.Entries) != 2 {
+		t.Fatalf("json entries = %d, want 2", len(listing.Entries))
+	}
+	if !listing.Entries[1].Gap || listing.Entries[1].DurationSeconds != 3600 {
+		t.Errorf("json gap entry = %+v, want gap=true and its 3600s span", listing.Entries[1])
+	}
+	if listing.TotalSeconds != 10800 {
+		t.Errorf("json total = %d, want 10800 (the gap is not tracked)", listing.TotalSeconds)
+	}
+
+	// status: the gap is the last entry, and the day total is still 3h.
+	buf.Reset()
+	if err := cmdCurrent(env(&buf, s, nil, now, time.UTC), false); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if want := "(gap) 12:00-13:00 (gap 0h30m) Today: 3h00m\n"; buf.String() != want {
+		t.Errorf("status = %q, want %q", buf.String(), want)
+	}
+
+	// daily: 3h tracked on the day, and a day holding only a gap is no day at
+	// all (the gap-only 5th gets no line).
+	if err := cmdGap(env(io.Discard, s, nil, now, time.UTC).on(dayAnchor(t, "2026-01-05", now, time.UTC)), "12-13"); err != nil {
+		t.Fatalf("gap on another day: %v", err)
+	}
+	buf.Reset()
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), 8, false, false); err != nil {
+		t.Fatalf("daily: %v", err)
+	}
+	out = buf.String()
+	if !strings.Contains(out, "Fri 2026-01-02  3h00m   -5:00") {
+		t.Errorf("daily = %q, want the day to track 3h", out)
+	}
+	if strings.Contains(out, "2026-01-05") {
+		t.Errorf("daily = %q, want no line for a day holding only a gap", out)
+	}
+	if !strings.Contains(out, "(1 day x 8h00m)") {
+		t.Errorf("daily footer = %q, want it to count one listed day", out)
+	}
+}
+
+// TestModOnGapEntry checks `tg mod` treats a gap like any other entry: it is
+// addressable by its number and by being the last entry, both timesign forms
+// work, --desc labels it without turning it into a tracked entry — and none of
+// it is ever queued for Toggl.
+func TestModOnGapEntry(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		ref       int
+		timesign  string
+		desc      string
+		setDesc   bool
+		wantStop  time.Time
+		wantDesc  string
+		wantLabel string
+	}{
+		{
+			name: "relative extends the gap", ref: 2, timesign: "+30",
+			wantStop:  time.Date(2026, 1, 2, 13, 30, 0, 0, time.UTC),
+			wantLabel: "Modified: (gap)  12:00-13:30 (1h30m)",
+		},
+		{
+			name: "negative shortens the gap", timesign: "-30",
+			wantStop:  time.Date(2026, 1, 2, 12, 30, 0, 0, time.UTC),
+			wantLabel: "Modified: (gap)  12:00-12:30 (0h30m)",
+		},
+		{
+			name: "absolute retimes the gap", ref: 2, timesign: "12:30-13",
+			wantStop:  time.Date(2026, 1, 2, 13, 0, 0, 0, time.UTC),
+			wantLabel: "Modified: (gap)  12:30-13:00 (0h30m)",
+		},
+		{
+			name: "desc labels the gap", ref: 2, desc: "lunch", setDesc: true,
+			wantStop:  time.Date(2026, 1, 2, 13, 0, 0, 0, time.UTC),
+			wantDesc:  "lunch",
+			wantLabel: "Modified: (gap) lunch  12:00-13:00 (1h00m)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newStore(t)
+			seedCatalog(t, s)
+			now := time.Date(2026, 1, 2, 15, 7, 0, 0, time.UTC)
+			if err := cmdAdd(env(io.Discard, s, nil, now, time.UTC), nil, false, "9-12", "login", ""); err != nil {
+				t.Fatalf("seed entry: %v", err)
+			}
+			if err := cmdGap(env(io.Discard, s, nil, now, time.UTC), "12-13"); err != nil {
+				t.Fatalf("seed gap: %v", err)
+			}
+
+			var buf bytes.Buffer
+			if err := cmdMod(env(&buf, s, nil, now, time.UTC), tc.ref, tc.timesign, tc.desc, tc.setDesc); err != nil {
+				t.Fatalf("mod: %v", err)
+			}
+			if !strings.Contains(buf.String(), tc.wantLabel) {
+				t.Errorf("output = %q, want %q", buf.String(), tc.wantLabel)
+			}
+			gaps := gapOnly(addWindow(t, s, now))
+			if len(gaps) != 1 {
+				t.Fatalf("gap entries = %d, want 1 (a mod must not change what the entry is)", len(gaps))
+			}
+			gap := gaps[0]
+			if gap.Stop == nil || !gap.Stop.Equal(tc.wantStop) {
+				t.Errorf("stop = %v, want %v", gap.Stop, tc.wantStop)
+			}
+			if gap.Description != tc.wantDesc {
+				t.Errorf("description = %q, want %q", gap.Description, tc.wantDesc)
+			}
+			if gap.TaskID != nil || gap.ProjectID != nil {
+				t.Errorf("gap gained a task/project: %+v", gap)
+			}
+			// The edited gap is never offered to a push, whatever the row says.
+			for _, e := range mustDirtyEntries(t, s) {
+				if e.ID == gap.ID {
+					t.Error("an edited gap must not enter the push queue")
+				}
+			}
+		})
+	}
+}
+
+// TestDelGapEntry checks `tg del` removes a gap the way it removes any entry:
+// it leaves every listing at once, its number is retired rather than reused, and
+// nothing about it is queued for Toggl.
+func TestDelGapEntry(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+	now := time.Date(2026, 1, 2, 15, 7, 0, 0, time.UTC)
+	if err := cmdAdd(env(io.Discard, s, nil, now, time.UTC), nil, false, "9-12", "login", ""); err != nil {
+		t.Fatalf("seed entry: %v", err)
+	}
+	if err := cmdGap(env(io.Discard, s, nil, now, time.UTC), "12-13"); err != nil {
+		t.Fatalf("seed gap: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := cmdDel(env(&buf, s, nil, now, time.UTC), 2); err != nil {
+		t.Fatalf("del: %v", err)
+	}
+	if want := "Deleted: (gap)  12:00-13:00 (1h00m)\n"; buf.String() != want {
+		t.Errorf("output = %q, want %q", buf.String(), want)
+	}
+	entries := addWindow(t, s, now)
+	if len(entries) != 1 || entries[0].Gap {
+		t.Fatalf("entries = %+v, want only the tracked one", entries)
+	}
+	if _, err := s.EntryByNum(ctx, 2, now); !errors.Is(err, store.ErrNoEntryNum) {
+		t.Errorf("EntryByNum(2) = %v, want ErrNoEntryNum: the number is retired", err)
+	}
+	// The span is free again, and the next entry gets a fresh number.
+	if err := cmdAdd(env(io.Discard, s, nil, now, time.UTC), nil, false, "12-13", "review", ""); err != nil {
+		t.Fatalf("add over the deleted gap: %v", err)
+	}
+	got, err := s.EntryByNum(ctx, 3, now)
+	if err != nil {
+		t.Fatalf("EntryByNum(3): %v", err)
+	}
+	if got.Gap {
+		t.Error("entry 3 should be the tracked replacement")
+	}
+	// Only the tracked entries are ever queued.
+	for _, e := range mustDirtyEntries(t, s) {
+		if e.Gap {
+			t.Errorf("push queue contains a gap: %+v", e)
+		}
+	}
+}
+
+// TestGapDoesNotPush pins that recording a gap talks to nobody: `tg add` pushes
+// its new entry best-effort, `tg gap` has nothing to push, so an authenticated
+// invocation must still make no request at all.
+func TestGapDoesNotPush(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected %s %s: a gap is never synced", r.Method, r.URL.Path)
+		w.Write([]byte(`{"id":1,"at":"2026-01-02T12:00:00Z"}`))
+	}))
+	defer srv.Close()
+	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+
+	var buf bytes.Buffer
+	if err := cmdGap(env(&buf, s, c, addNow, time.UTC), "12-13"); err != nil {
+		t.Fatalf("gap: %v", err)
+	}
+	if strings.Contains(buf.String(), "warning") {
+		t.Errorf("output = %q, want no sync warning", buf.String())
+	}
+}
+
+// TestGapWorksOffline checks a gap needs no credentials: it has no task to look
+// up and no workspace to file against, so it records the same marker before
+// `tg auth` has ever run.
+func TestGapWorksOffline(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+
+	var buf bytes.Buffer
+	if err := cmdGap(unauthenticatedEnv(&buf, s, addNow, time.UTC), "12-13"); err != nil {
+		t.Fatalf("gap offline: %v", err)
+	}
+	entries := addWindow(t, s, addNow)
+	if len(entries) != 1 || !entries[0].Gap {
+		t.Fatalf("entries = %+v, want one gap", entries)
+	}
+	if entries[0].WorkspaceID != 0 {
+		t.Errorf("workspace_id = %d, want 0 (unknown, and never needed)", entries[0].WorkspaceID)
+	}
+}
+
+// TestGapFlagRegistration pins runGap's flag wiring through the same
+// bindGapFlags the command uses (see TestAddFlagRegistration): --date is the
+// only flag, it may sit before or after the timesign, and nothing else is
+// accepted — in particular none of `add`'s task-related flags.
+func TestGapFlagRegistration(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		args     []string
+		wantPos  []string
+		wantDate string
+		wantErr  string
+	}{
+		{args: nil},
+		{args: []string{"12-13"}, wantPos: []string{"12-13"}},
+		{args: []string{"12-13", "--date", "2026-01-05"}, wantPos: []string{"12-13"}, wantDate: "2026-01-05"},
+		{args: []string{"--date", "2026-01-05", "12-13"}, wantPos: []string{"12-13"}, wantDate: "2026-01-05"},
+		{args: []string{"--date=2026-01-05", ":30"}, wantPos: []string{":30"}, wantDate: "2026-01-05"},
+		// Not validated here, only collected (see TestResolveDateFlag).
+		{args: []string{"12-13", "--date", "nope"}, wantPos: []string{"12-13"}, wantDate: "nope"},
+		{args: []string{"12-13", "--date"}, wantErr: "needs an argument"},
+		{args: []string{"12-13", "--desc", "lunch"}, wantErr: "not defined"},
+		{args: []string{"12-13", "-1"}, wantErr: "not defined"},
+	} {
+		t.Run(fmt.Sprint(tc.args), func(t *testing.T) {
+			t.Parallel()
+			fs := flag.NewFlagSet("gap", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			f := bindGapFlags(fs)
+
+			rest, err := parseArgsAndFlags(fs, tc.args)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("parse %v: err = %v, want it to contain %q", tc.args, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parse %v: %v", tc.args, err)
+			}
+			if strings.Join(rest, ",") != strings.Join(tc.wantPos, ",") {
+				t.Errorf("positional = %q, want %q", rest, tc.wantPos)
+			}
+			if f.date != tc.wantDate {
+				t.Errorf("date = %q, want %q", f.date, tc.wantDate)
+			}
+		})
+	}
+}
+
 // --- mod / del ---------------------------------------------------------------
 
 // modNow is the reference instant `mod`/`del` resolve relative timesigns and
@@ -2317,6 +2881,11 @@ func TestRunDispatchValidatesArgs(t *testing.T) {
 	}{
 		{name: "add without a task", cmd: "add", args: []string{"9-10"}, wantErr: addUsage},
 		{name: "add with nothing at all", cmd: "add", wantErr: addUsage},
+		{name: "gap without a timesign", cmd: "gap", wantErr: gapUsage},
+		// A gap names nothing, so a second positional is a mistake rather than
+		// a fragment (which is what `add` would read it as).
+		{name: "gap with a second argument", cmd: "gap", args: []string{"12-13", "lunch"}, wantErr: gapUsage},
+		{name: "gap with an unknown flag", cmd: "gap", args: []string{"12-13", "--desc", "x"}, wantErr: "not defined"},
 		{name: "del without a number", cmd: "del", wantErr: "usage: tg del"},
 		{name: "del with two numbers", cmd: "del", args: []string{"1", "2"}, wantErr: "usage: tg del"},
 		{name: "del with a non-number", cmd: "del", args: []string{"x"}, wantErr: "invalid entry number"},
@@ -4855,6 +5424,46 @@ func TestTodayCommandGolden(t *testing.T) {
 		t.Fatalf("today: %v", err)
 	}
 	assertGolden(t, "today.txt", buf.String())
+}
+
+// TestTodayCommandGapGolden lists a day holding a gap entry, through the command
+// rather than the renderer, against the same golden the renderer is pinned to
+// (see TestRenderTodayGapEntryGolden): what `tg gap` records is listed as a
+// numbered entry labelled "(gap)", the untracked hole before now stays an
+// unnumbered filler row, and the footer separates the two.
+func TestTodayCommandGapGolden(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	if err := s.ReplaceProjects(ctx, []store.Project{
+		{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceTasks(ctx, []store.Task{
+		{ID: 10, WorkspaceID: 1, ProjectID: 1, Name: "Fix login bug", Active: true},
+		{ID: 12, WorkspaceID: 1, ProjectID: 1, Name: "Code review", Active: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The fixture is built through the commands themselves, so the listing is
+	// pinned to what `tg add`/`tg gap` actually record.
+	now := time.Date(2026, 1, 2, 13, 55, 0, 0, time.UTC)
+	build := env(io.Discard, s, nil, now, time.UTC)
+	if err := cmdAdd(build, nil, false, "9-12", "login", ""); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := cmdGap(build, "12-12:30"); err != nil {
+		t.Fatalf("gap: %v", err)
+	}
+	if err := cmdAdd(build, nil, false, "1:00", "review", ""); err != nil {
+		t.Fatalf("add after the gap: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := cmdToday(env(&buf, s, nil, now, time.UTC), 1, false, false); err != nil {
+		t.Fatalf("today: %v", err)
+	}
+	assertGolden(t, "today_gap.txt", buf.String())
 }
 
 // TestTodayCommandNumbers pins the numbers behind `tg mod 2` / `tg del 3`: the

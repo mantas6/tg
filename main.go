@@ -49,6 +49,8 @@ func run(ctx context.Context, cmd string, args []string) error {
 		return runAuth(ctx, args)
 	case "add":
 		return runAdd(ctx, args)
+	case "gap":
+		return runGap(ctx, args)
 	case "mod":
 		return runMod(ctx, args)
 	case "del":
@@ -128,6 +130,32 @@ func runAdd(ctx context.Context, args []string) error {
 			pid, fragment = resolved, rest[1]
 		}
 		return cmdAdd(env.on(day), pid, f.first, timesign, fragment, f.desc)
+	})
+}
+
+// runGap wires `tg gap <timesign>`: the timesign is the lone positional, since
+// a gap names nothing, and --date may move it to a later day exactly as it moves
+// `add` (the span logic is shared, see cmdGap).
+func runGap(ctx context.Context, args []string) error {
+	fs := newFlagSet("gap")
+	f := bindGapFlags(fs)
+	// --date may follow the timesign (`tg gap 12-13 --date 2026-08-25`), so
+	// positionals are peeled off the way `tg add` does it. No timesign form
+	// `gap` accepts starts with "-", so nothing positional looks like a flag.
+	rest, err := parseArgsAndFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(rest) != 1 {
+		return errors.New(gapUsage)
+	}
+	timesign := rest[0]
+	return withEnv(ctx, func(env *cmdEnv) error {
+		day, err := resolveDateFlag(f.date, env.now, env.loc)
+		if err != nil {
+			return err
+		}
+		return cmdGap(env.on(day), timesign)
 	})
 }
 
@@ -490,9 +518,10 @@ func bindDescFlag(fs *flag.FlagSet, desc *string, usage string) {
 	fs.StringVar(desc, "description", "", usage+" (alias of --desc)")
 }
 
-// bindDateFlag binds --date, the day `add` and `mod` work on instead of today.
-// Both take it (and so spell it identically), since an entry booked for another
-// day has to be editable on that day too.
+// bindDateFlag binds --date, the day `add`, `gap` and `mod` work on instead of
+// today. All three take it (and so spell it identically), since an entry booked
+// for another day has to be editable on that day too — and a day booked ahead
+// has gaps in it like any other.
 //
 // The value is a calendar date in dateLayout (YYYY-MM-DD), the one date format
 // tg's interface uses; an empty value means "today". Only today or a later day
@@ -503,8 +532,8 @@ func bindDateFlag(fs *flag.FlagSet, date *string) {
 		"the day the entry belongs to (YYYY-MM-DD); today or later, default today")
 }
 
-// resolveDateFlag turns `add`'s and `mod`'s --date value into the instant the
-// command reckons its calendar day by (see cmdEnv.day):
+// resolveDateFlag turns the --date value of `add`, `gap` and `mod` into the
+// instant the command reckons its calendar day by (see cmdEnv.day):
 //
 //   - absent, or naming now's own day: now itself, so the ordinary case is
 //     bit-for-bit the behavior tg had before the flag existed;
@@ -564,6 +593,26 @@ func bindAddFlags(fs *flag.FlagSet) *addFlags {
 	// either spelling sets the entry's description (empty leaves it blank).
 	bindDescFlag(fs, &f.desc, "entry description")
 	bindFirstFlag(fs, &f.first, "task or project")
+	bindDateFlag(fs, &f.date)
+	return f
+}
+
+// gapFlags holds `tg gap`'s flag values; see updateFlags for why registration is
+// a function of its own. The timesign is positional and stays out of here.
+//
+// There is deliberately nothing but --date: a gap has no task to name, so no
+// fragment and hence no -1/--first, and no description either — it is a marker,
+// and `tg mod --desc` is what labels one afterwards.
+type gapFlags struct {
+	// date is the day the gap belongs to (--date DATE), empty for today; see
+	// resolveDateFlag.
+	date string
+}
+
+func bindGapFlags(fs *flag.FlagSet) *gapFlags {
+	f := &gapFlags{}
+	// Same --date as `add`/`mod`, and for the same reason: a day booked ahead
+	// has gaps in it too.
 	bindDateFlag(fs, &f.date)
 	return f
 }
@@ -943,6 +992,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  auth [token]              verify a Toggl API token and store config")
 	fmt.Fprintln(w, "  add <timesign> [project] <task>  add a finished entry")
 	fmt.Fprintln(w, "                            [--desc TEXT] [--date DATE] [-1]")
+	fmt.Fprintln(w, "  gap <timesign>            occupy a span without tracking work in it")
+	fmt.Fprintln(w, "                            (lunch, an errand)               [--date DATE]")
 	fmt.Fprintln(w, "  mod [num] [timesign]      retime/rename an entry (default: last), e.g.")
 	fmt.Fprintln(w, "                            +30 / -30 minutes  [--desc TEXT] [--date DATE]")
 	fmt.Fprintln(w, "  del <num>                 delete the entry numbered by `tg ls`")
@@ -967,7 +1018,15 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "      +1, +1:20 (that long, ending at the last 5m mark), negative")
 	fmt.Fprintln(w, "      -:20, -1:20 (that much LESS; `mod` only), or a bare duration")
 	fmt.Fprintln(w, "      1:30, :45 (that long, starting where the last entry ended;")
-	fmt.Fprintln(w, "      `add` only). Full spec: docs/timesig.md")
+	fmt.Fprintln(w, "      `add`/`gap` only). Full spec: docs/timesig.md")
+	fmt.Fprintln(w, "gap:  `tg gap 12-13` (or `gap :30`, `gap +:20`) marks a span as")
+	fmt.Fprintln(w, "      occupied but untracked. It is an entry in every way that")
+	fmt.Fprintln(w, "      matters — numbered by `tg ls`, `mod`/`del` reach it, and a")
+	fmt.Fprintln(w, "      later bare duration continues after it — except that its")
+	fmt.Fprintln(w, "      time is left out of every total and it is never synced to")
+	fmt.Fprintln(w, "      Toggl. `tg ls` shows it as `(gap)` on its own numbered")
+	fmt.Fprintln(w, "      line, unlike the unnumbered filler rows that mark time")
+	fmt.Fprintln(w, "      nothing at all was recorded for.")
 	fmt.Fprintln(w, "mod:  numbers are the per-day ones shown by `tg ls` (assigned when an")
 	fmt.Fprintln(w, "      entry is added, never reused); without one the last entry is")
 	fmt.Fprintln(w, "      modified: today's newest already-started entry, the same one")
@@ -977,12 +1036,12 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "      30m back (never past the start; use `tg del` to remove an")
 	fmt.Fprintln(w, "      entry). Unlike other timesigns, a number without `:` is")
 	fmt.Fprintln(w, "      minutes for `mod`.")
-	fmt.Fprintln(w, "date: `add` and `mod` work on today; `--date YYYY-MM-DD` moves them to")
-	fmt.Fprintln(w, "      another day, which must be today or later (a day that is over")
-	fmt.Fprintln(w, "      is history and is refused). On a moved day the entry numbers,")
-	fmt.Fprintln(w, "      the \"last entry\" and an absolute timesign are all that day's;")
-	fmt.Fprintln(w, "      a relative timesign has no `now` there, so `add` refuses one")
-	fmt.Fprintln(w, "      (`mod` still takes +30/-30, which only move an end).")
+	fmt.Fprintln(w, "date: `add`, `gap` and `mod` work on today; `--date YYYY-MM-DD` moves")
+	fmt.Fprintln(w, "      them to another day, which must be today or later (a day that")
+	fmt.Fprintln(w, "      is over is history and is refused). On a moved day the entry")
+	fmt.Fprintln(w, "      numbers, the \"last entry\" and an absolute timesign are all that")
+	fmt.Fprintln(w, "      day's; a relative timesign has no `now` there, so `add`/`gap`")
+	fmt.Fprintln(w, "      refuse one (`mod` still takes +30/-30, which only move an end).")
 	fmt.Fprintln(w, "-1:   `add`/`grep`/`total`/`update`/`pull` match tasks and projects by")
 	fmt.Fprintln(w, "      name fragment; a fragment matching several of them normally")
 	fmt.Fprintln(w, "      fails with the candidates listed. `-1` (alias `--first`) takes")

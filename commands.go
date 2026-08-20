@@ -311,6 +311,75 @@ func anchorlessForms(dayMoved bool) string {
 	return "an absolute timesign (e.g. 9-:30) or a relative one (e.g. +1:30)"
 }
 
+// gapUsage is `tg gap`'s usage line: the timesign is the only argument, since a
+// gap has nothing to name. Both the argument peeling in runGap and cmdGap's own
+// guard report it, so it lives here once.
+const gapUsage = "usage: tg gap <timesign> [--date DATE]"
+
+// cmdGap records a GAP: an entry that occupies a span without tracking any work
+// in it. It is the placeholder for the parts of a day that are accounted for but
+// not worked — lunch, the school run, a meeting someone else logs — so the
+// entries around it stay anchored to each other instead of being separated by a
+// hole tg has to guess about.
+//
+// It is `tg add` without a task, and deliberately so: the span comes from the
+// same timesign forms resolved the same way (see addSpan, so an absolute range,
+// a relative span or a bare duration continuing the last entry all work, and
+// --date moves the whole lot to a later day), and the same overlap guard applies,
+// since a gap occupies its span as exclusively as an entry does.
+//
+// What it records is an ordinary row carrying store.Entry.Gap, which is what
+// makes the rest of tg treat it like an entry: it is numbered by the day it lands
+// on, it counts as "the last entry" so the next bare duration continues after it,
+// and `tg mod`/`tg del` address it by that number like anything else.
+//
+// Two things set it apart. It is not tracked TIME: `tg ls`, `tg status` and
+// `tg daily` leave its span out of their totals (the listing notes it
+// separately, see renderToday). And it is local: Toggl has no notion of it, so
+// nothing about it is ever pushed (see store.DirtyEntries) — which is why,
+// unlike `add`, this does not push and why it needs neither credentials nor a
+// task to know the workspace of. The configured workspace is recorded when there
+// is one, purely so the row looks like every other; a gap is never sent whatever
+// it says.
+func cmdGap(env *cmdEnv, timesign string) error {
+	if strings.TrimSpace(timesign) == "" {
+		return errors.New(gapUsage)
+	}
+	start, stop, err := addSpan(env, timesign)
+	if err != nil {
+		return err
+	}
+	// Time is exclusive, exactly as in cmdAdd: a gap may sit between two
+	// entries, but not inside one.
+	clashes, err := env.st.FindOverlapping(env.ctx, start, stop)
+	if err != nil {
+		return err
+	}
+	if len(clashes) > 0 {
+		return fmt.Errorf("%s-%s overlaps existing entry %s",
+			formatClock(start, env.loc), formatClock(stop, env.loc), overlapLabel(clashes[0], env.loc))
+	}
+
+	dur := stop.Sub(start)
+	if _, err := env.st.CreateEntry(env.ctx, store.Entry{
+		WorkspaceID: env.workspaceID,
+		Start:       start,
+		Stop:        &stop,
+		Duration:    int64(dur / time.Second),
+		Gap:         true,
+		UpdatedAt:   env.now,
+		// Clean from the start: there is no remote counterpart for a push to
+		// create, so the entry is not queued for one.
+		Dirty: false,
+	}); err != nil {
+		return err
+	}
+	fmt.Fprintf(env.w, "Added: %s  %s-%s (%s)%s\n",
+		gapLabel, formatClock(start, env.loc), formatClock(stop, env.loc), formatHM(dur),
+		dayNote(start, env.now, env.loc))
+	return nil
+}
+
 // cmdMod edits a single existing entry in place: its times (from a timesign),
 // its description, or both. At least one change must be requested.
 //
@@ -351,6 +420,11 @@ func anchorlessForms(dayMoved bool) string {
 // being modified is excluded from the check). The entry is stored dirty so a
 // later `tg push` sends it; unless tg is offline the push is attempted
 // immediately, best-effort, exactly like `tg add`.
+//
+// A gap entry (see cmdGap) is modified exactly like a tracked one — the same
+// timesign forms, the same refusals, the same overlap guard — except that the
+// push has nothing of it to send. What it cannot become is a tracked entry:
+// `--desc` labels the gap ("(gap) lunch") rather than replacing the marker.
 func cmdMod(env *cmdEnv, ref int, timesign, desc string, setDesc bool) error {
 	if timesign == "" && !setDesc {
 		return errors.New("usage: tg mod [entry-number] [timesign] [--desc TEXT] [--date DATE]")
@@ -518,6 +592,10 @@ func modShiftDuration(timesign string, now time.Time, loc *time.Location) (time.
 //
 // The deleted entry's number is retired with it: the day's numbering keeps the
 // gap instead of shifting every later entry down one.
+//
+// A gap entry (see cmdGap) is deleted exactly like a tracked one, number
+// retirement included. The push it triggers has nothing of the gap to send, so
+// its row simply stays behind, invisible to every listing.
 func cmdDel(env *cmdEnv, ref int) error {
 	if ref < 1 {
 		return errors.New("usage: tg del <entry-number>")
@@ -763,9 +841,17 @@ func cmdDaily(env *cmdEnv, targetHours float64, jsonOut, color bool) error {
 // chronological order EntriesBetween returns. Entries are bucketed by the day
 // their START falls on, so an entry that crosses midnight counts entirely
 // towards the day it began — the same day its per-day number belongs to.
+//
+// Gap entries are skipped outright rather than contributing zero: their span is
+// not tracked time (see totalDuration), so a day holding nothing but gaps is a
+// day nothing was worked on and gets no line at all — which is what keeps the
+// report's target, measured over the LISTED days, honest.
 func groupDaily(entries []store.Entry, now time.Time, loc *time.Location) []dailyRow {
 	var rows []dailyRow
 	for _, e := range entries {
+		if e.Gap {
+			continue
+		}
 		day := startOfDay(e.Start, loc)
 		if n := len(rows); n == 0 || !rows[n-1].Day.Equal(day) {
 			rows = append(rows, dailyRow{Day: day})
@@ -823,6 +909,10 @@ func cmdCurrent(env *cmdEnv, jsonOut bool) error {
 // Deleting an entry therefore leaves a gap rather than renumbering the rest. A
 // multi-day listing groups entries under a date header, since each day carries
 // its own 1..N; `mod`/`del` address today's numbers.
+//
+// Gap entries (see cmdGap) are listed as the entries they are, marked as gaps
+// and left out of the day's total; the untracked holes between entries stay the
+// unnumbered filler rows they always were (see renderToday).
 func cmdToday(env *cmdEnv, days int, jsonOut, color bool) error {
 	if days < 1 {
 		days = 1

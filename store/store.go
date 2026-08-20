@@ -103,10 +103,24 @@ type Entry struct {
 	Duration    int64 // seconds; -1 while running
 	Billable    bool
 	Seq         int // per-day entry number shown by `tg ls`; see CreateEntry
-	UpdatedAt   time.Time
-	SyncedAt    *time.Time
-	Dirty       bool
-	Deleted     bool
+
+	// Gap marks a placeholder entry (`tg gap`): a span that is deliberately
+	// occupied without any work being tracked in it — a lunch break, an
+	// errand — so the entries around it stay anchored to each other. It is an
+	// ordinary row in every other respect: it takes part in the per-day
+	// numbering, in the overlap guard and in "the last entry", so a relative
+	// span continues after it and `tg mod`/`tg del` address it like anything
+	// else.
+	//
+	// What it is NOT is a time entry Toggl knows about: a gap has no task, no
+	// project and no remote id, and it is never pushed (see DirtyEntries),
+	// which is also why nothing a pull brings down can ever be one.
+	Gap bool
+
+	UpdatedAt time.Time
+	SyncedAt  *time.Time
+	Dirty     bool
+	Deleted   bool
 
 	TaskName     string // joined, display only
 	ProjectName  string // joined, display only
@@ -221,7 +235,7 @@ func nullInt(p *int64) any {
 // fields (task name, project name and color).
 const entrySelect = `
 SELECT e.id, e.remote_id, e.workspace_id, e.project_id, e.task_id,
-       e.description, e.start, e.stop, e.duration, e.billable, e.seq,
+       e.description, e.start, e.stop, e.duration, e.billable, e.seq, e.gap,
        e.updated_at, e.synced_at, e.dirty, e.deleted, t.name, p.name, p.color
 FROM entries e
 LEFT JOIN tasks t ON t.id = e.task_id
@@ -243,8 +257,9 @@ func scanEntry(sc interface{ Scan(...any) error }) (Entry, error) {
 		projColor sql.NullString
 	)
 	if err := sc.Scan(&e.ID, &remoteID, &e.WorkspaceID, &projectID, &taskID,
-		&e.Description, &start, &stop, &e.Duration, &e.Billable, &e.Seq, &updatedAt,
-		&syncedAt, &e.Dirty, &e.Deleted, &taskName, &projName, &projColor); err != nil {
+		&e.Description, &start, &stop, &e.Duration, &e.Billable, &e.Seq, &e.Gap,
+		&updatedAt, &syncedAt, &e.Dirty, &e.Deleted, &taskName, &projName,
+		&projColor); err != nil {
 		return Entry{}, err
 	}
 	if remoteID.Valid {
@@ -381,9 +396,19 @@ ORDER BY e.start ASC`,
 	return collectEntries(rows)
 }
 
-// DirtyEntries returns every entry with unsynced local changes, oldest first.
+// DirtyEntries returns the push queue: every entry with unsynced local changes,
+// oldest first.
+//
+// Gap entries are never in it, however dirty they look. A gap (see Entry.Gap) is
+// a local-only marker with no counterpart on Toggl, so there is nothing about it
+// to send — and excluding it here, at the one query that defines what a push
+// looks at, is what keeps editing or deleting a gap from being a special case
+// inside the sync code. A deleted gap therefore keeps its row for good, which is
+// also what keeps its per-day number retired (see nextSeqExpr); the row is
+// filtered out of every read, so nothing shows it again.
 func (s *Store) DirtyEntries(ctx context.Context) ([]Entry, error) {
-	rows, err := s.ex.QueryContext(ctx, entrySelect+" WHERE e.dirty = 1 ORDER BY e.start ASC")
+	rows, err := s.ex.QueryContext(ctx, entrySelect+
+		" WHERE e.dirty = 1 AND e.gap = 0 ORDER BY e.start ASC")
 	if err != nil {
 		return nil, fmt.Errorf("list dirty entries: %w", err)
 	}
@@ -506,6 +531,7 @@ func (s *Store) CreateEntry(ctx context.Context, e Entry) (int64, error) {
 	ins.set("stop", nullTime(e.Stop))
 	ins.set("duration", e.Duration)
 	ins.set("billable", boolToInt(e.Billable))
+	ins.set("gap", boolToInt(e.Gap))
 	// seq is computed by SQL rather than supplied, so the subquery's three
 	// arguments (the day's bounds and the id to exclude — nothing, on an
 	// insert) are attached to the column they belong to.
@@ -560,6 +586,12 @@ func dayStart(t time.Time, loc *time.Location) time.Time {
 // sends the change. It backs `tg mod`; remote_id, synced_at and the deleted
 // flag are deliberately left alone, so an already-synced entry keeps its remote
 // identity and is PUT rather than re-created. A missing id is an error.
+//
+// The gap flag is left alone too: what an entry IS (a tracked entry or the
+// placeholder `tg gap` records) is fixed when it is created, so retiming or
+// re-describing one never turns it into the other. A gap is otherwise edited
+// exactly like any other entry, dirty flag included — the push queue is where it
+// is filtered out (see DirtyEntries).
 //
 // This is the single local edit path, so it is also where the "today only"
 // failsafe lives: the stored start and the incoming start are both checked
@@ -695,6 +727,10 @@ var ErrEntryNotFound = errors.New("entry not found")
 // (joining the caller's when there is one, see WithTx), so the row that was
 // looked up is the row that is written and no half-applied update survives a
 // failure partway through.
+//
+// A gap entry can never be reached from here: gaps are local-only and so carry
+// no remote id (see Entry.Gap), which is what keeps a pull from overwriting one
+// with a remote entry that happens to occupy the same span.
 func (s *Store) UpdateFromRemote(ctx context.Context, e Entry) error {
 	return s.WithTx(ctx, func(tx *Store) error {
 		id, oldStart, err := tx.entryByRemote(ctx, e.RemoteID)

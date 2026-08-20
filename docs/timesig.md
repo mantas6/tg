@@ -1,7 +1,7 @@
 # Time signature ("timesign") spec
 
 A *timesign* is the compact wall-clock notation `tg` accepts wherever a command
-needs a finished time range (`tg add`, `tg mod`). Four forms exist:
+needs a finished time range (`tg add`, `tg gap`, `tg mod`). Four forms exist:
 
 | Form     | Shape         | Example  | Meaning                                    |
 | -------- | ------------- | -------- | ------------------------------------------ |
@@ -27,8 +27,8 @@ its arguments).
 
 The absolute and relative forms resolve to a time range on their own. The other
 two do not, so each is only accepted where the command can anchor it: a bare
-duration in `tg add`, which starts it at the last entry's end, and a negative
-length in `tg mod`, which takes it off the entry's end.
+duration in `tg add`/`tg gap`, which starts it at the last entry's end, and a
+negative length in `tg mod`, which takes it off the entry's end.
 
 The reference implementation is the `timesig` package (`timesig/timesig.go`);
 this document and that package must stay in sync.
@@ -169,7 +169,7 @@ Examples:
 
 The parser above is shared, but a command decides which reference instant a
 timesign is resolved against, and `tg mod` deliberately reads the relative form
-differently from `tg add`.
+differently from `tg add` (which `tg gap` follows exactly).
 
 ### `tg add <timesign>`
 
@@ -199,6 +199,20 @@ future (an absolute range may too): the anchor is the last stop, not now. For
 the same reason it may run past midnight — the start is always today's, so the
 entry is still recorded on today, the way a relative span may start on the
 previous day.
+
+### `tg gap <timesign>`
+
+Identical to `tg add`, form for form: `gap` is `add` without a task, so the span
+is resolved by the very same code. An absolute range lands on the day worked on,
+a relative span ends at the current 5-minute mark, and a bare duration continues
+from the last entry — including a gap, so `tg gap :30` followed by
+`tg add 1:00 <task>` anchors both.
+
+The only difference is what the span becomes: an entry that occupies the time
+without tracking any work in it. That makes it "the last entry" for the next
+anchor and part of the overlap check, exactly like a tracked entry (see the
+README's "Untracked spans: `gap`"). Every refusal above applies unchanged,
+including the relative form on a day `--date` moved the command to.
 
 ### `tg mod [num] <timesign>`
 
@@ -250,21 +264,21 @@ range.
 
 ### The day a timesign lands on
 
-Both commands work on **today** unless `--date YYYY-MM-DD` names a later day
+All three commands work on **today** unless `--date YYYY-MM-DD` names a later day
 (today or later only: a day that is over is never rewritten). On the day named:
 
-| Form                | With `--date`                                                     |
-| ------------------- | ----------------------------------------------------------------- |
-| absolute `9-10`     | resolved on that day (`add`), or on the entry's own day (`mod`)   |
-| bare duration `1:30`| continues **that day's** last entry (`add`)                        |
-| relative `+:20`     | **refused** by `add`; `mod` still moves the entry's end by it      |
-| negative `-:20`     | unchanged: `mod` moves the entry's end back by it                  |
+| Form                | With `--date`                                                        |
+| ------------------- | -------------------------------------------------------------------- |
+| absolute `9-10`     | resolved on that day (`add`/`gap`), or on the entry's own day (`mod`) |
+| bare duration `1:30`| continues **that day's** last entry (`add`/`gap`)                     |
+| relative `+:20`     | **refused** by `add`/`gap`; `mod` still moves the entry's end by it   |
+| negative `-:20`     | unchanged: `mod` moves the entry's end back by it                     |
 
 The relative form is the one exception because it is defined by "now": it ends
 at the current 5-minute mark, which exists only today, and no hour of another
-day is a defensible substitute. `add` therefore refuses it there and names the
-forms that do work; `mod` keeps taking it, since only its `DURATION` is used
-(see the table above).
+day is a defensible substitute. `add` and `gap` therefore refuse it there and
+name the forms that do work; `mod` keeps taking it, since only its `DURATION` is
+used (see the table above).
 
 The refusals that name a day follow the flag too: with `--date 2026-01-05` an
 unanchorable bare duration reads "no entry tracked on 2026-01-05 to continue
@@ -321,11 +335,12 @@ Duration:
 (An empty input and anything containing `-` never reach the duration parser via
 `IsDuration`; they are classified as absolute or negative and rejected there.)
 
-Beyond the parser, `tg add` refuses a bare duration it cannot anchor: no entry
-tracked on the day it works on, or a last entry that is still running. It also
-refuses a relative timesign on a day `--date` moved it to (see [The day a
-timesign lands on](#the-day-a-timesign-lands-on)). `tg mod` refuses a negative
-timesign that would consume the whole entry, and either sign on a running one.
+Beyond the parser, `tg add` (and `tg gap`) refuses a bare duration it cannot
+anchor: no entry tracked on the day it works on, or a last entry that is still
+running. It also refuses a relative timesign on a day `--date` moved it to (see
+[The day a timesign lands on](#the-day-a-timesign-lands-on)). `tg mod` refuses a
+negative timesign that would consume the whole entry, and either sign on a
+running one.
 
 ## API
 

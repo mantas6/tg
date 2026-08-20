@@ -626,6 +626,164 @@ func TestTotalDuration(t *testing.T) {
 	}
 }
 
+// TestTotalDurationExcludesGaps pins the one entry kind that is listed but not
+// counted: a gap holds time the day accounts for without working it, so it stays
+// out of the tracked total (and can never make the total look "running"), while
+// gapDuration reports it separately for the listing's footer.
+func TestTotalDurationExcludesGaps(t *testing.T) {
+	t.Parallel()
+	entries, now := sampleDay() // 1h15m stored + 0h45m live = 2h
+	lunch := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+	lunchStop := lunch.Add(30 * time.Minute)
+	withGap := append(entries,
+		store.Entry{ID: 13, Seq: 3, Gap: true, Start: lunch, Stop: &lunchStop, Duration: 1800})
+
+	total, anyRunning := totalDuration(withGap, now)
+	if want := 2 * time.Hour; total != want {
+		t.Errorf("total = %v, want %v (the gap's 30m is not tracked time)", total, want)
+	}
+	if !anyRunning {
+		t.Error("anyRunning = false, want true (the fixture's running entry is unaffected)")
+	}
+	if got, want := gapDuration(withGap), 30*time.Minute; got != want {
+		t.Errorf("gapDuration = %v, want %v", got, want)
+	}
+	if got := gapDuration(entries); got != 0 {
+		t.Errorf("gapDuration without gaps = %v, want 0", got)
+	}
+
+	// A day of nothing but gaps tracks nothing at all.
+	onlyGap := withGap[len(withGap)-1:]
+	if total, anyRunning := totalDuration(onlyGap, now); total != 0 || anyRunning {
+		t.Errorf("gap-only total = (%v, %v), want (0, false)", total, anyRunning)
+	}
+}
+
+// TestEntryLabel pins how an entry is named everywhere one is named: its task,
+// falling back to its description — and, for a gap, the marker, with any
+// description put on it later appended rather than replacing it.
+func TestEntryLabel(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		entry store.Entry
+		want  string
+	}{
+		{name: "task", entry: store.Entry{TaskName: "Code review"}, want: "Code review"},
+		{
+			name:  "task wins over description",
+			entry: store.Entry{TaskName: "Code review", Description: "pairing"},
+			want:  "Code review",
+		},
+		{name: "description only", entry: store.Entry{Description: "pairing"}, want: "pairing"},
+		{name: "nothing", entry: store.Entry{}, want: ""},
+		{name: "gap", entry: store.Entry{Gap: true}, want: "(gap)"},
+		{
+			name:  "described gap",
+			entry: store.Entry{Gap: true, Description: "lunch"},
+			want:  "(gap) lunch",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := entryLabel(tc.entry); got != tc.want {
+				t.Errorf("entryLabel = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// sampleGapDay is sampleDay with a gap entry and a genuinely untracked hole, the
+// fixture behind the gap goldens: a tracked entry, a gap covering lunch, a
+// second tracked entry, and 25 minutes of nothing before now.
+func sampleGapDay() (entries []store.Entry, now time.Time) {
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	at := func(h, m int) time.Time {
+		return day.Add(time.Duration(h)*time.Hour + time.Duration(m)*time.Minute)
+	}
+	pt := func(t time.Time) *time.Time { return &t }
+	entries = []store.Entry{
+		{ID: 11, Seq: 1, TaskName: "Fix login bug", ProjectName: "Backend",
+			Start: at(9, 0), Stop: pt(at(12, 0)), Duration: 10800},
+		{ID: 12, Seq: 2, Gap: true, Start: at(12, 0), Stop: pt(at(12, 30)), Duration: 1800},
+		{ID: 13, Seq: 3, TaskName: "Code review", ProjectName: "Backend",
+			Start: at(12, 30), Stop: pt(at(13, 30)), Duration: 3600},
+	}
+	return entries, at(13, 55)
+}
+
+// TestRenderTodayGapEntryGolden pins the listing's three kinds of row apart: a
+// tracked entry, a GAP ENTRY (numbered, ranged, labelled "(gap)", its time noted
+// in the footer but left out of the total) and an untracked hole (no number, its
+// text in the duration column).
+func TestRenderTodayGapEntryGolden(t *testing.T) {
+	t.Parallel()
+	entries, now := sampleGapDay()
+	var buf bytes.Buffer
+	renderToday(&buf, entries, now, time.UTC, false)
+	assertGolden(t, "today_gap.txt", buf.String())
+
+	got := buf.String()
+	// The gap entry is a numbered line naming the marker...
+	if want := "2  12:00-12:30 0h30m  (gap)\n"; !strings.Contains(got, want) {
+		t.Errorf("listing missing the gap entry line %q:\n%s", want, got)
+	}
+	// ...while the untracked hole stays an unnumbered filler row.
+	if want := strings.Repeat(" ", 15) + "(gap 0h25m)\n"; !strings.Contains(got, want) {
+		t.Errorf("listing missing the untracked filler row %q:\n%s", want, got)
+	}
+	// 3h + 1h tracked; the gap's 30m is reported, not totalled.
+	if want := "Total: 4h00m   (gap 0h30m)\n"; !strings.HasSuffix(got, want) {
+		t.Errorf("footer = %q, want it to end with %q", got, want)
+	}
+}
+
+func TestRenderTodayGapEntryJSONGolden(t *testing.T) {
+	t.Parallel()
+	entries, now := sampleGapDay()
+	var buf bytes.Buffer
+	if err := renderTodayJSON(&buf, entries, now); err != nil {
+		t.Fatal(err)
+	}
+	assertGolden(t, "today_gap.json", buf.String())
+
+	got := buf.String()
+	// The gap carries its span and the flag, and no task; the total excludes it.
+	if !strings.Contains(got, `{"num":2,"id":12,"gap":true,"start":"2026-01-02T12:00:00Z","stop":"2026-01-02T12:30:00Z","duration_seconds":1800,"running":false}`) {
+		t.Errorf("json missing the gap entry:\n%s", got)
+	}
+	if !strings.Contains(got, `"total_seconds":14400`) {
+		t.Errorf("json total should exclude the gap's 1800s:\n%s", got)
+	}
+	// An ordinary entry's shape is unchanged: no "gap" key at all.
+	if strings.Contains(got, `"id":11,"gap"`) {
+		t.Errorf("a tracked entry should carry no gap field:\n%s", got)
+	}
+}
+
+// TestRenderTodayGapColor checks the one styling difference: on a terminal a gap
+// entry's line is dimmed (like `tg daily`'s not-yet-worked days), while the
+// tracked entries around it are not. Plain output carries no escapes at all.
+func TestRenderTodayGapColor(t *testing.T) {
+	t.Parallel()
+	entries, now := sampleGapDay()
+	var buf bytes.Buffer
+	renderToday(&buf, entries, now, time.UTC, true)
+	got := buf.String()
+	if want := faint("2    12:00-12:30 0h30m  (gap)") + "\n"; !strings.Contains(got, want) {
+		t.Errorf("colored output missing dimmed gap line %q:\n%q", want, got)
+	}
+	if strings.Contains(got, faint("1  ")) {
+		t.Errorf("a tracked entry must not be dimmed:\n%q", got)
+	}
+
+	buf.Reset()
+	renderToday(&buf, entries, now, time.UTC, false)
+	if strings.Contains(buf.String(), "\x1b") {
+		t.Errorf("plain output contains ANSI escapes:\n%q", buf.String())
+	}
+}
+
 func TestTruncName(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

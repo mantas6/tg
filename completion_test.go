@@ -20,14 +20,14 @@ func TestCompletionZsh(t *testing.T) {
 		"compdef _tg tg",
 		"tg tasks --json",
 		// Every command and alias accepted by run() must be offered.
-		"'auth:", "'add:", "'mod:", "'del:", "\"current:", "\"status:",
+		"'auth:", "'add:", "'gap:", "'mod:", "'del:", "\"current:", "\"status:",
 		"\"today:", "\"list:", "\"ls:", "\"daily:", "'tasks:", "'grep:", "'projects:",
 		"\"update:", "'push:", "\"pull:", "'total:",
 		"'completion:", "'help:",
 		// `projects` has a subcommand of its own.
 		"__tg_projects_cmds", "'update:sync all workspace projects'",
 		// Per-command argument handling for the commands with flags.
-		"        add)", "        mod)", "        del)",
+		"        add)", "        gap)", "        mod)", "        del)",
 		"        current|status|push)", "        today|list|ls)", "        daily)",
 		"        tasks)", "        grep)", "        projects)", "        update)",
 		"        pull)", "        total)",
@@ -68,7 +68,7 @@ func TestCompletionCoversDispatch(t *testing.T) {
 	}
 	out := buf.String()
 	for _, cmd := range []string{
-		"auth", "add", "mod", "del", "current", "status", "today", "list",
+		"auth", "add", "gap", "mod", "del", "current", "status", "today", "list",
 		"ls", "daily", "tasks", "grep", "projects", "update", "push",
 		"pull", "total", "completion", "help",
 	} {
@@ -121,17 +121,18 @@ func TestCompletionOffersFirstFlag(t *testing.T) {
 			}
 		}
 	}
-	for _, cmd := range []string{"mod", "del", "tasks", "daily"} {
+	for _, cmd := range []string{"gap", "mod", "del", "tasks", "daily"} {
 		if strings.Contains(blocks[cmd], "'-1[") {
 			t.Errorf("%s takes no fragment, it should not offer -1:\n%s", cmd, blocks[cmd])
 		}
 	}
 }
 
-// TestCompletionOffersDateFlag pins --date to the two commands that take it
-// (see bindDateFlag): `add` and `mod` are the only ones that write an entry to a
-// particular day, and both must complete it as a date. The other commands must
-// not offer it — `pull`/`total` take a window start, which is --since.
+// TestCompletionOffersDateFlag pins --date to the three commands that take it
+// (see bindDateFlag): `add`, `gap` and `mod` are the only ones that write an
+// entry to a particular day, and each must complete it as a date. The other
+// commands must not offer it — `pull`/`total` take a window start, which is
+// --since.
 func TestCompletionOffersDateFlag(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
@@ -139,7 +140,7 @@ func TestCompletionOffersDateFlag(t *testing.T) {
 		t.Fatalf("completion: %v", err)
 	}
 	blocks := completionBlocks(buf.String())
-	for _, cmd := range []string{"add", "mod"} {
+	for _, cmd := range []string{"add", "gap", "mod"} {
 		block, ok := blocks[cmd]
 		if !ok {
 			t.Fatalf("completion script has no %q block", cmd)

@@ -15,7 +15,10 @@ import (
 // out at insert time, restarting at 1 on every calendar day and never reused,
 // so a listing's numbers survive later listings and deletions leave gaps
 // instead of renumbering their neighbours. entry_refs is dropped.
-const schemaVersion = "4"
+// v5 added entries.gap, marking the placeholder entries `tg gap` records: rows
+// that occupy a span without tracking work and that Toggl never hears about
+// (see Entry.Gap).
+const schemaVersion = "5"
 
 // schemaSQL creates every table and index. It is idempotent (IF NOT EXISTS),
 // so applying it repeatedly is safe and forms the basis of migration.
@@ -32,6 +35,7 @@ CREATE TABLE IF NOT EXISTS entries (
   duration     INTEGER NOT NULL,
   billable     INTEGER NOT NULL DEFAULT 0,
   seq          INTEGER NOT NULL DEFAULT 0,
+  gap          INTEGER NOT NULL DEFAULT 0,
   updated_at   TEXT NOT NULL,
   synced_at    TEXT,
   dirty        INTEGER NOT NULL DEFAULT 1,
@@ -74,6 +78,9 @@ var addColumns = []struct{ table, column, ddl string }{
 	{"entries", "billable", "ALTER TABLE entries ADD COLUMN billable INTEGER NOT NULL DEFAULT 0"},
 	{"projects", "billable", "ALTER TABLE projects ADD COLUMN billable INTEGER NOT NULL DEFAULT 0"},
 	{"entries", "seq", "ALTER TABLE entries ADD COLUMN seq INTEGER NOT NULL DEFAULT 0"},
+	// Every row that predates the column is an ordinary tracked entry, which
+	// is exactly what the 0 default says, so no back-fill is needed.
+	{"entries", "gap", "ALTER TABLE entries ADD COLUMN gap INTEGER NOT NULL DEFAULT 0"},
 }
 
 // migrate applies the schema, back-fills any columns added in later versions on
