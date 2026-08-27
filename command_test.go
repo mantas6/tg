@@ -4912,7 +4912,9 @@ func TestTodayCommandNumbers(t *testing.T) {
 	if err := cmdToday(env(&buf, s, nil, now, loc), 1, false, false); err != nil {
 		t.Fatalf("today after del: %v", err)
 	}
-	if !strings.Contains(buf.String(), "2  10:30-") {
+	// The survivor is the running entry, so it carries the `<` current-marker
+	// after its number; what matters here is that the number stays 2.
+	if !strings.Contains(buf.String(), "2< 10:30-") {
 		t.Errorf("listing renumbered the survivor:\n%s", buf.String())
 	}
 

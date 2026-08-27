@@ -322,8 +322,16 @@ func renderToday(w io.Writer, entries []store.Entry, now time.Time, loc *time.Lo
 				lead = block + " "
 			}
 		}
-		line := fmt.Sprintf("%*d  %s%-12s%-7s%-17s %s",
-			numWidth, e.Seq, lead, startClk+"-"+stopClk, formatHM(dur), label, project)
+		// The running (current) entry gets a `<` marker right after its number.
+		// It consumes the first of the two spaces that separate the number
+		// column from the rest, so nothing downstream shifts: a running row
+		// reads "2< 10:30-..." exactly where a finished "2  10:30-..." sat.
+		mark := "  "
+		if e.Stop == nil {
+			mark = "< "
+		}
+		line := fmt.Sprintf("%*d%s%s%-12s%-7s%-17s %s",
+			numWidth, e.Seq, mark, lead, startClk+"-"+stopClk, formatHM(dur), label, project)
 		fmt.Fprintln(w, strings.TrimRight(line, " "))
 	}
 

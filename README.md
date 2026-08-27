@@ -383,6 +383,10 @@ Gap rows are not entries and carry no number: they show idle time between two
 entries, and the last one shows the idle time since the newest entry stopped
 (only within the same day, and never while an entry is running).
 
+The current (running) entry is marked with a `<` right after its number
+(`2<` above where `2` would sit), so the one you are on stands out at a glance.
+The marker takes the place of a padding space, so no other row shifts.
+
 `--days N` looks further back. Since every day has its own 1..N, a multi-day
 listing groups the entries under a date header; `mod`/`del` address today's
 numbers. `--json` emits the same data with `num` on each entry.

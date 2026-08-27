@@ -392,6 +392,48 @@ func TestRenderTodayNumbersAreNotPositions(t *testing.T) {
 	}
 }
 
+// TestRenderTodayCurrentMarker pins the running-entry marker: the current
+// (running) entry gets a `<` right after its number, and that marker consumes
+// one of the two spaces between the number and the clock column so no other
+// row shifts — the finished rows land in exactly the columns they would
+// without any running entry present.
+func TestRenderTodayCurrentMarker(t *testing.T) {
+	t.Parallel()
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) time.Time { return day.Add(d) }
+	pt := func(t time.Time) *time.Time { return &t }
+
+	entries := []store.Entry{
+		{Seq: 1, TaskName: "A", Start: at(9 * time.Hour), Stop: pt(at(10 * time.Hour)), Duration: 3600},
+		{Seq: 2, TaskName: "B", Start: at(10 * time.Hour), Duration: -1},
+	}
+	var buf bytes.Buffer
+	renderToday(&buf, entries, at(10*time.Hour+45*time.Minute), time.UTC, false)
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	want := []string{
+		"1  09:00-10:00 1h00m  A",
+		"2< 10:00-  *   0h45m  B",
+		todayDivider,
+		"Total: 1h45m   (* running)",
+	}
+	if len(lines) != len(want) {
+		t.Fatalf("got %d lines, want %d:\n%s", len(lines), len(want), buf.String())
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Errorf("line %d = %q, want %q", i, lines[i], want[i])
+		}
+	}
+
+	// The marker must not move the clock column: the finished row's clock sits
+	// at exactly the byte offset it would with no running entry at all.
+	finishedClk := strings.Index(lines[0], "09:00")
+	runningClk := strings.Index(lines[1], "10:00")
+	if finishedClk != runningClk {
+		t.Errorf("clock column shifted: finished at %d, running at %d", finishedClk, runningClk)
+	}
+}
+
 // TestRenderTodayMultiDayHeaders covers the one place the flat table changes
 // shape: each calendar day numbers from 1, so a listing spanning days labels
 // the groups. A single-day listing gets no header at all.
