@@ -147,7 +147,9 @@ _tg() {
         daily)
           _arguments '--json[emit JSON]' \
             '--target[target hours worked per day (default 8)]:hours:' \
-            '-t[target hours worked per day (alias of --target)]:hours:'
+            '-t[target hours worked per day (alias of --target)]:hours:' \
+            '--no-today[exclude today from the output]' \
+            '-n[exclude today from the output (alias of --no-today)]'
           ;;
         tasks)
           _arguments '--all[include inactive tasks]' '--json[emit JSON]'

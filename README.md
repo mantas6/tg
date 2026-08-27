@@ -413,8 +413,15 @@ short.
 tg daily              # this month against an 8h/day target
 tg daily -t 6         # ...against 6h/day
 tg daily --target 7.5 # half-hour targets are fine
+tg daily -n           # exclude today (alias --no-today)
 tg daily --json       # machine-readable
 ```
+
+`-n`/`--no-today` drops today's row from the listing **and** the footer's
+totals, so the report covers only the days that are already over — handy while
+today is still in progress and its half-finished figure would otherwise skew
+the overtime. Days booked *ahead* are kept, since `-n` removes only today
+itself, not the future.
 
 **Only days you actually tracked something get a line**, and the footer's target
 is the daily target multiplied by the number of *listed* days — so weekends and
@@ -448,7 +455,7 @@ commands:
   current | status          last entry, gap, day total        [--json]
   today   | list | ls       show today's entries     [--days N] [--json]
   daily                     this month's time per day and overtime
-                            vs a daily target      [-t HOURS] [--json]
+                            vs a daily target [-t HOURS] [-n] [--json]
   tasks                     list cached tasks                 [--all] [--json]
   grep <fragment>           list cached tasks matching it [--all] [--json] [-1]
   projects                  list cached projects with ids     [--all] [--json]

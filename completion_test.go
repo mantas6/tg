@@ -39,6 +39,8 @@ func TestCompletionZsh(t *testing.T) {
 		"--all[pull this month", "-a[pull this month",
 		// `daily` measures each day against -t/--target.
 		"--target[target hours", "-t[target hours",
+		// `daily` can drop today with -n/--no-today.
+		"--no-today[", "-n[exclude today",
 		// Every fragment-taking command offers -1/--first.
 		"-1[", "--first[",
 	} {
@@ -154,6 +156,36 @@ func TestCompletionOffersDateFlag(t *testing.T) {
 	for _, cmd := range []string{"del", "tasks", "grep", "daily", "pull", "total", "update"} {
 		if strings.Contains(blocks[cmd], "'--date[") {
 			t.Errorf("%s does not take --date, it should not offer one:\n%s", cmd, blocks[cmd])
+		}
+	}
+}
+
+// TestCompletionOffersNoTodayFlag pins -n/--no-today to `tg daily`, the one
+// command that can drop today from its listing, and to nothing else: `update`
+// spells -n differently (its --days alias), so no other block may offer the
+// --no-today long form.
+func TestCompletionOffersNoTodayFlag(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	if err := cmdCompletion(&buf, "zsh"); err != nil {
+		t.Fatalf("completion: %v", err)
+	}
+	blocks := completionBlocks(buf.String())
+	daily, ok := blocks["daily"]
+	if !ok {
+		t.Fatalf("completion script has no daily block")
+	}
+	for _, want := range []string{"'--no-today[", "'-n["} {
+		if !strings.Contains(daily, want) {
+			t.Errorf("daily block missing %q:\n%s", want, daily)
+		}
+	}
+	for cmd, block := range blocks {
+		if cmd == "daily" {
+			continue
+		}
+		if strings.Contains(block, "--no-today[") {
+			t.Errorf("%s does not exclude today, it should not offer --no-today:\n%s", cmd, block)
 		}
 	}
 }

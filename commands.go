@@ -738,9 +738,15 @@ type dailyRow struct {
 // A running entry contributes its live elapsed time, exactly as `tg today` and
 // `tg status` count it, so today's row keeps moving while something runs.
 //
+// excludeToday drops today's row (`-n`/`--no-today`): the day still in progress
+// is left out of both the listing and the footer's totals, so the report
+// answers "how did the days that are already over go?" without today's
+// half-finished figure skewing it. Only today is removed; days booked ahead are
+// kept, since they are not today either (see dropTodayRow).
+//
 // color enables ANSI styling in the human output (never in JSON): days after
 // today are greyed out, see renderDaily.
-func cmdDaily(env *cmdEnv, targetHours float64, jsonOut, color bool) error {
+func cmdDaily(env *cmdEnv, targetHours float64, excludeToday, jsonOut, color bool) error {
 	if targetHours < 0 {
 		return fmt.Errorf("invalid target %g: hours per day must not be negative", targetHours)
 	}
@@ -751,6 +757,9 @@ func cmdDaily(env *cmdEnv, targetHours float64, jsonOut, color bool) error {
 		return err
 	}
 	rows := groupDaily(entries, env.now, env.loc)
+	if excludeToday {
+		rows = dropTodayRow(rows, env.now, env.loc)
+	}
 	target := time.Duration(targetHours * float64(time.Hour))
 	if jsonOut {
 		return renderDailyJSON(env.w, rows, target, env.loc)
@@ -777,6 +786,24 @@ func groupDaily(entries []store.Entry, now time.Time, loc *time.Location) []dail
 		}
 	}
 	return rows
+}
+
+// dropTodayRow removes today's row from a daily listing, backing `tg daily -n`.
+// "Today" is a calendar day in loc, matching how every other day in the report
+// is reckoned, so the row dropped is the one whose day is now's. Days booked
+// ahead (after today) are deliberately kept — `-n` excludes only the day still
+// in progress, not the future — and a listing without a today row (nothing
+// tracked yet, or today already filtered) is returned unchanged.
+func dropTodayRow(rows []dailyRow, now time.Time, loc *time.Location) []dailyRow {
+	today := startOfDay(now, loc)
+	out := make([]dailyRow, 0, len(rows))
+	for _, r := range rows {
+		if startOfDay(r.Day, loc).Equal(today) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // cmdCurrent shows the terse status line: the most recent entry, the idle gap
