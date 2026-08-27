@@ -402,7 +402,7 @@ func TestSummaryByTask(t *testing.T) {
 		    {"id":10,"title":"Fix login bug","seconds":1800}]}]}`))
 	})
 
-	tasks, err := c.SummaryByTask(ctx, 1, "", "2026-01-02")
+	tasks, err := c.SummaryByTask(ctx, 1, 77, "", "2026-01-02")
 	if err != nil {
 		t.Fatalf("SummaryByTask: %v", err)
 	}
@@ -421,6 +421,12 @@ func TestSummaryByTask(t *testing.T) {
 	}
 	if body["grouping"] != "projects" || body["sub_grouping"] != "tasks" {
 		t.Errorf("grouping/sub_grouping = %v/%v, want projects/tasks", body["grouping"], body["sub_grouping"])
+	}
+	// The report is scoped to the given user via the user_ids filter, so it
+	// totals only their time rather than every workspace member's. JSON numbers
+	// decode as float64 through the any-typed body.
+	if ids, ok := body["user_ids"].([]any); !ok || len(ids) != 1 || ids[0] != float64(77) {
+		t.Errorf("user_ids = %v, want [77]", body["user_ids"])
 	}
 
 	// Task 10 (summed across the two groups), task 12 and the titleless task
@@ -442,6 +448,24 @@ func TestSummaryByTask(t *testing.T) {
 	// catalog by id (see cmdTotal), which is what `tg total` matches against.
 	if got, ok := byID[15]; !ok || got.Seconds != 1200 || got.Name != "" {
 		t.Errorf("task 15 = %+v (present %v), want an untitled 1200s row", got, ok)
+	}
+}
+
+// TestSummaryByTaskNoUserFilter verifies a zero userID sends no user_ids filter,
+// so the report falls back to covering the whole workspace (the behavior kept
+// only for when the current user's id is unknown).
+func TestSummaryByTaskNoUserFilter(t *testing.T) {
+	t.Parallel()
+	var body map[string]any
+	c := newTestClientReports(t, func(w http.ResponseWriter, r *http.Request) {
+		body = decodeBody(t, r)
+		w.Write([]byte(`{"groups":[]}`))
+	})
+	if _, err := c.SummaryByTask(ctx, 1, 0, "", "2026-01-02"); err != nil {
+		t.Fatalf("SummaryByTask: %v", err)
+	}
+	if _, ok := body["user_ids"]; ok {
+		t.Errorf("user_ids = %v, want it omitted for a zero user id", body["user_ids"])
 	}
 }
 

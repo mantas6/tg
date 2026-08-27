@@ -25,11 +25,17 @@ type SummaryTask struct {
 
 // summaryRequest is the request body for the summary/time_entries endpoint. Only
 // the fields tg needs are sent; the endpoint accepts many more optional filters.
+//
+// UserIDs restricts the report to specific users. It is omitted (via omitempty)
+// when empty, which is what makes an unfiltered report cover the whole
+// workspace; tg always sends the authenticated user's own id so `tg total`
+// reports only their time (see SummaryByTask).
 type summaryRequest struct {
-	StartDate   string `json:"start_date"`
-	EndDate     string `json:"end_date"`
-	Grouping    string `json:"grouping"`
-	SubGrouping string `json:"sub_grouping"`
+	StartDate   string  `json:"start_date"`
+	EndDate     string  `json:"end_date"`
+	Grouping    string  `json:"grouping"`
+	SubGrouping string  `json:"sub_grouping"`
+	UserIDs     []int64 `json:"user_ids,omitempty"`
 }
 
 // summaryResponse mirrors the summary/time_entries response: a list of groups,
@@ -47,18 +53,23 @@ type summaryResponse struct {
 	} `json:"groups"`
 }
 
-// SummaryByTask returns per-task tracked totals for the workspace over
-// [startDate, endDate] (inclusive, "YYYY-MM-DD"). An empty startDate defaults to
-// the earliest date the Reports API allows, giving an all-time total. Totals
-// come straight from the Reports API (POST
-// /workspace/{workspace_id}/summary/time_entries, grouping=projects,
-// sub_grouping=tasks); nothing is read from or written to the local store.
-// Sub-groups without a task id (e.g. no-task time) are skipped, and sub-groups
-// sharing a task id are summed. A sub-group that carries an id but no title is
-// KEPT with an empty Name: the endpoint frequently omits titles, and dropping
-// those rows used to make every `tg total` fragment match nothing. Resolving
-// names is the caller's job.
-func (c *Client) SummaryByTask(ctx context.Context, workspaceID int64, startDate, endDate string) ([]SummaryTask, error) {
+// SummaryByTask returns per-task tracked totals over [startDate, endDate]
+// (inclusive, "YYYY-MM-DD"). An empty startDate defaults to the earliest date
+// the Reports API allows, giving an all-time total. Totals come straight from
+// the Reports API (POST /workspace/{workspace_id}/summary/time_entries,
+// grouping=projects, sub_grouping=tasks); nothing is read from or written to the
+// local store. Sub-groups without a task id (e.g. no-task time) are skipped, and
+// sub-groups sharing a task id are summed. A sub-group that carries an id but no
+// title is KEPT with an empty Name: the endpoint frequently omits titles, and
+// dropping those rows used to make every `tg total` fragment match nothing.
+// Resolving names is the caller's job.
+//
+// A non-zero userID scopes the report to that single user (the `user_ids`
+// filter), so `tg total` reports only the authenticated user's time rather than
+// every workspace member's. A zero userID sends no filter and reports the whole
+// workspace, which is the pre-filter behavior kept only for the case the id is
+// unknown.
+func (c *Client) SummaryByTask(ctx context.Context, workspaceID, userID int64, startDate, endDate string) ([]SummaryTask, error) {
 	if startDate == "" {
 		startDate = reportAllTimeStart
 	}
@@ -67,6 +78,9 @@ func (c *Client) SummaryByTask(ctx context.Context, workspaceID int64, startDate
 		EndDate:     endDate,
 		Grouping:    "projects",
 		SubGrouping: "tasks",
+	}
+	if userID != 0 {
+		req.UserIDs = []int64{userID}
 	}
 	var resp summaryResponse
 	path := fmt.Sprintf("/workspace/%d/summary/time_entries", workspaceID)

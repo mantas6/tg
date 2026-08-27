@@ -438,6 +438,7 @@ func withEnvOut(ctx context.Context, w io.Writer, fn func(env *cmdEnv) error) er
 	if cfg != nil {
 		env.c = api.New(cfg.APIToken)
 		env.workspaceID = cfg.WorkspaceID
+		env.userID = cfg.UserID
 	}
 	return fn(env)
 }

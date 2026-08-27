@@ -82,7 +82,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	base := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", base)
 
-	c := &Config{APIToken: "secret-token", WorkspaceID: 12345}
+	c := &Config{APIToken: "secret-token", WorkspaceID: 12345, UserID: 77}
 	if err := c.Save(); err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if got.APIToken != c.APIToken || got.WorkspaceID != c.WorkspaceID {
+	if got.APIToken != c.APIToken || got.WorkspaceID != c.WorkspaceID || got.UserID != c.UserID {
 		t.Errorf("round-trip = %+v, want %+v", got, c)
 	}
 }

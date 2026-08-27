@@ -39,6 +39,13 @@ type cmdEnv struct {
 	// when tg is unauthenticated (see workspaceFor).
 	workspaceID int64
 
+	// userID is the authenticated user's own Toggl id, cached at `tg auth`
+	// time (see cmdAuth). It scopes `tg total` to this user's tracked time
+	// rather than the whole workspace's. It is 0 when tg is unauthenticated,
+	// and also in configs written before the id was cached, in which case
+	// cmdTotal discovers it from GET /me instead.
+	userID int64
+
 	now time.Time
 	loc *time.Location
 
@@ -99,6 +106,27 @@ func (e *cmdEnv) client() (*api.Client, error) {
 		return nil, config.ErrNotConfigured
 	}
 	return e.c, nil
+}
+
+// currentUserID returns the authenticated user's Toggl id, which scopes
+// `tg total` to their own tracked time. It is normally the id cached in the
+// config at `tg auth` time (see cmdAuth); only a config written before the id
+// was cached carries 0, and then it is fetched once from GET /me. Callers must
+// already hold the client (total does), so an offline env is a programming
+// error rather than a case handled here.
+func (e *cmdEnv) currentUserID() (int64, error) {
+	if e.userID != 0 {
+		return e.userID, nil
+	}
+	c, err := e.client()
+	if err != nil {
+		return 0, err
+	}
+	me, err := c.Me(e.ctx)
+	if err != nil {
+		return 0, err
+	}
+	return me.ID, nil
 }
 
 // bestEffortPush sends the dirty local entries right after a local edit
@@ -595,9 +623,18 @@ func cmdTotal(env *cmdEnv, first bool, fragments []string, since time.Time, json
 		}
 	}
 
+	// `tg total` reports the current user's own time, not the whole
+	// workspace's, so the summary is filtered by the authenticated user id.
+	// It is normally cached in the config (see cmdAuth); a config written
+	// before it was cached carries 0, so it is discovered from GET /me here.
+	userID, err := env.currentUserID()
+	if err != nil {
+		return err
+	}
+
 	startDate := since.In(env.loc).Format(dateLayout)
 	endDate := env.now.In(env.loc).Format(dateLayout)
-	rows, err := c.SummaryByTask(env.ctx, env.workspaceID, startDate, endDate)
+	rows, err := c.SummaryByTask(env.ctx, env.workspaceID, userID, startDate, endDate)
 	if err != nil {
 		return fmt.Errorf("fetch totals for %s..%s: %w", startDate, endDate, err)
 	}
@@ -1266,7 +1303,7 @@ func cmdAuth(ctx context.Context, w io.Writer, tokenSource func() (string, error
 		return err
 	}
 
-	cfg := &config.Config{APIToken: token, WorkspaceID: me.DefaultWorkspaceID}
+	cfg := &config.Config{APIToken: token, WorkspaceID: me.DefaultWorkspaceID, UserID: me.ID}
 	if err := cfg.Save(); err != nil {
 		return fmt.Errorf("save config: %w", err)
 	}

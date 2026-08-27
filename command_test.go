@@ -32,6 +32,11 @@ var ctx = context.Background()
 // invocation would.
 const testWorkspaceID = 1
 
+// testUserID is the authenticated user env reports as the configured one, so
+// `tg total` scopes its report to this user just as a real invocation with a
+// cached user id would (see cmdEnv.userID).
+const testUserID = 42
+
 // env builds the cmdEnv the cmd* functions take. A nil client is the offline
 // case (no credentials, or none needed): the local edit still applies and stays
 // dirty for a later push, and nothing is sent (see cmdEnv.offline).
@@ -42,7 +47,7 @@ const testWorkspaceID = 1
 func env(w io.Writer, s *store.Store, c *api.Client, now time.Time, loc *time.Location) *cmdEnv {
 	return &cmdEnv{
 		ctx: ctx, w: w, st: s, c: c,
-		workspaceID: testWorkspaceID, now: now, day: now, loc: loc,
+		workspaceID: testWorkspaceID, userID: testUserID, now: now, day: now, loc: loc,
 	}
 }
 
@@ -3866,6 +3871,62 @@ func TestTotalWindow(t *testing.T) {
 	}
 }
 
+// TestTotalFiltersByCurrentUser pins the fix for `tg total` reporting every
+// workspace member's time: the summary request must carry the current user's
+// id in its user_ids filter, so the report is scoped to just this user.
+func TestTotalFiltersByCurrentUser(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+	c, body := totalReportsServer(t)
+
+	var buf bytes.Buffer
+	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, []string{"login"}, totalSince, false); err != nil {
+		t.Fatalf("total: %v", err)
+	}
+	ids, ok := (*body)["user_ids"].([]any)
+	if !ok || len(ids) != 1 || ids[0] != float64(testUserID) {
+		t.Errorf("user_ids = %v, want [%d]", (*body)["user_ids"], testUserID)
+	}
+}
+
+// TestTotalDiscoversUserID covers a config written before the user id was
+// cached (env.userID == 0): `tg total` must fetch it from GET /me and still
+// scope the report to that user, rather than falling back to the whole
+// workspace.
+func TestTotalDiscoversUserID(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/me":
+			w.Write([]byte(`{"id":77,"default_workspace_id":1}`))
+		case "/workspace/1/summary/time_entries":
+			body = decodeBody(t, r)
+			w.Write([]byte(`{"groups":[{"id":1,"sub_groups":[{"id":10,"seconds":4500}]}]}`))
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithReportsBaseURL(srv.URL),
+		api.WithHTTPClient(srv.Client()))
+
+	e := env(io.Discard, s, c, totalNow, time.UTC)
+	e.userID = 0 // config predates the cached id
+
+	if err := cmdTotal(e, false, []string{"login"}, totalSince, false); err != nil {
+		t.Fatalf("total: %v", err)
+	}
+	ids, ok := body["user_ids"].([]any)
+	if !ok || len(ids) != 1 || ids[0] != float64(77) {
+		t.Errorf("user_ids = %v, want [77] discovered from /me", body["user_ids"])
+	}
+}
+
 // totalJSONOut is the shape `tg total --json` is read back as: the distinct
 // tasks and overall total, plus the per-fragment breakdown that only appears
 // once several fragments were given.
@@ -5716,7 +5777,7 @@ func TestWithEnvOffline(t *testing.T) {
 // client and the workspace new entries are filed under.
 func TestWithEnvUsesStoredCredentials(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	cfg := &config.Config{APIToken: "stored-token", WorkspaceID: 4242}
+	cfg := &config.Config{APIToken: "stored-token", WorkspaceID: 4242, UserID: 77}
 	if err := cfg.Save(); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
@@ -5729,6 +5790,9 @@ func TestWithEnvUsesStoredCredentials(t *testing.T) {
 		}
 		if e.workspaceID != 4242 {
 			t.Errorf("workspace_id = %d, want 4242 from the stored config", e.workspaceID)
+		}
+		if e.userID != 77 {
+			t.Errorf("user_id = %d, want 77 from the stored config", e.userID)
 		}
 		return nil
 	}); err != nil {
@@ -5816,7 +5880,7 @@ func TestAuthSuccessWritesConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.APIToken != "tok123" || cfg.WorkspaceID != 12345 {
+	if cfg.APIToken != "tok123" || cfg.WorkspaceID != 12345 || cfg.UserID != 1 {
 		t.Errorf("config = %+v", cfg)
 	}
 }

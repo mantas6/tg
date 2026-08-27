@@ -15,9 +15,15 @@ import (
 var ErrNotConfigured = errors.New("not authenticated: run `tg auth`")
 
 // Config is the persisted credential/workspace state.
+//
+// UserID is the authenticated user's own Toggl id, cached at `tg auth` time (see
+// cmdAuth) so `tg total` can filter the Reports API to just this user's tracked
+// time rather than the whole workspace's. It is 0 in configs written before the
+// field existed; callers that need it fall back to GET /me (see cmdTotal).
 type Config struct {
 	APIToken    string `json:"api_token"`
 	WorkspaceID int64  `json:"workspace_id"`
+	UserID      int64  `json:"user_id"`
 }
 
 // Dir returns the tg state directory ($XDG_STATE_HOME/tg or ~/.local/state/tg).
