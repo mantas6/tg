@@ -47,25 +47,8 @@ func formatClock(t time.Time, loc *time.Location) string {
 	return t.In(loc).Format("15:04")
 }
 
-// gapLabel names a gap entry (see store.Entry.Gap) wherever an entry is named:
-// the `tg ls` line, the status line, the one-line confirmations and the overlap
-// errors. It is parenthesized so it can never be read as a task actually called
-// "gap", and it is the one spelling of the marker, so all of those agree.
-const gapLabel = "(gap)"
-
 // entryLabel is the task name, falling back to the free-form description.
-//
-// A gap entry has neither by construction (`tg gap` records no task and no
-// description), so it is named by the marker itself; a description later put on
-// one with `tg mod --desc lunch` is appended, since it says what the gap is for
-// and the marker still identifies it as one.
 func entryLabel(e store.Entry) string {
-	if e.Gap {
-		if e.Description != "" {
-			return gapLabel + " " + e.Description
-		}
-		return gapLabel
-	}
 	if e.TaskName != "" {
 		return e.TaskName
 	}
@@ -157,36 +140,14 @@ const todayDivider = "----------------------------------------"
 // running entry, the stored duration otherwise) and reports whether any of them
 // is still running. It is the shared tracked-time total behind `today`'s footer
 // and `status`'s day total.
-//
-// Gap entries are left out: a gap is time deliberately NOT tracked (see
-// store.Entry.Gap), so counting it would inflate every total tg reports and put
-// them at odds with Toggl's, which never sees a gap at all. gapDuration reports
-// that time separately, which is what the listing's footer notes.
 func totalDuration(entries []store.Entry, now time.Time) (total time.Duration, anyRunning bool) {
 	for _, e := range entries {
-		if e.Gap {
-			continue
-		}
 		total += displayDuration(e, now)
 		if e.Stop == nil {
 			anyRunning = true
 		}
 	}
 	return total, anyRunning
-}
-
-// gapDuration sums the spans held by the gap entries among entries, i.e. the
-// time the listing accounts for without tracking it (see totalDuration). It is 0
-// when there are no gaps, which is what keeps the footer note out of an ordinary
-// listing.
-func gapDuration(entries []store.Entry) time.Duration {
-	var total time.Duration
-	for _, e := range entries {
-		if e.Gap {
-			total += time.Duration(e.Duration) * time.Second
-		}
-	}
-	return total
 }
 
 // parseHexColor parses a "#RRGGBB" hex color (as stored on projects) into its
@@ -306,16 +267,6 @@ func spansDays(entries []store.Entry, loc *time.Location) bool {
 // multi-day listing repeats numbers; the latter is grouped under a date header
 // so it stays readable. Filler rows (the gaps between entries and the trailing
 // gap up to now) are not entries and carry no number.
-//
-// Three things are therefore told apart in the same table:
-//
-//   - a tracked entry, which reads as its number, range, duration and task;
-//   - a GAP ENTRY (`tg gap`, see store.Entry.Gap), which is a real entry and so
-//     keeps its number and range, but is labelled with the marker instead of a
-//     task and is dimmed when color is on: its span is accounted for, not
-//     tracked, so it is left out of the total and noted separately in the footer;
-//   - an untracked hole, the filler row, which is no entry at all: no number, and
-//     its "(gap H:MM)" text sits in the duration column.
 func renderToday(w io.Writer, entries []store.Entry, now time.Time, loc *time.Location, color bool) {
 	if len(entries) == 0 {
 		fmt.Fprintln(w, "No entries.")
@@ -371,14 +322,9 @@ func renderToday(w io.Writer, entries []store.Entry, now time.Time, loc *time.Lo
 				lead = block + " "
 			}
 		}
-		line := strings.TrimRight(fmt.Sprintf("%*d  %s%-12s%-7s%-17s %s",
-			numWidth, e.Seq, lead, startClk+"-"+stopClk, formatHM(dur), label, project), " ")
-		// A gap holds no worked time, so it is greyed out next to the entries
-		// that do, exactly as `tg daily` dims the days not worked yet.
-		if color && e.Gap {
-			line = faint(line)
-		}
-		fmt.Fprintln(w, line)
+		line := fmt.Sprintf("%*d  %s%-12s%-7s%-17s %s",
+			numWidth, e.Seq, lead, startClk+"-"+stopClk, formatHM(dur), label, project)
+		fmt.Fprintln(w, strings.TrimRight(line, " "))
 	}
 
 	// Idle time since the last entry stopped, rendered as a closing filler row.
@@ -388,11 +334,6 @@ func renderToday(w io.Writer, entries []store.Entry, now time.Time, loc *time.Lo
 
 	fmt.Fprintln(w, todayDivider)
 	footer := "Total: " + formatHM(total)
-	// The gap entries' own time, so the total can be read against the lines
-	// above it: their spans are listed but not tracked (see totalDuration).
-	if gaps := gapDuration(entries); gaps > 0 {
-		footer += "   (gap " + formatHM(gaps) + ")"
-	}
 	if anyRunning {
 		footer += "   (* running)"
 	}
@@ -405,11 +346,7 @@ func renderToday(w io.Writer, entries []store.Entry, now time.Time, loc *time.Lo
 // is the idle time between its stop and now (0 while running or with no
 // entries), and DayTotalSeconds is today's tracked total.
 type currentJSON struct {
-	Running bool `json:"running"`
-	// Gap marks the last entry as a gap placeholder (see store.Entry.Gap),
-	// i.e. a span the day accounts for without tracking work in it. It is
-	// omitted for an ordinary entry, so the shape is unchanged for one.
-	Gap             bool   `json:"gap,omitempty"`
+	Running         bool   `json:"running"`
 	Task            string `json:"task,omitempty"`
 	Project         string `json:"project,omitempty"`
 	Start           string `json:"start,omitempty"`
@@ -449,7 +386,6 @@ func renderCurrent(w io.Writer, last *store.Entry, dayTotal time.Duration, now t
 			DayTotalSeconds: int64(dayTotal / time.Second),
 		}
 		if last != nil {
-			out.Gap = last.Gap
 			out.Task = entryLabel(*last)
 			out.Project = last.ProjectName
 			out.Start = last.Start.UTC().Format(time.RFC3339)
@@ -488,15 +424,9 @@ func renderCurrent(w io.Writer, last *store.Entry, dayTotal time.Duration, now t
 // the entry's persistent per-day number (store.Entry.Seq), the same one the
 // human listing leads with, so scripted callers can address an entry the way
 // `tg mod`/`tg del` expect.
-//
-// Gap marks a gap placeholder (see store.Entry.Gap): the entry occupies
-// DurationSeconds without tracking work, so it is the one kind of entry whose
-// duration is NOT part of the listing's TotalSeconds. It is omitted on an
-// ordinary entry, leaving that shape as it was.
 type todayEntryJSON struct {
 	Num             int    `json:"num"`
 	ID              int64  `json:"id"`
-	Gap             bool   `json:"gap,omitempty"`
 	Task            string `json:"task,omitempty"`
 	Project         string `json:"project,omitempty"`
 	Description     string `json:"description,omitempty"`
@@ -519,7 +449,6 @@ func renderTodayJSON(w io.Writer, entries []store.Entry, now time.Time) error {
 		je := todayEntryJSON{
 			Num:             e.Seq,
 			ID:              e.ID,
-			Gap:             e.Gap,
 			Task:            e.TaskName,
 			Project:         e.ProjectName,
 			Start:           e.Start.UTC().Format(time.RFC3339),

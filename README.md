@@ -9,7 +9,6 @@ on demand, so tracking works offline and syncs when you choose.
 - Local-first: every action is written to SQLite first and works offline.
 - On-demand sync with Toggl Track using last-writer-wins reconciliation.
 - Fuzzy task matching — record time with just a fragment of a task name.
-- Gap markers for the spans a day accounts for without tracking work in them.
 - Cached project/task catalog for fast, offline-friendly lookups.
 - Human-readable output with project colors, plus `--json` on most commands.
 - zsh completion.
@@ -46,7 +45,6 @@ Refresh the local catalog, then record time:
 tg projects update          # sync all workspace projects
 tg update <project>         # fetch one project's tasks + its recent entries
 tg add +:20 <task>          # record the last 20 minutes against the task
-tg gap 12-13                # mark an hour as occupied but not tracked
 tg status                   # last entry, idle gap, today's total
 ```
 
@@ -102,58 +100,6 @@ Flags may come before or after the positional arguments, so
 `tg add 9-:30 login --desc "…"` works too. `--date` books the entry on another
 day; see [Another day: `--date`](#another-day---date).
 
-### Untracked spans: `gap`
-
-Some of a day is accounted for without being work: lunch, the school run, a
-meeting somebody else logs. `tg gap <timesign>` marks such a span as **occupied
-but untracked**, so the entries around it stay anchored to each other instead of
-being separated by a hole tg has to guess about:
-
-```sh
-tg gap 12-13                 # 12:00-13:00 is taken, and not work
-tg gap :30                   # half an hour from where the last entry ended
-tg gap +:20                  # the last 20 minutes
-tg gap --date 2026-01-05 12-13
-```
-
-It is `add` without a task: the same timesign forms resolved the same way (an
-absolute range, a relative span, or a bare duration continuing the last entry),
-the same overlap check, the same `--date`. There is nothing to name, so it takes
-neither a fragment, nor `--desc`, nor `-1`.
-
-The result is a **real entry** in every way that matters:
-
-```
-$ tg ls
-1  09:00-12:00 3h00m  Fix login bug     [Backend]
-2  12:00-12:30 0h30m  (gap)
-3  12:30-13:30 1h00m  Code review       [Backend]
-               (gap 0h25m)
-----------------------------------------
-Total: 4h00m   (gap 0h30m)
-```
-
-- it takes the day's next **number**, so `tg mod 2 +30` and `tg del 2` reach it
-  like any other entry (`tg mod --desc lunch 2` labels it, `(gap) lunch`, and it
-  stays a gap);
-- it occupies its span **exclusively**, so `add` refuses to record over it;
-- it counts as **the last entry**, which is the whole point: `tg gap :30`
-  followed by `tg add 1:00 <task>` logs the afternoon back to back without a
-  single clock time.
-
-Two things set it apart. Its time is **not tracked**: `tg ls`, `tg status` and
-`tg daily` leave it out of their totals — the listing reports it separately in
-the footer instead (`(gap 0h30m)` above), and a day holding nothing but gaps is
-not a worked day at all. And it is **local**: Toggl has no notion of a gap, so
-nothing about one is ever pushed, pulled, or affected by a sync — which also
-means `tg gap` needs no credentials and makes no network call.
-
-Note the two kinds of "gap" in that listing, which is why they read differently:
-line 2 is a **gap entry** — numbered, with a range and a duration — while the
-unnumbered `(gap 0h25m)` filler row is an **actual gap**, time that has no entry
-of any kind (see [`ls`](#usage) below). On a terminal a gap entry's line is
-dimmed as well, like the days not yet worked in `tg daily`.
-
 ### Ambiguous fragments and `-1`
 
 Tasks and projects are named by **fragment**: a case-insensitive substring of
@@ -189,14 +135,13 @@ precedence, so its first line is not always the task `add -1` picks).
 
 ### Another day: `--date`
 
-`add`, `gap` and `mod` work on **today**. Pass `--date YYYY-MM-DD` to point any
-of them at a different day — for time you already know you will spend, or to fix
+`add` and `mod` work on **today**. Pass `--date YYYY-MM-DD` to point either of
+them at a different day — for time you already know you will spend, or to fix
 something you booked ahead earlier:
 
 ```sh
 tg add --date 2026-01-05 9-10 <task>     # 09:00-10:00 on the 5th
 tg add --date 2026-01-05 :30 <task>      # continues the 5th's last entry
-tg gap --date 2026-01-05 12-13           # the 5th's lunch hour
 tg mod --date 2026-01-05 +30             # extend that day's last entry
 tg mod --date 2026-01-05 2 9-10:30       # retime entry 2 of the 5th
 ```
@@ -221,9 +166,9 @@ On the day named, everything a command reckons per day is that day's:
 
 A **relative** timesign (`+:20`) is the one form `--date` cannot take: it means
 "the last 20 minutes", counted back from the current 5-minute mark, and another
-day has no such mark. `tg add --date … +:20` (and `tg gap --date … +:20`) is
-therefore refused, naming the forms that do work. (`tg mod`'s `+30`/`-30` are
-fine: they only move an existing entry's end by that much.)
+day has no such mark. `tg add --date … +:20` is therefore refused, naming the
+forms that do work. (`tg mod`'s `+30`/`-30` are fine: they only move an existing
+entry's end by that much.)
 
 Confirmation lines name the day whenever it is not today, since the clock times
 alone no longer identify the entry:
@@ -237,8 +182,7 @@ Entries booked ahead behave like any other: they are pushed to Toggl
 immediately (best-effort), they take part in the overlap check *on their own
 day* — an entry at 09:00 today is no conflict for one at 09:00 next week — and
 they are excluded from `tg status`'s "last entry" and day total until their day
-arrives. A gap booked ahead behaves the same, minus the push it has nothing to
-send (see [Untracked spans: `gap`](#untracked-spans-gap)).
+arrives.
 
 Two commands do **not** take `--date` yet: `tg ls` lists today and days *behind*
 it, and `tg del` addresses today's numbers only. Until a booked day comes
@@ -305,11 +249,6 @@ next `tg push`. Deleting an entry retires its number rather than renumbering the
 rest, so the numbers you just read stay valid. A number that does not resolve
 (nothing was numbered that high today, or that entry is gone) is an error
 telling you to re-run `tg ls`.
-
-Both work on gap entries (see [Untracked spans: `gap`](#untracked-spans-gap))
-exactly as they do on tracked ones — same numbers, same timesigns, same
-refusals. The only difference is invisible: there is nothing about a gap for the
-push to send, and `--desc` labels it rather than turning it into tracked work.
 
 `grep` searches the cached task catalog and lists every task whose name
 contains the fragment, case-insensitively. It is the way to find the exact
@@ -418,10 +357,6 @@ With `--json` the same facts come back as
 `{"running":false,"task":"Code review",...,"gap_seconds":1500,"day_total_seconds":23400}`,
 where `elapsed_seconds` is the last entry's length (live while running).
 
-A gap entry can be the last entry like any other, reported as `(gap)` (and
-`"gap":true` in JSON); its span is left out of the day total, which is always
-tracked time only.
-
 `ls` (aliases `today`, `list`) is the day's table: one line per entry with its
 local number, wall-clock range, duration, task and project, filler rows for the
 time you did not track, and the day's total.
@@ -444,17 +379,9 @@ they never change. A deleted entry takes its number with it, which is why the
 listing above jumps from 2 to 4: numbers are never reused or shifted, so
 `tg del 4` keeps meaning the same entry no matter what else you removed first.
 
-Filler gap rows are not entries and carry no number: they show idle time between
-two entries, and the last one shows the idle time since the newest entry stopped
+Gap rows are not entries and carry no number: they show idle time between two
+entries, and the last one shows the idle time since the newest entry stopped
 (only within the same day, and never while an entry is running).
-
-A **gap entry** recorded with `tg gap` is a different thing and reads
-differently: it keeps its number and range and is labelled `(gap)` (dimmed on a
-terminal), so a span you deliberately marked as untracked is never confused with
-one nothing was recorded for. Its time is not part of `Total`, which reports it
-on its own instead — `Total: 4h00m   (gap 0h30m)`. In `--json` such an entry
-carries `"gap":true` alongside its span, and `total_seconds` excludes it; an
-ordinary entry's shape is unchanged.
 
 `--days N` looks further back. Since every day has its own 1..N, a multi-day
 listing groups the entries under a date header; `mod`/`del` address today's
@@ -489,10 +416,6 @@ tg daily --target 7.5 # half-hour targets are fine
 tg daily --json       # machine-readable
 ```
 
-Gap entries are not tracked time, so they never contribute to a day's total and
-a day holding nothing but gaps gets no line (see
-[Untracked spans: `gap`](#untracked-spans-gap)).
-
 **Only days you actually tracked something get a line**, and the footer's target
 is the daily target multiplied by the number of *listed* days — so weekends and
 days off never accumulate a deficit, and the total overtime answers "am I ahead
@@ -519,8 +442,6 @@ commands:
   auth [token]              verify a Toggl API token and store config
   add <timesign> [project] <task>  add a finished entry
                             [--desc TEXT] [--date DATE] [-1]
-  gap <timesign>            occupy a span without tracking work in it
-                            (lunch, an errand)               [--date DATE]
   mod [num] [timesign]      retime/rename an entry (default: last), e.g.
                             +30 / -30 minutes  [--desc TEXT] [--date DATE]
   del <num>                 delete the entry numbered by `tg ls`
@@ -545,43 +466,26 @@ timesign: absolute 9-:30, 10-11, 10:30-11:15 (today), relative +:20,
       +1, +1:20 (that long, ending at the last 5m mark), negative
       -:20, -1:20 (that much LESS; `mod` only), or a bare duration
       1:30, :45 (that long, starting where the last entry ended;
-      `add`/`gap` only). Full spec: docs/timesig.md
-gap:  `tg gap 12-13` (or `gap :30`, `gap +:20`) marks a span as
-      occupied but untracked. It is an entry in every way that
-      matters — numbered by `tg ls`, `mod`/`del` reach it, and a
-      later bare duration continues after it — except that its
-      time is left out of every total and it is never synced to
-      Toggl. `tg ls` shows it as `(gap)` on its own numbered
-      line, unlike the unnumbered filler rows that mark time
-      nothing at all was recorded for.
-mod:  numbers are the per-day ones shown by `tg ls` (assigned when an
-      entry is added, never reused); without one the last entry is
-      modified: today's newest already-started entry, the same one
-      `tg status` shows. An absolute timesign sets the range on the
-      entry's own day; a signed one moves its END, keeping the start:
-      `tg mod +30` pushes the end 30m later, `tg mod -30` pulls it
-      30m back (never past the start; use `tg del` to remove an
-      entry). Unlike other timesigns, a number without `:` is
-      minutes for `mod`.
-date: `add`, `gap` and `mod` work on today; `--date YYYY-MM-DD` moves
-      them to another day, which must be today or later (a day that
-      is over is history and is refused). On a moved day the entry
-      numbers, the "last entry" and an absolute timesign are all that
-      day's; a relative timesign has no `now` there, so `add`/`gap`
-      refuse one (`mod` still takes +30/-30, which only move an end).
+      `add` only). Full spec: docs/timesig.md
+mod:  numbers are the per-day ones shown by `tg ls`; without one the
+      last entry is modified: today's newest already-started entry, the
+      same one `tg status` shows. A day that is OVER can never be
+      modified (see `date`).
+      An absolute timesign sets the range on the entry's own day; a
+      signed one moves its END, keeping the start: `tg mod +30` pushes
+      the end 30m later, `tg mod -30` pulls it 30m back (never past the
+      start); a number without `:` is minutes for `mod`.
+date: `add` and `mod` work on today; `--date YYYY-MM-DD` moves them to
+      another day, which must be today or later (a day that is over is
+      history and is refused). On a moved day the entry numbers, the
+      "last entry" and an absolute timesign are all that day's; a
+      relative timesign has no `now` there, so `add` refuses one
+      (`mod` still takes +30/-30, which only move an end).
 -1:   `add`/`grep`/`total`/`update`/`pull` match tasks and projects by
       name fragment; a fragment matching several of them normally
       fails with the candidates listed. `-1` (alias `--first`) takes
       the first candidate instead, which is how two tasks sharing a
       name in different projects are told apart.
-sync: run `tg pull` then `tg push` for correct last-writer-wins.
-env:  TOGGL_PROJECT_ID scopes `add`/`tasks`/`grep`/`update` to one project
-      (and sets the project on entries created by `add`). `pull`
-      ignores it and always reconciles every project; pass a
-      <project> name to `pull` to scope it explicitly. When unset,
-      `update` needs a <project> fragment (positional or -p) matching
-      exactly one cached project, and `add` accepts
-      `<timesign> <project> <task>` to scope by project name.
 ```
 
 ### Syncing
@@ -614,11 +518,6 @@ changed in the meantime is ever marked as reconciled.
 `tg push` runs automatically (best-effort) when you `tg add`, so the entry shows
 up in the Toggl web app immediately. If the network is unavailable, the entry
 stays local and dirty until the next `tg push`.
-
-Gap entries take no part in any of this. Toggl has no notion of a gap, so one is
-never pushed, never pulled, and never touched by a sync in either direction (see
-[Untracked spans: `gap`](#untracked-spans-gap)); a remote entry occupying the
-same span is simply reconciled next to it.
 
 An entry Toggl refuses is skipped rather than fatal: the rest of the dirty queue
 is still sent, the rejected entry stays dirty, and `tg push` reports it (and

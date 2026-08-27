@@ -256,12 +256,6 @@ func canAdvanceWatermark(ctx context.Context, st *store.Store, since time.Time) 
 //
 // A cancelled context is different: it aborts the loop at once and is returned
 // as-is, since nothing suggests the next entry would fare better.
-//
-// Gap entries are outside all of this: they are local markers Toggl has no
-// notion of, so store.DirtyEntries never offers one and pushEntry refuses to
-// send one anyway (see there). Nothing about a gap is created, updated or
-// deleted remotely, and no pull can bring one back down, since a gap carries no
-// remote id to be matched against.
 func Push(ctx context.Context, st *store.Store, c *api.Client, now time.Time) (PushResult, error) {
 	var res PushResult
 	dirty, err := st.DirtyEntries(ctx)
@@ -296,15 +290,6 @@ func Push(ctx context.Context, st *store.Store, c *api.Client, now time.Time) (P
 // succeeded, so a failure never leaves an entry looking synced.
 func pushEntry(ctx context.Context, st *store.Store, c *api.Client, e store.Entry, now time.Time, res *PushResult) error {
 	switch {
-	// A gap (store.Entry.Gap) is a local-only marker: Toggl holds no entry for
-	// it, so there is nothing to create, update or delete there, and inventing
-	// one would put worked time on a span the user marked as NOT worked. The
-	// push queue already leaves gaps out (store.DirtyEntries), so this is the
-	// failsafe that keeps "nothing about a gap is ever sent" true of this
-	// function on its own, whatever queue it is handed.
-	case e.Gap:
-		return nil
-
 	case e.Deleted:
 		if e.RemoteID != nil {
 			if err := c.Delete(ctx, e.WorkspaceID, *e.RemoteID); err != nil {

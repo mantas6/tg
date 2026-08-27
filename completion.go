@@ -84,7 +84,6 @@ _tg() {
       commands=(
         'auth:verify a Toggl API token and store config'
         'add:add a finished entry from a timesign (9-:30, +:20, 1:30)'
-        'gap:occupy a span without tracking work in it (lunch, an errand)'
         'mod:retime (+30, -30, 9-10:30) or rename an entry (default: the last one)'
         'del:delete an entry by its number from tg ls'
         "current:show the last entry, idle gap and today's total"
@@ -121,14 +120,6 @@ _tg() {
             '--first[use the first match on an ambiguous fragment (alias of -1)]' \
             '1:timesign:' \
             '*:task fragment:__tg_tasks'
-          ;;
-        gap)
-          # The lone positional is the timesign of the span to mark as
-          # occupied but untracked; there is nothing to name, so the only
-          # flag is --date, which books the gap on another (later) day.
-          _arguments \
-            '--date[the day the gap belongs to; today or later]:date (YYYY-MM-DD):' \
-            '1:timesign (12-13, :30, +:20):'
           ;;
         mod)
           # Positionals are an entry number from tg ls (optional, defaults to

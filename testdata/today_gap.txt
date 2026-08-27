@@ -1,6 +1,0 @@
-1  09:00-12:00 3h00m  Fix login bug     [Backend]
-2  12:00-12:30 0h30m  (gap)
-3  12:30-13:30 1h00m  Code review       [Backend]
-               (gap 0h25m)
-----------------------------------------
-Total: 4h00m   (gap 0h30m)
