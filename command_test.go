@@ -404,6 +404,70 @@ func TestAddAcceptsRelativeTimesign(t *testing.T) {
 	}
 }
 
+// TestAddAcceptsAtTimesign checks that `add` resolves the "@" now-token: the
+// entry starts at now floored to the preceding 5-minute mark and runs to the
+// stop the range names, and the dashless "@:30" shorthand reads as "from now
+// until :30". (The grammar itself is covered by the timesig package.)
+func TestAddAcceptsAtTimesign(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	// 15:07 floors to 15:05, so "@:30" spans 15:05-15:30.
+	now := time.Date(2026, 1, 2, 15, 7, 0, 0, time.UTC)
+	var buf bytes.Buffer
+	if err := cmdAdd(env(&buf, s, nil, now, time.UTC), nil, false, "@:30", "login", ""); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "15:05-15:30") {
+		t.Errorf("output = %q, want 15:05-15:30", out)
+	}
+
+	entries := addWindow(t, s, now)
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	wantStart := time.Date(2026, 1, 2, 15, 5, 0, 0, time.UTC)
+	wantStop := time.Date(2026, 1, 2, 15, 30, 0, 0, time.UTC)
+	if !e.Start.Equal(wantStart) {
+		t.Errorf("start = %v, want %v", e.Start, wantStart)
+	}
+	if e.Stop == nil || !e.Stop.Equal(wantStop) {
+		t.Errorf("stop = %v, want %v", e.Stop, wantStop)
+	}
+	if e.Duration != 1500 {
+		t.Errorf("duration = %d, want 1500", e.Duration)
+	}
+}
+
+// TestAddOnAnotherDayRefusesAtTimesign pins that "@", like the relative form,
+// is refused once --date moved the command off today: it resolves to now, which
+// exists only today, so it cannot record time on another day. The refusal names
+// the day and the forms that do work, and nothing is written.
+func TestAddOnAnotherDayRefusesAtTimesign(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	anchor := dayAnchor(t, "2026-01-05", addNow, time.UTC)
+	for _, timesign := range []string{"@:30", "@-16", "9-@"} {
+		var buf bytes.Buffer
+		err := cmdAdd(env(&buf, s, nil, addNow, time.UTC).on(anchor), nil, false, timesign, "login", "")
+		if err == nil {
+			t.Fatalf("add --date %q = nil error, want a refusal", timesign)
+		}
+		for _, want := range []string{"@", "on 2026-01-05", "9-:30", "1:30"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("add %q err = %v, want it to mention %q", timesign, err, want)
+			}
+		}
+		if buf.Len() != 0 {
+			t.Errorf("output = %q, want nothing written", buf.String())
+		}
+	}
+}
+
 // TestAddResolvesTask tables what `tg add` files an entry against: the fragment
 // is resolved through the shared task resolver (an exact task name beating the
 // longer names it is part of, a project scope narrowing the candidates, `-1`

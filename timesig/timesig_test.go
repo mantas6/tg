@@ -80,6 +80,142 @@ func TestParseAbsoluteErrors(t *testing.T) {
 	}
 }
 
+// TestParseAbsoluteAtNow covers the "@" token: it resolves to now floored to
+// the preceding 5-minute mark and, as a START, needs no dash ("@:30").
+func TestParseAbsoluteAtNow(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name                   string
+		in                     string
+		now                    time.Time
+		wantStartH, wantStartM int
+		wantStopH, wantStopM   int
+	}{
+		// "@START" needs no dash; the minutes-only stop inherits @'s hour.
+		{"dashless minutes stop", "@:30", hm(15, 7), 15, 5, 15, 30},
+		{"dashless bare-hour stop", "@16", hm(15, 7), 15, 5, 16, 0},
+		{"dashless H:MM stop", "@16:45", hm(15, 7), 15, 5, 16, 45},
+		// The explicit dash form is equivalent.
+		{"explicit dash minutes", "@-:30", hm(15, 7), 15, 5, 15, 30},
+		{"explicit dash hour", "@-16", hm(15, 7), 15, 5, 16, 0},
+		// "@" as the STOP runs an ordinary START up to now.
+		{"at as stop", "9-@", hm(15, 7), 9, 0, 15, 5},
+		{"at as stop with minutes", "9:15-@", hm(15, 7), 9, 15, 15, 5},
+		// now is floored DOWN, never up.
+		{"already on a mark", "@:30", hm(15, 0), 15, 0, 15, 30},
+		{"floors down", "@16", hm(15, 3), 15, 0, 16, 0},
+		{"one minute before mark", "@17", hm(15, 59), 15, 55, 17, 0},
+		// Whitespace around the token and the dash is tolerated.
+		{"whitespace tolerated", " @ - :30 ", hm(15, 7), 15, 5, 15, 30},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			span, err := Parse(tc.in, tc.now, time.UTC)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tc.in, err)
+			}
+			if span.Kind != Absolute {
+				t.Errorf("kind = %v, want absolute", span.Kind)
+			}
+			if !span.Start.Equal(hm(tc.wantStartH, tc.wantStartM)) {
+				t.Errorf("start = %v, want %02d:%02d", span.Start, tc.wantStartH, tc.wantStartM)
+			}
+			if !span.Stop.Equal(hm(tc.wantStopH, tc.wantStopM)) {
+				t.Errorf("stop = %v, want %02d:%02d", span.Stop, tc.wantStopH, tc.wantStopM)
+			}
+		})
+	}
+}
+
+// TestParseAbsoluteAtNowFloorsSeconds pins that sub-minute components of now
+// never leak into an "@" span, just as they do not for the relative form.
+func TestParseAbsoluteAtNowFloorsSeconds(t *testing.T) {
+	t.Parallel()
+	in := time.Date(2026, 1, 2, 15, 7, 47, 123456789, time.UTC)
+	span, err := Parse("@:30", in, time.UTC)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !span.Start.Equal(hm(15, 5)) {
+		t.Errorf("start = %v, want 15:05", span.Start)
+	}
+	if !span.Stop.Equal(hm(15, 30)) {
+		t.Errorf("stop = %v, want 15:30", span.Stop)
+	}
+}
+
+// TestParseAbsoluteAtNowUsesLocationWallClock pins that "@" floors against the
+// active location's wall clock, so the mark is local rather than UTC.
+func TestParseAbsoluteAtNowUsesLocationWallClock(t *testing.T) {
+	t.Parallel()
+	loc := time.FixedZone("plus2", 2*60*60)
+	in := time.Date(2026, 1, 2, 14, 23, 0, 0, time.UTC) // 16:23 in loc
+	span, err := Parse("@17", in, loc)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	start := span.Start.In(loc)
+	if start.Hour() != 16 || start.Minute() != 20 {
+		t.Errorf("start = %v, want 16:20 local", start)
+	}
+	stop := span.Stop.In(loc)
+	if stop.Hour() != 17 || stop.Minute() != 0 {
+		t.Errorf("stop = %v, want 17:00 local", stop)
+	}
+}
+
+func TestParseAbsoluteAtNowErrors(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		in   string
+		now  time.Time
+	}{
+		{"at alone, no stop", "@", hm(15, 7)},
+		{"at with empty stop", "@-", hm(15, 7)},
+		{"stop equals now mark", "@:05", hm(15, 7)}, // 15:05 == floored start
+		{"stop before now", "@-9", hm(15, 7)},       // 09:00 < 15:05
+		{"both sides at", "@-@", hm(15, 7)},         // zero length
+		{"bad stop hour", "@-24", hm(15, 7)},        // hour out of range
+		{"bad stop minutes", "@-9:60", hm(15, 7)},   // minute out of range
+		{"minutes-only start still bad", ":30-@", hm(15, 7)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := Parse(tc.in, tc.now, time.UTC); err == nil {
+				t.Errorf("Parse(%q) = nil error, want an error", tc.in)
+			}
+		})
+	}
+}
+
+func TestIsAt(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"@:30", true},
+		{"@-16", true},
+		{"9-@", true},
+		{" @ ", true},
+		{"@", true},
+		{"9-:30", false},
+		{"+:20", false},
+		{"-1", false},
+		{"1:30", false},
+		{"", false},
+		{" ", false},
+	}
+	for _, tc := range cases {
+		if got := IsAt(tc.in); got != tc.want {
+			t.Errorf("IsAt(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestParseRelativeValid(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -405,7 +541,9 @@ func TestIsDuration(t *testing.T) {
 		{" +1", false},
 		{"9-:30", false},
 		{"10-11", false},
-		{"-1", false}, // a dash makes it a (malformed) range, not a duration
+		{"-1", false},   // a dash makes it a (malformed) range, not a duration
+		{"@:30", false}, // the "@" now-token is an absolute range, not a duration
+		{"@-16", false}, // same, with an explicit dash
 		{"", false},
 		{" ", false},
 	}

@@ -6,6 +6,11 @@
 //	NEGATIVE  "-" DURATION     a length to take AWAY from a span ("-:20")
 //	DURATION  DURATION         a bare length with no times of its own ("1:30")
 //
+// Within an ABSOLUTE range either side may be the "@" token, which resolves to
+// now floored to the preceding 5-minute mark; as a START it also stands in for
+// the range separator, so "@:30" reads as "from now until :30" (see
+// ParseAbsolute).
+//
 // The first two resolve to a Span on their own; the last two do not, so
 // ParseNegative and ParseDuration return just the length and the caller anchors
 // it (see `tg add`, which starts the entry at the last entry's end, and
@@ -70,14 +75,32 @@ func IsRelative(s string) bool {
 }
 
 // IsDuration reports whether s looks like a bare duration timesign ("1:30"):
-// non-empty, without the relative "+" prefix and without the "-" that
-// separates an absolute range. Like IsRelative it is a classifier, not a
-// validator, so IsDuration("bad") is true while ParseDuration("bad") errors.
-// Callers that accept the form (only `tg add`, which anchors it to the last
-// entry's end) use this to route the argument before parsing it.
+// non-empty, without the relative "+" prefix, without the "-" that separates an
+// absolute range and without the "@" now-token that marks an absolute range.
+// Like IsRelative it is a classifier, not a validator, so IsDuration("bad") is
+// true while ParseDuration("bad") errors. Callers that accept the form (only
+// `tg add`, which anchors it to the last entry's end) use this to route the
+// argument before parsing it.
 func IsDuration(s string) bool {
 	s = strings.TrimSpace(s)
-	return s != "" && !strings.HasPrefix(s, RelativePrefix) && !strings.Contains(s, "-")
+	return s != "" && !strings.HasPrefix(s, RelativePrefix) &&
+		!strings.Contains(s, "-") && !strings.Contains(s, AtSign)
+}
+
+// AtSign is the token that stands for "now" inside an absolute timesign,
+// floored to the preceding 5-minute wall-clock mark (see Floor5).
+const AtSign = "@"
+
+// IsAt reports whether s uses the "@" now-token. Like the "@" itself this is an
+// absolute-range affair, so it is a substring test rather than a prefix one:
+// "@:30", "@-11" and "9-@" all count. It is a classifier, not a validator —
+// ParseAbsolute still decides whether the surrounding range is well formed.
+//
+// Callers that resolve a timesign against "now" (only `tg add`) use it to
+// refuse the token on a day --date moved them to, where there is no "now" for
+// it to mean, exactly as they refuse the relative form there.
+func IsAt(s string) bool {
+	return strings.Contains(strings.TrimSpace(s), AtSign)
 }
 
 // NegativePrefix marks a negative timesign.
@@ -145,9 +168,9 @@ func Parse(s string, now time.Time, loc *time.Location) (Span, error) {
 // ParseAbsolute parses an absolute START-STOP timesign into two wall-clock
 // times on now's calendar day in loc. The grammar is:
 //
-//	timesign = START "-" STOP
-//	START    = H | H ":" MM
-//	STOP     = H | H ":" MM | ":" MM
+//	timesign = START "-" STOP | "@" STOP
+//	START    = H | H ":" MM | "@"
+//	STOP     = H | H ":" MM | ":" MM | "@"
 //	H        = hour   0-23
 //	MM       = minute 0-59
 //
@@ -155,14 +178,32 @@ func Parse(s string, now time.Time, loc *time.Location) (Span, error) {
 // 09:00-09:30. Each side defaults its minutes to 0 ("10-11" is 10:00-11:00).
 // STOP must be strictly after START; anything else (bad hour/minute, missing
 // dash, empty side, stop <= start) is a clear error.
+//
+// The "@" token resolves to now floored to the preceding 5-minute wall-clock
+// mark in loc (see Floor5): "9-@" runs from 09:00 until that mark. As a START,
+// "@" also stands in for the range separator, so "@:30" needs no dash and reads
+// as "from now until :30" (the ":30" inheriting @'s hour); the explicit "@-:30"
+// is accepted too.
 func ParseAbsolute(s string, now time.Time, loc *time.Location) (Span, error) {
 	s = strings.TrimSpace(s)
-	dash := strings.IndexByte(s, '-')
-	if dash < 0 {
-		return Span{}, fmt.Errorf("invalid timesign %q: expected START-STOP", s)
+
+	// now floored to the preceding 5-minute mark, which the "@" token resolves
+	// to on either side of the range.
+	at := Floor5(now.In(loc))
+
+	var left, right string
+	if strings.HasPrefix(s, AtSign) && strings.IndexByte(s, '-') < 0 {
+		// "@STOP": the "@" START implies the separator, so no dash is needed.
+		left = AtSign
+		right = strings.TrimSpace(s[len(AtSign):])
+	} else {
+		dash := strings.IndexByte(s, '-')
+		if dash < 0 {
+			return Span{}, fmt.Errorf("invalid timesign %q: expected START-STOP", s)
+		}
+		left = strings.TrimSpace(s[:dash])
+		right = strings.TrimSpace(s[dash+1:])
 	}
-	left := strings.TrimSpace(s[:dash])
-	right := strings.TrimSpace(s[dash+1:])
 	if left == "" {
 		return Span{}, fmt.Errorf("invalid timesign %q: empty START", s)
 	}
@@ -170,11 +211,11 @@ func ParseAbsolute(s string, now time.Time, loc *time.Location) (Span, error) {
 		return Span{}, fmt.Errorf("invalid timesign %q: empty STOP", s)
 	}
 
-	sh, sm, err := parseClockPart(left, false, 0)
+	sh, sm, err := parseClockOrAt(left, false, 0, at)
 	if err != nil {
 		return Span{}, fmt.Errorf("invalid START %q: %w", left, err)
 	}
-	eh, em, err := parseClockPart(right, true, sh)
+	eh, em, err := parseClockOrAt(right, true, sh, at)
 	if err != nil {
 		return Span{}, fmt.Errorf("invalid STOP %q: %w", right, err)
 	}
@@ -305,6 +346,18 @@ func Floor5(t time.Time) time.Time {
 	// gets truncated, which keeps the result correct across odd UTC offsets.
 	hour := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, t.Location())
 	return hour.Add((t.Sub(hour) / step) * step)
+}
+
+// parseClockOrAt parses one side of an absolute range, resolving the "@" token
+// to at's wall-clock hour and minute (already floored by ParseAbsolute) and
+// deferring every other form to parseClockPart. Passing at's minute through as
+// the START hour of a minutes-only STOP is intentional: "@:30" inherits @'s
+// hour just as "9-:30" inherits 9.
+func parseClockOrAt(s string, allowMinuteOnly bool, inheritHour int, at time.Time) (hour, minute int, err error) {
+	if s == AtSign {
+		return at.Hour(), at.Minute(), nil
+	}
+	return parseClockPart(s, allowMinuteOnly, inheritHour)
 }
 
 // parseClockPart parses one side of a timesign ("H", "H:MM", or, when

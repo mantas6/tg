@@ -59,6 +59,8 @@ adds a fourth form, `-DURATION`, to take time back off it; see
 tg add 9-:30 <task>         # 09:00-09:30
 tg add 10-11 <task>         # 10:00-11:00
 tg add 10:30-11 <task>      # 10:30-11:00
+tg add @:30 <task>          # from now (floored to the last 5m mark) until :30
+tg add @-16 <task>          # from now until 16:00
 tg add +:20 <task>          # the last 20 minutes
 tg add +1:20 <task>         # the last 1h20m
 tg add 1:30 <task>          # 1h30m starting when the last entry ended
@@ -67,9 +69,11 @@ tg add :45 <task>           # 45m starting when the last entry ended
 
 For absolute ranges each side is `H` or `H:MM`; the stop side may also be `:MM`,
 inheriting the start hour. Hours are 0-23, minutes 0-59, and the stop must be
-after the start. A relative timesign ends at now rounded *down* to the preceding
-5-minute mark (14:23 -> 14:20) and starts that duration earlier. The full
-grammar, rounding rules, and error cases are in [docs/timesig.md](docs/timesig.md).
+after the start. Either side may be `@`, which is now floored *down* to the
+preceding 5-minute mark (14:23 -> 14:20); as the start it needs no dash, so
+`@:30` reads "from now until :30". A relative timesign ends at that same mark
+and starts that duration earlier. The full grammar, rounding rules, and error
+cases are in [docs/timesig.md](docs/timesig.md).
 
 A **bare duration** (no `+`, no `-`) leaves the start out: the entry begins where
 the last one ended and runs that long, which is how you log a day of back-to-back
@@ -164,9 +168,10 @@ On the day named, everything a command reckons per day is that day's:
   there, not what you tracked today. Today's numbers do not reach it, and its
   numbers do not reach today.
 
-A **relative** timesign (`+:20`) is the one form `--date` cannot take: it means
-"the last 20 minutes", counted back from the current 5-minute mark, and another
-day has no such mark. `tg add --date … +:20` is therefore refused, naming the
+A **relative** timesign (`+:20`) and the **`@`** now-token are the forms `--date`
+cannot take: `+:20` means "the last 20 minutes", counted back from the current
+5-minute mark, and `@` *is* that mark — another day has no such mark. `tg add
+--date … +:20` and `tg add --date … @:30` are therefore refused, naming the
 forms that do work. (`tg mod`'s `+30`/`-30` are fine: they only move an existing
 entry's end by that much.)
 
@@ -473,11 +478,12 @@ commands:
                             task; last 3 months [--since DATE] [--json] [-1]
   completion zsh            print the zsh completion script
 
-timesign: absolute 9-:30, 10-11, 10:30-11:15 (today), relative +:20,
-      +1, +1:20 (that long, ending at the last 5m mark), negative
-      -:20, -1:20 (that much LESS; `mod` only), or a bare duration
-      1:30, :45 (that long, starting where the last entry ended;
-      `add` only). Full spec: docs/timesig.md
+timesign: absolute 9-:30, 10-11, 10:30-11:15 (today); `@` in a range is
+      now floored to the last 5m mark, and `@:30` (no dash) is from now
+      until :30. relative +:20, +1, +1:20 (that long, ending at the last
+      5m mark), negative -:20, -1:20 (that much LESS; `mod` only), or a
+      bare duration 1:30, :45 (that long, starting where the last entry
+      ended; `add` only). Full spec: docs/timesig.md
 mod:  numbers are the per-day ones shown by `tg ls`; without one the
       last entry is modified: today's newest already-started entry, the
       same one `tg status` shows. A day that is OVER can never be
@@ -490,7 +496,7 @@ date: `add` and `mod` work on today; `--date YYYY-MM-DD` moves them to
       another day, which must be today or later (a day that is over is
       history and is refused). On a moved day the entry numbers, the
       "last entry" and an absolute timesign are all that day's; a
-      relative timesign has no `now` there, so `add` refuses one
+      relative or `@` timesign has no `now` there, so `add` refuses one
       (`mod` still takes +30/-30, which only move an end).
 -1:   `add`/`grep`/`total`/`update`/`pull` match tasks and projects by
       name fragment; a fragment matching several of them normally

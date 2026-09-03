@@ -6,6 +6,7 @@ needs a finished time range (`tg add`, `tg mod`). Four forms exist:
 | Form     | Shape         | Example  | Meaning                                    |
 | -------- | ------------- | -------- | ------------------------------------------ |
 | absolute | `START-STOP`  | `9-:30`  | 09:00-09:30 on the day worked on (today by default) |
+| absolute | `@STOP`       | `@:30`   | from now (floored to the last 5-minute mark) until :30 |
 | relative | `+DURATION`   | `+:20`   | the last 20 minutes, ending at the current 5-minute mark |
 | negative | `-DURATION`   | `-:20`   | 20 minutes to take AWAY from an existing span |
 | duration | `DURATION`    | `1:30`   | a bare 1h30m length; the command supplies the start |
@@ -15,11 +16,13 @@ The form is decided by punctuation, after trimming surrounding whitespace:
 - it is **relative** if and only if it starts with `+`;
 - it is **negative** if it starts with `-` and the rest is *shaped* like a
   duration (digits with at most one `:`, nothing else);
-- otherwise it is a **duration** if it is non-empty and contains no `-`;
-- everything else (including an empty timesign) is parsed as **absolute**.
+- otherwise it is a **duration** if it is non-empty and contains no `-` and no
+  `@`;
+- everything else (including an empty timesign and any use of the `@` now-token)
+  is parsed as **absolute**.
 
-So `1:30` is a duration, `+1:30` a relative span, `-1:30` a negative length and
-`1:30-3` an absolute range. The `-` is overloaded, which is why the negative form
+So `1:30` is a duration, `+1:30` a relative span, `-1:30` a negative length,
+`1:30-3` an absolute range and `@:30` an absolute range anchored to now. The `-` is overloaded, which is why the negative form
 is the one classified by shape rather than by its leading character alone: `-30`
 is negative, `9-30` is a range, and `-desc` is neither (it is a command-line
 flag, and `tg mod` uses the same shape test to tell the two apart before parsing
@@ -50,9 +53,9 @@ MM  = 1*DIGIT   ; 0-59
 ## Absolute form
 
 ```
-timesign = START "-" STOP
-START    = H | H ":" MM
-STOP     = H | H ":" MM | ":" MM
+timesign = START "-" STOP | "@" STOP
+START    = H | H ":" MM | "@"
+STOP     = H | H ":" MM | ":" MM | "@"
 ```
 
 Both sides resolve to wall-clock times on **now's calendar day** in the active
@@ -65,6 +68,22 @@ location (`TZ`). Rules:
 - No day arithmetic: absolute timesigns cannot cross midnight. Use two entries.
 - No rounding: the times are taken exactly as written (`9:07-9:11` is honored).
 
+### The `@` now-token
+
+Either side of the range may be `@`, which resolves to **now floored down to the
+preceding 5-minute wall-clock mark** (`00, 05, ..., 55`), seconds zeroed, in the
+active location — the same mark the relative form ends at, and never rounded up.
+As a `START`, `@` also stands in for the `-` separator, so `@:30` reads as "from
+now until :30" (the `:30` inheriting `@`'s hour) with no dash; the explicit
+`@-:30` and a `@` `STOP` (`9-@`) work too. `STOP` must still be strictly after
+`START`, so an `@` range that would be empty or inside out (`@:05` when now
+floors to 15:05, `@-@`) is an error.
+
+Because `@` is defined by "now", `tg add` accepts it only on today: on a day
+`--date` moved the command to there is no "now", so it is refused there just like
+the relative form (see [The day a timesign lands
+on](#the-day-a-timesign-lands-on)).
+
 Examples:
 
 | Input        | Start | Stop  | Duration |
@@ -76,6 +95,15 @@ Examples:
 | `0-:01`      | 00:00 | 00:01 | 1m       |
 | `23-23:59`   | 23:00 | 23:59 | 59m      |
 | ` 9 - :30 `  | 09:00 | 09:30 | 30m      |
+
+`@` examples (assuming now = 15:07, so `@` floors to 15:05):
+
+| Input     | Start | Stop  | Duration |
+| --------- | ----- | ----- | -------- |
+| `@:30`    | 15:05 | 15:30 | 25m      |
+| `@16`     | 15:05 | 16:00 | 55m      |
+| `@-16:45` | 15:05 | 16:45 | 1h40m    |
+| `9-@`     | 09:00 | 15:05 | 6h5m     |
 
 ## Relative form
 
@@ -256,15 +284,16 @@ Both commands work on **today** unless `--date YYYY-MM-DD` names a later day
 | Form                | With `--date`                                                     |
 | ------------------- | ----------------------------------------------------------------- |
 | absolute `9-10`     | resolved on that day (`add`), or on the entry's own day (`mod`)   |
+| absolute `@:30`     | **refused** by `add`: `@` is now, which exists only today         |
 | bare duration `1:30`| continues **that day's** last entry (`add`)                        |
 | relative `+:20`     | **refused** by `add`; `mod` still moves the entry's end by it      |
 | negative `-:20`     | unchanged: `mod` moves the entry's end back by it                  |
 
-The relative form is the one exception because it is defined by "now": it ends
-at the current 5-minute mark, which exists only today, and no hour of another
-day is a defensible substitute. `add` therefore refuses it there and names the
-forms that do work; `mod` keeps taking it, since only its `DURATION` is used
-(see the table above).
+The relative form and the `@` token are the exceptions because both are defined
+by "now": the relative form ends at the current 5-minute mark and `@` resolves
+to it, and no hour of another day is a defensible substitute. `add` therefore
+refuses them there and names the forms that do work; `mod` keeps taking the
+relative form, since only its `DURATION` is used (see the table above).
 
 The refusals that name a day follow the flag too: with `--date 2026-01-05` an
 unanchorable bare duration reads "no entry tracked on 2026-01-05 to continue
@@ -278,12 +307,13 @@ rejects:
 
 Absolute:
 
-- no `-` separator: `9`
-- an empty side: `-11`, `9-`, `-`, `` (empty input)
-- hour out of range: `24-25`, `9-24`
-- minute out of range: `9:60-10`, `9-9:60`
-- minutes-only start: `:30-10`
-- stop not after start: `9-9`, `10-9`, `9-:00`
+- no `-` separator: `9` (but `@STOP` needs none: `@:30` is a valid range)
+- an empty side: `-11`, `9-`, `-`, `` (empty input), `@`, `@-`
+- hour out of range: `24-25`, `9-24`, `@-24`
+- minute out of range: `9:60-10`, `9-9:60`, `@-9:60`
+- minutes-only start: `:30-10`, `:30-@`
+- stop not after start: `9-9`, `10-9`, `9-:00`, `@-@`, and any `@` range whose
+  stop is at or before the current 5-minute mark
 - non-numeric components: `ab-cd`, `9:aa-10`
 
 Relative:
@@ -348,10 +378,12 @@ func (s Span) Duration() time.Duration
 
 const RelativePrefix = "+"
 const NegativePrefix = "-"
+const AtSign = "@"
 
 func IsRelative(s string) bool
 func IsNegative(s string) bool
 func IsDuration(s string) bool
+func IsAt(s string) bool
 func Parse(s string, now time.Time, loc *time.Location) (Span, error)
 func ParseAbsolute(s string, now time.Time, loc *time.Location) (Span, error)
 func ParseRelative(s string, now time.Time, loc *time.Location) (Span, error)

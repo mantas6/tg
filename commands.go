@@ -300,6 +300,11 @@ func addSpan(env *cmdEnv, timesign string) (time.Time, time.Time, error) {
 				"a relative timesign counts back from now, so it cannot record time %s: give an absolute timesign (e.g. 9-:30) or a bare duration (e.g. 1:30) instead",
 				env.dayPhrase())
 		}
+		if timesig.IsAt(timesign) && env.dayMoved() {
+			return time.Time{}, time.Time{}, fmt.Errorf(
+				"the @ timesign resolves to now, so it cannot record time %s: give an absolute timesign (e.g. 9-:30) or a bare duration (e.g. 1:30) instead",
+				env.dayPhrase())
+		}
 		span, err := timesig.Parse(timesign, env.day, env.loc)
 		if err != nil {
 			return time.Time{}, time.Time{}, err
