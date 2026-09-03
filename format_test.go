@@ -434,6 +434,43 @@ func TestRenderTodayCurrentMarker(t *testing.T) {
 	}
 }
 
+// TestRenderTodayCurrentMarkerNegativeDuration pins the running-entry marker for
+// the OTHER shape of a running row: one that carries Toggl's negative-duration
+// marker while also having a stop time set. A pull can bring down a row with
+// only one of the two running signals (see store.Entry.Running), so `ls` must
+// key the `<` off the canonical predicate, not off `Stop == nil` alone. Such a
+// row must still read as running: `<` marker, `*` stop column, live duration.
+func TestRenderTodayCurrentMarkerNegativeDuration(t *testing.T) {
+	t.Parallel()
+	day := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) time.Time { return day.Add(d) }
+	pt := func(t time.Time) *time.Time { return &t }
+
+	entries := []store.Entry{
+		{Seq: 1, TaskName: "A", Start: at(9 * time.Hour), Stop: pt(at(10 * time.Hour)), Duration: 3600},
+		// Running, but expressed as negative duration with a stale stop set,
+		// exactly the way a Toggl pull can land it.
+		{Seq: 2, TaskName: "B", Start: at(10 * time.Hour), Stop: pt(at(10 * time.Hour)), Duration: -1},
+	}
+	var buf bytes.Buffer
+	renderToday(&buf, entries, at(10*time.Hour+45*time.Minute), time.UTC, false)
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	want := []string{
+		"1  09:00-10:00 1h00m  A",
+		"2< 10:00-  *   0h45m  B",
+		todayDivider,
+		"Total: 1h45m   (* running)",
+	}
+	if len(lines) != len(want) {
+		t.Fatalf("got %d lines, want %d:\n%s", len(lines), len(want), buf.String())
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Errorf("line %d = %q, want %q", i, lines[i], want[i])
+		}
+	}
+}
+
 // TestRenderTodayMultiDayHeaders covers the one place the flat table changes
 // shape: each calendar day numbers from 1, so a listing spanning days labels
 // the groups. A single-day listing gets no header at all.

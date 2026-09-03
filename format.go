@@ -128,7 +128,7 @@ func truncName(s string, limit int) string {
 // displayDuration is the duration shown for an entry: live (un-rounded) elapsed
 // while running, otherwise the stored quantized duration.
 func displayDuration(e store.Entry, now time.Time) time.Duration {
-	if e.Stop == nil {
+	if e.Running() {
 		return now.Sub(e.Start)
 	}
 	return time.Duration(e.Duration) * time.Second
@@ -143,7 +143,7 @@ const todayDivider = "----------------------------------------"
 func totalDuration(entries []store.Entry, now time.Time) (total time.Duration, anyRunning bool) {
 	for _, e := range entries {
 		total += displayDuration(e, now)
-		if e.Stop == nil {
+		if e.Running() {
 			anyRunning = true
 		}
 	}
@@ -192,7 +192,7 @@ const gapThreshold = time.Minute
 // sit closer than gapThreshold, or when they fall on different calendar days
 // in loc (a "gap" across midnight is just the night, not tracked idle time).
 func gapBetween(prev, next store.Entry, loc *time.Location) time.Duration {
-	if prev.Stop == nil {
+	if prev.Running() || prev.Stop == nil {
 		return 0
 	}
 	gap := next.Start.Sub(*prev.Stop)
@@ -304,7 +304,7 @@ func renderToday(w io.Writer, entries []store.Entry, now time.Time, loc *time.Lo
 		}
 		startClk := formatClock(e.Start, loc)
 		stopClk := "  *"
-		if e.Stop != nil {
+		if !e.Running() && e.Stop != nil {
 			stopClk = formatClock(*e.Stop, loc)
 		}
 		dur := displayDuration(e, now)
@@ -326,8 +326,13 @@ func renderToday(w io.Writer, entries []store.Entry, now time.Time, loc *time.Lo
 		// It consumes the first of the two spaces that separate the number
 		// column from the rest, so nothing downstream shifts: a running row
 		// reads "2< 10:30-..." exactly where a finished "2  10:30-..." sat.
+		//
+		// "Running" is the canonical store.Entry.Running predicate, not a bare
+		// Stop == nil: a pull can land a running row carrying only Toggl's
+		// negative-duration marker (with a stale stop still set), and that row
+		// must be flagged current just the same.
 		mark := "  "
-		if e.Stop == nil {
+		if e.Running() {
 			mark = "< "
 		}
 		line := fmt.Sprintf("%*d%s%s%-12s%-7s%-17s %s",
