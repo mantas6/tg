@@ -89,7 +89,14 @@ func (f PushFailure) describe() string {
 // part-way through the remote list leaves the store exactly as it was instead of
 // half-reconciled with a watermark that no longer describes it. The returned
 // result is therefore zero when an error is returned: nothing was applied.
-func Pull(ctx context.Context, st *store.Store, c *api.Client, projectID *int64, since, now time.Time) (PullResult, error) {
+//
+// force makes Toggl the source of truth for the pulled window: after the normal
+// reconciliation, any local entry whose start falls within [since, now) (and,
+// when projectID is set, that belongs to that project) but that Toggl did not
+// report is deleted. This removes entries deleted on Toggl outside the
+// modification window as well as local-only entries that were never pushed, so
+// force is DESTRUCTIVE of unsynced local work by design.
+func Pull(ctx context.Context, st *store.Store, c *api.Client, projectID *int64, since, now time.Time, force bool) (PullResult, error) {
 	remotes, err := c.List(ctx, since)
 	if err != nil {
 		return PullResult{}, fmt.Errorf("fetch entries modified since %s: %w",
@@ -99,7 +106,7 @@ func Pull(ctx context.Context, st *store.Store, c *api.Client, projectID *int64,
 	var res PullResult
 	if err := st.WithTx(ctx, func(tx *store.Store) error {
 		var err error
-		res, err = apply(ctx, tx, remotes, projectID, since, now)
+		res, err = apply(ctx, tx, remotes, projectID, since, now, force)
 		return err
 	}); err != nil {
 		return PullResult{}, err
@@ -108,8 +115,15 @@ func Pull(ctx context.Context, st *store.Store, c *api.Client, projectID *int64,
 }
 
 // apply is Pull's body, run inside the pull's transaction (tx).
-func apply(ctx context.Context, tx *store.Store, remotes []api.TimeEntry, projectID *int64, since, now time.Time) (PullResult, error) {
+func apply(ctx context.Context, tx *store.Store, remotes []api.TimeEntry, projectID *int64, since, now time.Time, force bool) (PullResult, error) {
 	var res PullResult
+	// seen collects the remote ids Toggl still reports as existing (non-deleted)
+	// within the pulled scope, so a force pass can tell which local entries are
+	// gone from Toggl (see forceDeleteMissing).
+	var seen map[int64]struct{}
+	if force {
+		seen = make(map[int64]struct{}, len(remotes))
+	}
 	for _, r := range remotes {
 		// A cancelled context (Ctrl-C) stops the loop promptly; the
 		// transaction is rolled back by WithTx.
@@ -118,6 +132,9 @@ func apply(ctx context.Context, tx *store.Store, remotes []api.TimeEntry, projec
 		}
 		if projectID != nil && (r.ProjectID == nil || *r.ProjectID != *projectID) {
 			continue
+		}
+		if force && !r.Deleted() {
+			seen[r.ID] = struct{}{}
 		}
 
 		local, err := tx.EntryByRemoteID(ctx, r.ID)
@@ -177,6 +194,14 @@ func apply(ctx context.Context, tx *store.Store, remotes []api.TimeEntry, projec
 		}
 	}
 
+	// With --force, Toggl is the source of truth for the pulled window: drop any
+	// local entry it did not report.
+	if force {
+		if err := forceDeleteMissing(ctx, tx, projectID, since, now, seen, &res); err != nil {
+			return res, err
+		}
+	}
+
 	// Only advance the watermark on a full pull; a project-scoped pull is
 	// partial and must not hide other projects' changes from a later full
 	// pull, and a window that starts after the watermark must not hide the
@@ -193,6 +218,40 @@ func apply(ctx context.Context, tx *store.Store, remotes []api.TimeEntry, projec
 		}
 	}
 	return res, nil
+}
+
+// forceDeleteMissing implements the --force pass: it deletes every local entry
+// whose start falls within the pulled window [since, now) — and, when projectID
+// is set, that belongs to that project — unless Toggl still reports it (its
+// remote id is in seen). This catches both entries deleted on Toggl outside the
+// modification window and local-only entries that were never pushed, since
+// neither appears in seen.
+//
+// It runs inside the pull's transaction, so a failure here rolls the whole pull
+// back alongside the reconciliation above.
+func forceDeleteMissing(ctx context.Context, tx *store.Store, projectID *int64, since, now time.Time, seen map[int64]struct{}, res *PullResult) error {
+	locals, err := tx.EntriesBetween(ctx, since, now)
+	if err != nil {
+		return err
+	}
+	for _, e := range locals {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if projectID != nil && (e.ProjectID == nil || *e.ProjectID != *projectID) {
+			continue
+		}
+		if e.RemoteID != nil {
+			if _, ok := seen[*e.RemoteID]; ok {
+				continue // still on Toggl
+			}
+		}
+		if err := tx.DeleteRow(ctx, e.ID); err != nil {
+			return err
+		}
+		res.Deleted++
+	}
+	return nil
 }
 
 // remoteWins decides the LWW comparison behind Pull: it reports whether the

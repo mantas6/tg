@@ -348,7 +348,7 @@ func runPull(ctx context.Context, args []string) error {
 		// it always reconciles every project. Scoping happens only via an
 		// explicit <project> argument, so the env project id is never passed
 		// through here.
-		return cmdPull(env, f.first, fragment, since, f.jsonOut)
+		return cmdPull(env, f.first, fragment, since, f.force, f.jsonOut)
 	})
 }
 
@@ -663,7 +663,11 @@ type pullFlags struct {
 	since string
 	// all widens the default today-only window to the whole current month
 	// (--all/-a).
-	all   bool
+	all bool
+	// force makes the pull treat Toggl as the source of truth: local entries
+	// within the pulled window/scope that Toggl does not report are deleted
+	// (--force/-f).
+	force bool
 	first bool
 }
 
@@ -674,6 +678,9 @@ func bindPullFlags(fs *flag.FlagSet) *pullFlags {
 	// --all and -a are aliases bound to the same variable.
 	fs.BoolVar(&f.all, "all", false, "pull this month's entries instead of only today's")
 	fs.BoolVar(&f.all, "a", false, "pull this month's entries (alias of --all)")
+	// --force and -f are aliases bound to the same variable.
+	fs.BoolVar(&f.force, "force", false, "delete local entries in the pulled window that no longer exist on Toggl")
+	fs.BoolVar(&f.force, "f", false, "delete local entries missing on Toggl (alias of --force)")
 	bindFirstFlag(fs, &f.first, "project")
 	return f
 }
@@ -965,7 +972,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "                            entries [-p FRAGMENT] [--days N] [--all] [--json] [-1]")
 	fmt.Fprintln(w, "  push                      send local changes to Toggl       [--json]")
 	fmt.Fprintln(w, "  pull [project]            fetch today's changes; all projects, or one")
-	fmt.Fprintln(w, "                            [-a|--all this month] [--since DATE] [--json] [-1]")
+	fmt.Fprintln(w, "                            [-a|--all this month] [--since DATE] [-f|--force] [--json] [-1]")
 	fmt.Fprintln(w, "  total [task...]           total tracked hours per task, one group per named")
 	fmt.Fprintln(w, "                            task; last 3 months [--since DATE] [--json] [-1]")
 	fmt.Fprintln(w, "  completion zsh            print the zsh completion script")

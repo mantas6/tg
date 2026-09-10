@@ -3551,7 +3551,7 @@ func TestSyncCommandsRequireCredentials(t *testing.T) {
 		run  func(env *cmdEnv) error
 	}{
 		{"push", func(e *cmdEnv) error { return cmdPush(e, false) }},
-		{"pull", func(e *cmdEnv) error { return cmdPull(e, false, "", since, false) }},
+		{"pull", func(e *cmdEnv) error { return cmdPull(e, false, "", since, false, false) }},
 		{"update", func(e *cmdEnv) error { return cmdUpdate(e, ptrInt(1), false, "", since, false, false) }},
 		{"projects update", func(e *cmdEnv) error { return cmdUpdateProjects(e, false, false) }},
 		{"total", func(e *cmdEnv) error { return cmdTotal(e, false, nil, since, false) }},
@@ -3653,7 +3653,7 @@ func TestPullProjectScope(t *testing.T) {
 			since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 			now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
 			var buf bytes.Buffer
-			if err := cmdPull(env(&buf, s, c, now, time.UTC), false, tc.fragment, since, false); err != nil {
+			if err := cmdPull(env(&buf, s, c, now, time.UTC), false, tc.fragment, since, false, false); err != nil {
 				t.Fatalf("pull: %v", err)
 			}
 			if !strings.Contains(buf.String(), tc.wantOutput) {
@@ -3697,7 +3697,7 @@ func TestPullIgnoresProjectEnv(t *testing.T) {
 	since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdPull(env(&buf, s, c, now, time.UTC), false, "", since, false); err != nil {
+	if err := cmdPull(env(&buf, s, c, now, time.UTC), false, "", since, false, false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	if !strings.Contains(buf.String(), "2 inserted") {
@@ -4839,7 +4839,7 @@ func TestPullTodayWindowKeepsStaleWatermark(t *testing.T) {
 	now := time.Date(2026, 1, 5, 12, 0, 0, 0, time.UTC)
 	since := startOfDay(now, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdPull(env(&buf, s, c, now, time.UTC), false, "", since, false); err != nil {
+	if err := cmdPull(env(&buf, s, c, now, time.UTC), false, "", since, false, false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	v, _ := mustMeta(t, s, store.MetaLastPull)
@@ -5743,7 +5743,7 @@ func TestSyncCommandsSurfaceUnauthorized(t *testing.T) {
 		// carries the message but not the error value.
 		wantSentinel bool
 	}{
-		{name: "pull", run: func(e *cmdEnv) error { return cmdPull(e, false, "", since, false) }, wantSentinel: true},
+		{name: "pull", run: func(e *cmdEnv) error { return cmdPull(e, false, "", since, false, false) }, wantSentinel: true},
 		{name: "update", run: func(e *cmdEnv) error { return cmdUpdate(e, ptrInt(1), false, "", since, false, false) }, wantSentinel: true},
 		{name: "projects update", run: func(e *cmdEnv) error { return cmdUpdateProjects(e, false, false) }, wantSentinel: true},
 		{name: "total", run: func(e *cmdEnv) error { return cmdTotal(e, false, nil, since, false) }, wantSentinel: true},

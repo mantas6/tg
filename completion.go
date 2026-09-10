@@ -186,6 +186,8 @@ _tg() {
           _arguments '--all[pull this month, not just today]' \
             '-a[pull this month, not just today (alias of --all)]' \
             '--since[pull entries modified since DATE]:date (YYYY-MM-DD):' \
+            '--force[delete local entries missing on Toggl]' \
+            '-f[delete local entries missing on Toggl (alias of --force)]' \
             '--json[emit JSON]' \
             '-1[use the first match on an ambiguous fragment]' \
             '--first[use the first match on an ambiguous fragment (alias of -1)]' \

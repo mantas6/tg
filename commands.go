@@ -1040,7 +1040,7 @@ func cmdUpdate(env *cmdEnv, projectID *int64, first bool, fragment string, since
 	if err := env.st.ReplaceProjectTasks(env.ctx, *pid, toStoreTasks(tasks)); err != nil {
 		return err
 	}
-	entries, err := togglsync.Pull(env.ctx, env.st, c, pid, since, env.now)
+	entries, err := togglsync.Pull(env.ctx, env.st, c, pid, since, env.now, false)
 	if err != nil {
 		return err
 	}
@@ -1134,7 +1134,7 @@ func cmdPush(env *cmdEnv, jsonOut bool) error {
 // to the current month under --all/-a (see resolvePullSince). A window that
 // does not reach back to the watermark is partial too and leaves it untouched
 // (see togglsync.Pull).
-func cmdPull(env *cmdEnv, first bool, fragment string, since time.Time, jsonOut bool) error {
+func cmdPull(env *cmdEnv, first bool, fragment string, since time.Time, force, jsonOut bool) error {
 	c, err := env.client()
 	if err != nil {
 		return err
@@ -1143,7 +1143,7 @@ func cmdPull(env *cmdEnv, first bool, fragment string, since time.Time, jsonOut 
 	if err != nil {
 		return err
 	}
-	res, err := togglsync.Pull(env.ctx, env.st, c, pid, since, env.now)
+	res, err := togglsync.Pull(env.ctx, env.st, c, pid, since, env.now, force)
 	if err != nil {
 		return err
 	}

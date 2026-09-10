@@ -61,6 +61,15 @@ func mustEntryByRemoteID(t *testing.T, st *store.Store, remoteID int64) *store.E
 	return e
 }
 
+func mustEntriesBetween(t *testing.T, st *store.Store, from, to time.Time) []store.Entry {
+	t.Helper()
+	es, err := st.EntriesBetween(ctx, from, to)
+	if err != nil {
+		t.Fatalf("EntriesBetween: %v", err)
+	}
+	return es
+}
+
 func mustDirty(t *testing.T, st *store.Store) []store.Entry {
 	t.Helper()
 	dirty, err := st.DirtyEntries(ctx)
@@ -239,7 +248,7 @@ func TestPullInsert(t *testing.T) {
 		  "duration":1800,"at":"2026-01-02T09:30:00Z"}]`))
 	})
 	now := ts(t, "2026-01-02T12:00:00Z")
-	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), now)
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), now, false)
 	if err != nil {
 		t.Fatalf("pull: %v", err)
 	}
@@ -282,7 +291,7 @@ func TestPullNumbersInsertedEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-03T12:00:00Z")); err != nil {
+	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-03T12:00:00Z"), false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 
@@ -313,7 +322,7 @@ func TestPullMapsBillable(t *testing.T) {
 		  "start":"2026-01-02T09:00:00Z","stop":"2026-01-02T09:30:00Z",
 		  "duration":1800,"billable":true,"at":"2026-01-02T09:30:00Z"}]`))
 	})
-	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z")); err != nil {
+	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"), false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	got := mustEntryByRemoteID(t, st, 910)
@@ -355,7 +364,7 @@ func TestPullLWWRemoteNewer(t *testing.T) {
 		UpdatedAt: ts(t, "2026-01-02T09:00:00Z"), Dirty: false,
 	})
 
-	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"))
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"), false)
 	if err != nil {
 		t.Fatalf("pull: %v", err)
 	}
@@ -380,7 +389,7 @@ func TestPullLWWLocalNewer(t *testing.T) {
 		UpdatedAt: ts(t, "2026-01-02T11:00:00Z"), Dirty: true,
 	})
 
-	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"))
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"), false)
 	if err != nil {
 		t.Fatalf("pull: %v", err)
 	}
@@ -412,7 +421,7 @@ func TestPullLWWTieKeepsDirtyLocal(t *testing.T) {
 		Duration: 2700, UpdatedAt: at, SyncedAt: &at, Dirty: true,
 	})
 
-	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"))
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"), false)
 	if err != nil {
 		t.Fatalf("pull: %v", err)
 	}
@@ -447,7 +456,7 @@ func TestPullLWWTieOverwritesCleanLocal(t *testing.T) {
 		Duration: 1800, UpdatedAt: at, SyncedAt: &at, Dirty: false,
 	})
 
-	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"))
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"), false)
 	if err != nil {
 		t.Fatalf("pull: %v", err)
 	}
@@ -471,7 +480,7 @@ func TestPullRemoteDeleted(t *testing.T) {
 		UpdatedAt: ts(t, "2026-01-02T09:00:00Z"),
 	})
 
-	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"))
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"), false)
 	if err != nil {
 		t.Fatalf("pull: %v", err)
 	}
@@ -489,7 +498,7 @@ func TestPullSkipsRemoteDeletedWithNoLocal(t *testing.T) {
 		w.Write([]byte(`[{"id":903,"workspace_id":1,"start":"2026-01-02T09:00:00Z",
 		  "duration":300,"at":"2026-01-02T10:00:00Z","server_deleted_at":"2026-01-02T10:00:00Z"}]`))
 	})
-	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"))
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"), false)
 	if err != nil {
 		t.Fatalf("pull: %v", err)
 	}
@@ -511,7 +520,7 @@ func TestPullSelfHealsCatalog(t *testing.T) {
 		  "duration":1800,"at":"2026-01-02T09:30:00Z"}]`))
 	})
 
-	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z")); err != nil {
+	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"), false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 
@@ -562,7 +571,7 @@ func TestPullProjectScope(t *testing.T) {
 
 	pid := int64(5)
 	now := ts(t, "2026-01-02T12:00:00Z")
-	res, err := Pull(ctx, st, c, &pid, ts(t, "2026-01-01T00:00:00Z"), now)
+	res, err := Pull(ctx, st, c, &pid, ts(t, "2026-01-01T00:00:00Z"), now, false)
 	if err != nil {
 		t.Fatalf("pull: %v", err)
 	}
@@ -584,13 +593,129 @@ func TestPullProjectScope(t *testing.T) {
 	}
 }
 
+// TestPullForceDeletesMissing verifies --force makes Toggl the source of truth:
+// a previously-synced local entry Toggl no longer reports, and a local-only
+// entry that was never pushed, are both deleted when they fall in the window;
+// an entry Toggl still reports is kept.
+func TestPullForceDeletesMissing(t *testing.T) {
+	t.Parallel()
+	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
+		// Toggl reports only entry 700.
+		w.Write([]byte(`[{"id":700,"workspace_id":1,"description":"kept",
+		  "start":"2026-01-02T09:00:00Z","stop":"2026-01-02T09:30:00Z",
+		  "duration":1800,"at":"2026-01-02T09:30:00Z"}]`))
+	})
+
+	// Still on Toggl: reconciled normally, kept.
+	mustCreate(t, st, store.Entry{
+		RemoteID: ptrInt(700), WorkspaceID: 1, Description: "kept",
+		Start: ts(t, "2026-01-02T09:00:00Z"), Stop: ptrTime(ts(t, "2026-01-02T09:30:00Z")),
+		Duration: 1800, UpdatedAt: ts(t, "2026-01-02T09:30:00Z"),
+	})
+	// Previously synced but gone from Toggl (deleted there outside the window).
+	goneID := mustCreate(t, st, store.Entry{
+		RemoteID: ptrInt(701), WorkspaceID: 1, Description: "gone",
+		Start: ts(t, "2026-01-02T08:00:00Z"), Stop: ptrTime(ts(t, "2026-01-02T08:30:00Z")),
+		Duration: 1800, UpdatedAt: ts(t, "2026-01-02T08:30:00Z"),
+	})
+	// Never pushed (no remote id): strict API-as-truth deletes it too.
+	localOnlyID := mustCreate(t, st, store.Entry{
+		WorkspaceID: 1, Description: "local only",
+		Start: ts(t, "2026-01-02T07:00:00Z"), Stop: ptrTime(ts(t, "2026-01-02T07:30:00Z")),
+		Duration: 1800, UpdatedAt: ts(t, "2026-01-02T07:30:00Z"), Dirty: true,
+	})
+
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"), true)
+	if err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	if res.Deleted != 2 {
+		t.Errorf("deleted = %d, want 2 (gone + local-only)", res.Deleted)
+	}
+	if got := mustEntryByRemoteID(t, st, 700); got == nil {
+		t.Error("entry still on Toggl should be kept")
+	}
+	if got := mustEntryByRemoteID(t, st, 701); got != nil {
+		t.Error("entry gone from Toggl should be force-deleted")
+	}
+	remaining := mustEntriesBetween(t, st, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"))
+	for _, e := range remaining {
+		if e.ID == goneID || e.ID == localOnlyID {
+			t.Errorf("entry %d should have been force-deleted", e.ID)
+		}
+	}
+	if len(remaining) != 1 {
+		t.Errorf("remaining = %d entries, want 1 (only the kept one)", len(remaining))
+	}
+}
+
+// TestPullForceKeepsOutsideWindow verifies --force only reconciles the pulled
+// window: a local entry whose start falls before `since` is left alone even
+// though Toggl did not report it (it was never in scope).
+func TestPullForceKeepsOutsideWindow(t *testing.T) {
+	t.Parallel()
+	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[]`))
+	})
+	before := mustCreate(t, st, store.Entry{
+		RemoteID: ptrInt(710), WorkspaceID: 1, Description: "old",
+		Start: ts(t, "2025-12-31T09:00:00Z"), Stop: ptrTime(ts(t, "2025-12-31T09:30:00Z")),
+		Duration: 1800, UpdatedAt: ts(t, "2025-12-31T09:30:00Z"),
+	})
+
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-02T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"), true)
+	if err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	if res.Deleted != 0 {
+		t.Errorf("deleted = %d, want 0 (entry is outside the window)", res.Deleted)
+	}
+	if got := mustEntryByRemoteID(t, st, 710); got == nil || got.ID != before {
+		t.Error("entry outside the window should be kept")
+	}
+}
+
+// TestPullForceRespectsProjectScope verifies a scoped --force pull only deletes
+// missing entries of that project and leaves other projects untouched.
+func TestPullForceRespectsProjectScope(t *testing.T) {
+	t.Parallel()
+	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[]`))
+	})
+	mustCreate(t, st, store.Entry{
+		RemoteID: ptrInt(720), WorkspaceID: 1, ProjectID: ptrInt(5), Description: "scoped gone",
+		Start: ts(t, "2026-01-02T09:00:00Z"), Stop: ptrTime(ts(t, "2026-01-02T09:30:00Z")),
+		Duration: 1800, UpdatedAt: ts(t, "2026-01-02T09:30:00Z"),
+	})
+	other := mustCreate(t, st, store.Entry{
+		RemoteID: ptrInt(721), WorkspaceID: 1, ProjectID: ptrInt(9), Description: "other project",
+		Start: ts(t, "2026-01-02T10:00:00Z"), Stop: ptrTime(ts(t, "2026-01-02T10:30:00Z")),
+		Duration: 1800, UpdatedAt: ts(t, "2026-01-02T10:30:00Z"),
+	})
+
+	pid := int64(5)
+	res, err := Pull(ctx, st, c, &pid, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"), true)
+	if err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	if res.Deleted != 1 {
+		t.Errorf("deleted = %d, want 1 (only project 5)", res.Deleted)
+	}
+	if got := mustEntryByRemoteID(t, st, 720); got != nil {
+		t.Error("scoped project entry gone from Toggl should be deleted")
+	}
+	if got := mustEntryByRemoteID(t, st, 721); got == nil || got.ID != other {
+		t.Error("other project's entry must not be touched by a scoped force pull")
+	}
+}
+
 func TestPullAdvancesLastPull(t *testing.T) {
 	t.Parallel()
 	st, c := setup(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`[]`))
 	})
 	now := ts(t, "2026-01-02T12:00:00Z")
-	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), now); err != nil {
+	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), now, false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	v, ok := mustMeta(t, st, store.MetaLastPull)
@@ -612,7 +737,7 @@ func TestPullChainedWindowAdvancesLastPull(t *testing.T) {
 		t.Fatalf("seed watermark: %v", err)
 	}
 	now := ts(t, "2026-01-02T12:00:00Z")
-	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-02T00:00:00Z"), now); err != nil {
+	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-02T00:00:00Z"), now, false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	v, _ := mustMeta(t, st, store.MetaLastPull)
@@ -634,7 +759,7 @@ func TestPullPartialWindowKeepsLastPull(t *testing.T) {
 		t.Fatalf("seed watermark: %v", err)
 	}
 	now := ts(t, "2026-01-02T12:00:00Z")
-	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-02T00:00:00Z"), now); err != nil {
+	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-02T00:00:00Z"), now, false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	v, _ := mustMeta(t, st, store.MetaLastPull)
@@ -655,7 +780,7 @@ func TestPullUnparsableWatermarkAdvances(t *testing.T) {
 		t.Fatalf("seed watermark: %v", err)
 	}
 	now := ts(t, "2026-01-02T12:00:00Z")
-	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-02T00:00:00Z"), now); err != nil {
+	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-02T00:00:00Z"), now, false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 	v, _ := mustMeta(t, st, store.MetaLastPull)
@@ -750,7 +875,7 @@ func TestRoundTrip(t *testing.T) {
 	if !created {
 		t.Fatal("expected a create call")
 	}
-	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z")); err != nil {
+	if _, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"), false); err != nil {
 		t.Fatalf("pull: %v", err)
 	}
 
@@ -951,7 +1076,7 @@ func TestPullRollsBackOnFailure(t *testing.T) {
 		  "start":"2026-01-02T10:00:00Z","duration":1800,"at":"yesterday"}]`))
 	})
 
-	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"))
+	res, err := Pull(ctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"), false)
 	if err == nil {
 		t.Fatalf("pull = %+v, want an error for the malformed entry", res)
 	}
@@ -978,7 +1103,7 @@ func TestPullContextCancelAborts(t *testing.T) {
 		  "duration":1800,"at":"2026-01-02T09:30:00Z"}]`))
 	})
 
-	if _, err := Pull(cctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z")); !errors.Is(err, context.Canceled) {
+	if _, err := Pull(cctx, st, c, nil, ts(t, "2026-01-01T00:00:00Z"), ts(t, "2026-01-02T12:00:00Z"), false); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 	if got := mustEntryByRemoteID(t, st, 920); got != nil {

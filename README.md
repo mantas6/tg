@@ -473,7 +473,7 @@ commands:
                             entries [-p FRAGMENT] [--days N] [--all] [--json] [-1]
   push                      send local changes to Toggl       [--json]
   pull [project]            fetch today's changes; all projects, or one
-                            [-a|--all this month] [--since DATE] [--json] [-1]
+                            [-a|--all this month] [--since DATE] [-f|--force] [--json] [-1]
   total [task...]           total tracked hours per task, one group per named
                             task; last 3 months [--since DATE] [--json] [-1]
   completion zsh            print the zsh completion script
@@ -531,6 +531,20 @@ Only entries **modified** inside the window are fetched, so the usual
 today-sized pull stays cheap. A window that does not reach back to the
 `last_pull` watermark is partial and leaves it untouched, so nothing that
 changed in the meantime is ever marked as reconciled.
+
+Pass `-f`/`--force` to make Toggl the **source of truth** for the pulled window:
+after the normal reconciliation, any local entry whose start falls inside the
+window (and matches the project scope, if one is given) that Toggl did **not**
+report is deleted. This removes entries deleted on Toggl outside the
+modification window as well as local-only entries that were never pushed, so
+`--force` is **destructive of unsynced local work** — widen the window with `-a`
+or `--since` to control exactly what it reconciles:
+
+```sh
+tg pull -f             # today: local entries missing on Toggl are deleted
+tg pull -a --force     # this month, Toggl wins
+tg pull backend -f     # ...scoped to one project
+```
 
 `tg push` runs automatically (best-effort) when you `tg add`, so the entry shows
 up in the Toggl web app immediately. If the network is unavailable, the entry
