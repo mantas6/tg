@@ -3581,7 +3581,7 @@ func TestLocalCommandsWorkUnauthenticated(t *testing.T) {
 	}{
 		{"current", func(e *cmdEnv) error { return cmdCurrent(e, false) }},
 		{"today", func(e *cmdEnv) error { return cmdToday(e, 1, false, false) }},
-		{"daily", func(e *cmdEnv) error { return cmdDaily(e, dailyDefaultTarget, false, false, false) }},
+		{"daily", func(e *cmdEnv) error { return cmdDaily(e, dailyDefaultTarget, false, false, false, false) }},
 		{"tasks", func(e *cmdEnv) error { return cmdTasks(e, false, nil, false) }},
 		{"grep", func(e *cmdEnv) error { return cmdGrep(e, false, nil, false, "login", false) }},
 		{"projects", func(e *cmdEnv) error { return cmdProjects(e, false, false) }},
@@ -5227,6 +5227,7 @@ func TestDailyOutput(t *testing.T) {
 		entries []fixtureEntry
 		now     time.Time
 		color   bool
+		all     bool
 		want    string
 	}{
 		{
@@ -5259,6 +5260,7 @@ func TestDailyOutput(t *testing.T) {
 			},
 			now:   time.Date(2026, 1, 20, 18, 0, 0, 0, time.UTC),
 			color: true,
+			all:   true, // -a: booked-ahead days are only shown (and dimmed) with --all
 			want: "Mon 2026-01-19  8h00m   +0:00\n" +
 				"Tue 2026-01-20  6h00m   -2:00\n" +
 				faint("Wed 2026-01-21  4h00m   -4:00") + "\n" +
@@ -5279,7 +5281,7 @@ func TestDailyOutput(t *testing.T) {
 			seedFixture(t, s, tc.entries...)
 
 			var buf bytes.Buffer
-			if err := cmdDaily(env(&buf, s, nil, tc.now, time.UTC), dailyDefaultTarget, false, false, tc.color); err != nil {
+			if err := cmdDaily(env(&buf, s, nil, tc.now, time.UTC), dailyDefaultTarget, false, tc.all, false, tc.color); err != nil {
 				t.Fatalf("daily: %v", err)
 			}
 			if got := buf.String(); got != tc.want {
@@ -5289,9 +5291,11 @@ func TestDailyOutput(t *testing.T) {
 	}
 }
 
-// TestDailyCoversWholeMonth pins the window: the listing spans the FULL
-// calendar month containing now, so days later in the month are included even
-// when now sits early in it, while the neighbouring months are excluded.
+// TestDailyCoversWholeMonth pins the window: with --all the listing spans the
+// FULL calendar month containing now, so days later in the month are included
+// even when now sits early in it, while the neighbouring months are excluded.
+// (--all is needed because those later days are in the future here, which the
+// default view hides; see TestDailyHidesFutureByDefault.)
 func TestDailyCoversWholeMonth(t *testing.T) {
 	t.Parallel()
 	s := newStore(t)
@@ -5309,8 +5313,8 @@ func TestDailyCoversWholeMonth(t *testing.T) {
 
 	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, false, false); err != nil {
-		t.Fatalf("daily: %v", err)
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, true, false, false); err != nil {
+		t.Fatalf("daily --all: %v", err)
 	}
 	got := buf.String()
 	for _, want := range []string{"Thu 2026-01-01", "Sat 2026-01-31", "(2 days x 8h00m)"} {
@@ -5327,32 +5331,122 @@ func TestDailyCoversWholeMonth(t *testing.T) {
 
 // TestDailyExcludeToday pins -n/--no-today: today's row is dropped from both the
 // listing and the footer's totals (its target shrinks with it), while earlier
-// days stay and so do days booked ahead — the filter removes only the one day
-// that is now's, reckoned as a calendar day.
+// days stay. Days booked ahead are already hidden by the default view, so with
+// just -n only the finished, past days remain.
 func TestDailyExcludeToday(t *testing.T) {
 	t.Parallel()
 	s := newStore(t)
 	seedDailyMonth(t, s, map[int]time.Duration{
 		5:  8 * time.Hour, // an earlier, finished day
 		20: 6 * time.Hour, // today, still in progress
+		21: 4 * time.Hour, // booked ahead (hidden by default)
+	})
+	now := time.Date(2026, 1, 20, 18, 0, 0, 0, time.UTC)
+
+	var buf bytes.Buffer
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, true, false, false, false); err != nil {
+		t.Fatalf("daily -n: %v", err)
+	}
+	got := buf.String()
+	for _, gone := range []string{"2026-01-20", "2026-01-21"} {
+		if strings.Contains(got, gone) {
+			t.Errorf("daily -n still lists %s:\n%s", gone, got)
+		}
+	}
+	for _, want := range []string{
+		"Mon 2026-01-05",
+		"Total: 8h00m   +0:00  (1 day x 8h00m)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("daily -n missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestDailyHidesFutureByDefault pins the default view: days booked ahead of
+// today are dropped from both the listing and the footer's totals, while today
+// and earlier days stay.
+func TestDailyHidesFutureByDefault(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedDailyMonth(t, s, map[int]time.Duration{
+		5:  8 * time.Hour, // past
+		20: 6 * time.Hour, // today
 		21: 4 * time.Hour, // booked ahead
 	})
 	now := time.Date(2026, 1, 20, 18, 0, 0, 0, time.UTC)
 
 	var buf bytes.Buffer
-	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, true, false, false); err != nil {
-		t.Fatalf("daily -n: %v", err)
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, false, false, false); err != nil {
+		t.Fatalf("daily: %v", err)
+	}
+	got := buf.String()
+	if strings.Contains(got, "2026-01-21") {
+		t.Errorf("daily lists a booked-ahead day by default:\n%s", got)
+	}
+	for _, want := range []string{
+		"Mon 2026-01-05", "Tue 2026-01-20",
+		"Total: 14h00m  -2:00  (2 days x 8h00m)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("daily missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestDailyAllShowsFuture pins -a/--all: the days the default view hides (those
+// booked ahead of today) are listed again and counted in the footer's totals.
+func TestDailyAllShowsFuture(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedDailyMonth(t, s, map[int]time.Duration{
+		5:  8 * time.Hour, // past
+		20: 6 * time.Hour, // today
+		21: 4 * time.Hour, // booked ahead
+	})
+	now := time.Date(2026, 1, 20, 18, 0, 0, 0, time.UTC)
+
+	var buf bytes.Buffer
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, true, false, false); err != nil {
+		t.Fatalf("daily -a: %v", err)
+	}
+	got := buf.String()
+	for _, want := range []string{
+		"Mon 2026-01-05", "Tue 2026-01-20", "Wed 2026-01-21",
+		"Total: 18h00m  -6:00  (3 days x 8h00m)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("daily -a missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestDailyAllExcludeToday pins the -a -n combination: --all restores the
+// booked-ahead days and -n still drops today, so every day but today is shown.
+func TestDailyAllExcludeToday(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedDailyMonth(t, s, map[int]time.Duration{
+		5:  8 * time.Hour, // past
+		20: 6 * time.Hour, // today
+		21: 4 * time.Hour, // booked ahead
+	})
+	now := time.Date(2026, 1, 20, 18, 0, 0, 0, time.UTC)
+
+	var buf bytes.Buffer
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, true, true, false, false); err != nil {
+		t.Fatalf("daily -a -n: %v", err)
 	}
 	got := buf.String()
 	if strings.Contains(got, "2026-01-20") {
-		t.Errorf("daily -n still lists today:\n%s", got)
+		t.Errorf("daily -a -n still lists today:\n%s", got)
 	}
 	for _, want := range []string{
 		"Mon 2026-01-05", "Wed 2026-01-21",
 		"Total: 12h00m  -4:00  (2 days x 8h00m)",
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("daily -n missing %q:\n%s", want, got)
+			t.Errorf("daily -a -n missing %q:\n%s", want, got)
 		}
 	}
 }
@@ -5367,7 +5461,7 @@ func TestDailyExcludeTodayOnlyToday(t *testing.T) {
 	now := time.Date(2026, 1, 20, 18, 0, 0, 0, time.UTC)
 
 	var buf bytes.Buffer
-	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, true, false, false); err != nil {
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, true, false, false, false); err != nil {
 		t.Fatalf("daily -n: %v", err)
 	}
 	if got := buf.String(); got != "No entries this month.\n" {
@@ -5388,7 +5482,7 @@ func TestDailyExcludeTodayJSON(t *testing.T) {
 	now := time.Date(2026, 1, 20, 18, 0, 0, 0, time.UTC)
 
 	var buf bytes.Buffer
-	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, true, true, false); err != nil {
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, true, false, true, false); err != nil {
 		t.Fatalf("daily -n --json: %v", err)
 	}
 	var got dailyJSON
@@ -5422,7 +5516,7 @@ func TestDailyJSONCarriesNoStyling(t *testing.T) {
 	now := time.Date(2026, 1, 20, 18, 0, 0, 0, time.UTC)
 
 	var buf bytes.Buffer
-	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, true, true); err != nil {
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, true, true, true); err != nil {
 		t.Fatalf("daily --json: %v", err)
 	}
 	if strings.Contains(buf.String(), "\x1b") {
@@ -5450,7 +5544,7 @@ func TestDailyTargetFlag(t *testing.T) {
 	}
 	for _, c := range cases {
 		var buf bytes.Buffer
-		if err := cmdDaily(env(&buf, s, nil, now, time.UTC), c.target, false, false, false); err != nil {
+		if err := cmdDaily(env(&buf, s, nil, now, time.UTC), c.target, false, false, false, false); err != nil {
 			t.Fatalf("daily -t %v: %v", c.target, err)
 		}
 		got := buf.String()
@@ -5474,7 +5568,7 @@ func TestDailyRejectsNegativeTarget(t *testing.T) {
 	seedDailyMonth(t, s, map[int]time.Duration{5: 8 * time.Hour})
 	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	err := cmdDaily(env(&buf, s, nil, now, time.UTC), -1, false, false, false)
+	err := cmdDaily(env(&buf, s, nil, now, time.UTC), -1, false, false, false, false)
 	if err == nil {
 		t.Fatalf("daily -t -1: expected an error, got %q", buf.String())
 	}
@@ -5497,7 +5591,7 @@ func TestDailySkipsDeletedEntries(t *testing.T) {
 		t.Fatalf("del: %v", err)
 	}
 	var buf bytes.Buffer
-	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, false, false); err != nil {
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, false, false, false); err != nil {
 		t.Fatalf("daily: %v", err)
 	}
 	got := buf.String()
@@ -5521,7 +5615,7 @@ func TestDailyJSON(t *testing.T) {
 	})
 	now := time.Date(2026, 1, 20, 12, 0, 0, 0, time.UTC)
 	var buf bytes.Buffer
-	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, true, false); err != nil {
+	if err := cmdDaily(env(&buf, s, nil, now, time.UTC), dailyDefaultTarget, false, false, true, false); err != nil {
 		t.Fatalf("daily --json: %v", err)
 	}
 	var got dailyJSON

@@ -218,12 +218,18 @@ func runDaily(ctx context.Context, args []string) error {
 	var noToday bool
 	fs.BoolVar(&noToday, "no-today", false, "exclude today from the output")
 	fs.BoolVar(&noToday, "n", false, "exclude today from the output (alias of --no-today)")
+	// --all and -a are aliases bound to the same variable: by default the
+	// listing stops at today, since days booked ahead are not worked yet;
+	// --all keeps the whole month, future days included.
+	var showAll bool
+	fs.BoolVar(&showAll, "all", false, "show all days in the month, including days booked ahead")
+	fs.BoolVar(&showAll, "a", false, "show all days in the month, including days booked ahead (alias of --all)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	color := term.IsTerminal(int(os.Stdout.Fd()))
 	return withEnv(ctx, func(env *cmdEnv) error {
-		return cmdDaily(env, target, noToday, *jsonOut, color)
+		return cmdDaily(env, target, noToday, showAll, *jsonOut, color)
 	})
 }
 
@@ -980,7 +986,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  current | status          last entry, gap, day total        [--json]")
 	fmt.Fprintln(w, "  today   | list | ls       show today's entries     [--days N] [--json]")
 	fmt.Fprintln(w, "  daily                     this month's time per day and overtime")
-	fmt.Fprintln(w, "                            vs a daily target [-t HOURS] [-n] [--json]")
+	fmt.Fprintln(w, "                            vs a daily target [-t HOURS] [-n] [-a] [--json]")
 	fmt.Fprintln(w, "  tasks                     list cached tasks                 [--all] [--json]")
 	fmt.Fprintln(w, "  grep <fragment>           list cached tasks matching it [--all] [--json] [-1]")
 	fmt.Fprintln(w, "  projects                  list cached projects with ids     [--all] [--json]")

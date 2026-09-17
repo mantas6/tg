@@ -41,6 +41,8 @@ func TestCompletionZsh(t *testing.T) {
 		"--target[target hours", "-t[target hours",
 		// `daily` can drop today with -n/--no-today.
 		"--no-today[", "-n[exclude today",
+		// `daily` reveals days booked ahead with -a/--all.
+		"--all[show all days", "-a[show all days",
 		// Every fragment-taking command offers -1/--first.
 		"-1[", "--first[",
 	} {

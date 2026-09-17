@@ -420,25 +420,32 @@ Total: 23h45m  -0:15  (3 days x 8h00m)   (* running)
 ```
 
 The window is the **whole current calendar month**, from the 1st to the last
-day, regardless of where in the month you run it. The target is `-t`/`--target`
-in hours, defaulting to **8**, and fractional targets work (`-t 7.5`). The third
-column is that day's tracked time minus the target, always signed, as
-`h:mm` — `+0:30` is half an hour over, `-0:45` is three quarters of an hour
-short.
+day, regardless of where in the month you run it. By default the listing stops
+at **today** — days booked *ahead* are not shown, since their planned time has
+not been worked yet; use `-a`/`--all` to list the whole month, future days
+included. The target is `-t`/`--target` in hours, defaulting to **8**, and
+fractional targets work (`-t 7.5`). The third column is that day's tracked time
+minus the target, always signed, as `h:mm` — `+0:30` is half an hour over,
+`-0:45` is three quarters of an hour short.
 
 ```sh
-tg daily              # this month against an 8h/day target
+tg daily              # this month up to today, against an 8h/day target
+tg daily -a           # ...including days booked ahead (alias --all)
 tg daily -t 6         # ...against 6h/day
 tg daily --target 7.5 # half-hour targets are fine
 tg daily -n           # exclude today (alias --no-today)
 tg daily --json       # machine-readable
 ```
 
+`-a`/`--all` restores the full-month view: days booked *ahead* of today are
+listed and counted in the footer's totals. Without it the report stops at today,
+so the overtime reflects only days that have actually happened.
+
 `-n`/`--no-today` drops today's row from the listing **and** the footer's
 totals, so the report covers only the days that are already over — handy while
 today is still in progress and its half-finished figure would otherwise skew
-the overtime. Days booked *ahead* are kept, since `-n` removes only today
-itself, not the future.
+the overtime. It composes with `-a`: `tg daily -a -n` shows every day of the
+month except today.
 
 **Only days you actually tracked something get a line**, and the footer's target
 is the daily target multiplied by the number of *listed* days — so weekends and
@@ -448,8 +455,9 @@ on it (an entry crossing midnight counts entirely towards the day it began), and
 a still-running entry contributes its elapsed time so far exactly as `tg ls` and
 `tg status` count it, marked with `*`.
 
-Days *after today* (time booked ahead) are greyed out, so planned days are easy
-to tell apart from worked ones. Like the project colors in `ls`, the dimming is
+Days *after today* (time booked ahead, shown only with `-a`/`--all`) are greyed
+out, so planned days are easy to tell apart from worked ones. Like the project
+colors in `ls`, the dimming is
 only emitted when the output is a terminal — piped or redirected output stays
 plain, and `--json` never carries styling.
 
@@ -472,7 +480,7 @@ commands:
   current | status          last entry, gap, day total        [--json]
   today   | list | ls       show today's entries     [--days N] [--json]
   daily                     this month's time per day and overtime
-                            vs a daily target [-t HOURS] [-n] [--json]
+                            vs a daily target [-t HOURS] [-n] [-a] [--json]
   tasks                     list cached tasks                 [--all] [--json]
   grep <fragment>           list cached tasks matching it [--all] [--json] [-1]
   projects                  list cached projects with ids     [--all] [--json]

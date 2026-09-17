@@ -149,7 +149,9 @@ _tg() {
             '--target[target hours worked per day (default 8)]:hours:' \
             '-t[target hours worked per day (alias of --target)]:hours:' \
             '--no-today[exclude today from the output]' \
-            '-n[exclude today from the output (alias of --no-today)]'
+            '-n[exclude today from the output (alias of --no-today)]' \
+            '--all[show all days, including days booked ahead]' \
+            '-a[show all days, including days booked ahead (alias of --all)]'
           ;;
         tasks)
           _arguments '--all[include inactive tasks]' '--json[emit JSON]'

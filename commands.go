@@ -795,15 +795,20 @@ type dailyRow struct {
 // A running entry contributes its live elapsed time, exactly as `tg today` and
 // `tg status` count it, so today's row keeps moving while something runs.
 //
+// By default only days up to and including today are listed: days booked ahead
+// have not been worked yet, so their planned figures are dropped from both the
+// listing and the footer's totals (see dropFutureRows). showAll (`-a`/`--all`)
+// keeps the whole month, future included, restoring the full-range view.
+//
 // excludeToday drops today's row (`-n`/`--no-today`): the day still in progress
 // is left out of both the listing and the footer's totals, so the report
 // answers "how did the days that are already over go?" without today's
-// half-finished figure skewing it. Only today is removed; days booked ahead are
-// kept, since they are not today either (see dropTodayRow).
+// half-finished figure skewing it (see dropTodayRow). The two filters compose:
+// `-a -n` shows every day except today.
 //
 // color enables ANSI styling in the human output (never in JSON): days after
-// today are greyed out, see renderDaily.
-func cmdDaily(env *cmdEnv, targetHours float64, excludeToday, jsonOut, color bool) error {
+// today (only ever visible under -a) are greyed out, see renderDaily.
+func cmdDaily(env *cmdEnv, targetHours float64, excludeToday, showAll, jsonOut, color bool) error {
 	if targetHours < 0 {
 		return fmt.Errorf("invalid target %g: hours per day must not be negative", targetHours)
 	}
@@ -814,6 +819,9 @@ func cmdDaily(env *cmdEnv, targetHours float64, excludeToday, jsonOut, color boo
 		return err
 	}
 	rows := groupDaily(entries, env.now, env.loc)
+	if !showAll {
+		rows = dropFutureRows(rows, env.now, env.loc)
+	}
 	if excludeToday {
 		rows = dropTodayRow(rows, env.now, env.loc)
 	}
@@ -856,6 +864,25 @@ func dropTodayRow(rows []dailyRow, now time.Time, loc *time.Location) []dailyRow
 	out := make([]dailyRow, 0, len(rows))
 	for _, r := range rows {
 		if startOfDay(r.Day, loc).Equal(today) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// dropFutureRows removes days after today from a daily listing, backing the
+// default `tg daily` view. "Today" and each row's day are calendar days in loc,
+// matching how the rest of the report is reckoned, so only rows strictly after
+// today are cut — today itself is kept (drop it with -n). Days booked ahead have
+// not been worked yet, so leaving them out keeps their planned figures out of
+// both the listing and the footer's totals; `-a`/`--all` skips this filter to
+// show the whole month, future included.
+func dropFutureRows(rows []dailyRow, now time.Time, loc *time.Location) []dailyRow {
+	today := startOfDay(now, loc)
+	out := make([]dailyRow, 0, len(rows))
+	for _, r := range rows {
+		if startOfDay(r.Day, loc).After(today) {
 			continue
 		}
 		out = append(out, r)
