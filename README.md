@@ -584,8 +584,10 @@ pass -1 to use the first match
 ```
 
 Refine the fragment (`tg update "backend api"`), pass `-1` to take the first
-candidate listed, or export `TOGGL_PROJECT_ID`, which takes precedence and also
-lets you update a project that is not cached yet.
+candidate listed, or export `TOGGL_PROJECT_ID`, which lets you update a project
+that is not cached yet. A `<project>` named on the command line (positional or
+`--project`/`-p`) takes priority over `TOGGL_PROJECT_ID`, so the env var only
+picks the project when none is named.
 
 The entry window defaults to **one day back** and is set by `--days`/`-n`, a
 count of calendar days: the window starts at midnight that many days before
@@ -603,10 +605,11 @@ task count and pull counters.
   project id is an error, not a silent "unset", so a typo cannot quietly widen
   the scope. `pull` ignores it and always
   reconciles every project; pass a `<project>` name to `pull` to scope it
-  explicitly. When unset, `update` requires a `<project>` fragment (positional
-  or `--project`/`-p`) that matches exactly one cached project — or several with
-  `-1`, which takes the first — and `add` accepts
-  `<timesign> <project> <task>` to scope by project name.
+  explicitly. `update` takes a `<project>` fragment (positional or
+  `--project`/`-p`) that matches exactly one cached project — or several with
+  `-1`, which takes the first — and that named project takes priority over
+  `TOGGL_PROJECT_ID`; the env var is required only when no project is named. `add`
+  accepts `<timesign> <project> <task>` to scope by project name.
 - `XDG_STATE_HOME` controls where state is stored (`$XDG_STATE_HOME/tg`,
   falling back to `~/.local/state/tg`). This holds `config.json` (mode 0600)
   and the SQLite database.

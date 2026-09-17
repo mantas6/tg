@@ -4216,8 +4216,9 @@ func TestResolveAddProject(t *testing.T) {
 }
 
 // TestResolveUpdateProject covers `tg update`'s two ways of naming a project:
-// TOGGL_PROJECT_ID wins outright when set (the fragment is not even consulted),
-// and with neither an id nor a fragment the command says which of the two is
+// an explicit --project/positional fragment takes priority over
+// TOGGL_PROJECT_ID, the env id is the fallback when no fragment is given, and
+// with neither an id nor a fragment the command says which of the two is
 // missing.
 func TestResolveUpdateProject(t *testing.T) {
 	t.Parallel()
@@ -4228,7 +4229,8 @@ func TestResolveUpdateProject(t *testing.T) {
 		want      *int64
 		wantErr   string
 	}{
-		{name: "env id wins over the fragment", projectID: ptrInt(2), fragment: "backend", want: ptrInt(2)},
+		{name: "fragment wins over the env id", projectID: ptrInt(2), fragment: "backend", want: ptrInt(1)},
+		{name: "env id is the fallback when no fragment is given", projectID: ptrInt(2), fragment: "  ", want: ptrInt(2)},
 		{name: "fragment resolves", fragment: "backend", want: ptrInt(1)},
 		{name: "neither is given", fragment: "  ", wantErr: "TOGGL_PROJECT_ID"},
 	} {

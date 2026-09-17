@@ -1004,9 +1004,10 @@ func cmdProjects(env *cmdEnv, all, jsonOut bool) error {
 
 // cmdUpdate refreshes the local state for a SINGLE project (never the whole
 // workspace): its tasks are fetched and upserted, and its recent time entries
-// are pulled. The project is chosen by projectID (from TOGGL_PROJECT_ID) when
-// set; otherwise fragment must uniquely match a cached project name, or match
-// several with first (`-1`) picking the top candidate.
+// are pulled. The project is chosen by fragment (from the --project/-p flag or
+// a positional argument) when given, which must uniquely match a cached project
+// name, or match several with first (`-1`) picking the top candidate; otherwise
+// it falls back to projectID (from TOGGL_PROJECT_ID).
 // Refreshing every project at once is intentionally disallowed (see
 // resolveUpdateProject).
 //
@@ -1209,20 +1210,21 @@ func labelCandidates(ctx context.Context, st *store.Store, tasks []store.Task) [
 }
 
 // resolveCachedProject resolves an optional env project id or a project-name
-// fragment to exactly one cached project id. When projectID (TOGGL_PROJECT_ID)
-// is non-nil it wins and fragment is ignored. Otherwise fragment is required
-// (emptyErr is returned verbatim when it is blank) and must resolve to exactly
-// one cached project: none -> error + noMatchHint; many -> error listing
-// candidates, unless first (the `-1` flag) takes the top candidate, exactly as
-// resolveTaskFragment does for tasks. This is the shared machinery that keeps
-// `add`, `pull`, and `update` scoped to a single project rather than the whole
-// workspace.
+// fragment to exactly one cached project id. An explicitly named project (a
+// --project flag or positional argument) takes priority over projectID
+// (TOGGL_PROJECT_ID), so the env id is only the fallback when no project is
+// named: a non-blank fragment must resolve to exactly one cached project (none
+// -> error + noMatchHint; many -> error listing candidates, unless first, the
+// `-1` flag, takes the top candidate, exactly as resolveTaskFragment does for
+// tasks), and a blank one falls back to projectID, or to emptyErr when that is
+// nil too. This is the shared machinery that keeps `add`, `pull`, and `update`
+// scoped to a single project rather than the whole workspace.
 func resolveCachedProject(ctx context.Context, st *store.Store, projectID *int64, fragment string, first bool, emptyErr error, noMatchHint string) (*int64, error) {
-	if projectID != nil {
-		return projectID, nil
-	}
 	fragment = strings.TrimSpace(fragment)
 	if fragment == "" {
+		if projectID != nil {
+			return projectID, nil
+		}
 		return nil, emptyErr
 	}
 	projects, err := st.FindProjectsByFragment(ctx, fragment)
@@ -1264,10 +1266,11 @@ func resolvePullProject(ctx context.Context, st *store.Store, fragment string, f
 		"; run `tg update` to refresh the catalog")
 }
 
-// resolveUpdateProject decides which single project `tg update` refreshes. When
-// TOGGL_PROJECT_ID is set it wins; otherwise the project-name argument must
-// uniquely match a cached project (or name several with `-1` set, which takes
-// the first). This keeps update from ever refreshing every project at once.
+// resolveUpdateProject decides which single project `tg update` refreshes. An
+// explicit project name (the --project/-p flag or a positional argument) takes
+// priority and must uniquely match a cached project (or name several with `-1`
+// set, which takes the first); when none is given TOGGL_PROJECT_ID is the
+// fallback. This keeps update from ever refreshing every project at once.
 func resolveUpdateProject(ctx context.Context, st *store.Store, projectID *int64, fragment string, first bool) (*int64, error) {
 	return resolveCachedProject(ctx, st, projectID, fragment, first,
 		errors.New("update requires a project-name argument (or set TOGGL_PROJECT_ID)"),
