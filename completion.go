@@ -197,6 +197,8 @@ _tg() {
           # Each positional is its own task fragment, so several may be given.
           _arguments '--since[total entries since DATE (default 3 months ago)]:date (YYYY-MM-DD):' \
             '--json[emit JSON]' \
+            '--project[limit the report to one project]:project fragment:__tg_project_names' \
+            '-p[limit the report to one project (alias of --project)]:project fragment:__tg_project_names' \
             '-1[total only the first match of each fragment]' \
             '--first[total only the first match of each fragment (alias of -1)]' \
             '*:task fragment:__tg_tasks'

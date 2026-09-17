@@ -30,12 +30,17 @@ type SummaryTask struct {
 // when empty, which is what makes an unfiltered report cover the whole
 // workspace; tg always sends the authenticated user's own id so `tg total`
 // reports only their time (see SummaryByTask).
+//
+// ProjectIDs restricts the report to specific projects, and is likewise omitted
+// when empty (the default, unscoped report). `tg total --project` sets it to the
+// one resolved project so the report covers only that project's tasks.
 type summaryRequest struct {
 	StartDate   string  `json:"start_date"`
 	EndDate     string  `json:"end_date"`
 	Grouping    string  `json:"grouping"`
 	SubGrouping string  `json:"sub_grouping"`
 	UserIDs     []int64 `json:"user_ids,omitempty"`
+	ProjectIDs  []int64 `json:"project_ids,omitempty"`
 }
 
 // summaryResponse mirrors the summary/time_entries response: a list of groups,
@@ -69,7 +74,11 @@ type summaryResponse struct {
 // every workspace member's. A zero userID sends no filter and reports the whole
 // workspace, which is the pre-filter behavior kept only for the case the id is
 // unknown.
-func (c *Client) SummaryByTask(ctx context.Context, workspaceID, userID int64, startDate, endDate string) ([]SummaryTask, error) {
+//
+// A non-zero projectID scopes the report to that single project (the
+// `project_ids` filter), which is how `tg total --project` limits the report to
+// one project. A zero projectID sends no project filter, covering every project.
+func (c *Client) SummaryByTask(ctx context.Context, workspaceID, userID, projectID int64, startDate, endDate string) ([]SummaryTask, error) {
 	if startDate == "" {
 		startDate = reportAllTimeStart
 	}
@@ -81,6 +90,9 @@ func (c *Client) SummaryByTask(ctx context.Context, workspaceID, userID int64, s
 	}
 	if userID != 0 {
 		req.UserIDs = []int64{userID}
+	}
+	if projectID != 0 {
+		req.ProjectIDs = []int64{projectID}
 	}
 	var resp summaryResponse
 	path := fmt.Sprintf("/workspace/%d/summary/time_entries", workspaceID)

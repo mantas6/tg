@@ -373,7 +373,16 @@ func runTotal(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		return cmdTotal(env, f.first, rest, since, f.jsonOut)
+		// --project/-p is optional: when absent the report stays unscoped, so
+		// the project is resolved only when a fragment was actually given.
+		var projectID *int64
+		if strings.TrimSpace(f.project) != "" {
+			projectID, err = resolveTotalProject(env.ctx, env.st, f.project, f.first)
+			if err != nil {
+				return err
+			}
+		}
+		return cmdTotal(env, f.first, rest, projectID, since, f.jsonOut)
 	})
 }
 
@@ -694,13 +703,21 @@ type totalFlags struct {
 	// since is the explicit window start (--since DATE), empty when absent;
 	// see resolveTotalSince.
 	since string
-	first bool
+	// project limits the report to one project by name fragment (--project/-p),
+	// empty when absent; see resolveTotalProject. Unlike `update` there is no
+	// positional spelling, since the positionals are task fragments.
+	project string
+	first   bool
 }
 
 func bindTotalFlags(fs *flag.FlagSet) *totalFlags {
 	f := &totalFlags{}
 	fs.BoolVar(&f.jsonOut, "json", false, "emit JSON")
 	fs.StringVar(&f.since, "since", "", "total entries since DATE (YYYY-MM-DD); default 3 months ago")
+	// --project and -p limit the report to one project, named by the same kind
+	// of fragment `tg update -p` takes.
+	fs.StringVar(&f.project, "project", "", "limit the report to one project (name fragment)")
+	fs.StringVar(&f.project, "p", "", "limit the report to one project (alias of --project)")
 	bindFirstFlag(fs, &f.first, "task")
 	return f
 }

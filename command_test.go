@@ -3554,7 +3554,7 @@ func TestSyncCommandsRequireCredentials(t *testing.T) {
 		{"pull", func(e *cmdEnv) error { return cmdPull(e, false, "", since, false, false) }},
 		{"update", func(e *cmdEnv) error { return cmdUpdate(e, ptrInt(1), false, "", since, false, false) }},
 		{"projects update", func(e *cmdEnv) error { return cmdUpdateProjects(e, false, false) }},
-		{"total", func(e *cmdEnv) error { return cmdTotal(e, false, nil, since, false) }},
+		{"total", func(e *cmdEnv) error { return cmdTotal(e, false, nil, nil, since, false) }},
 	} {
 		var buf bytes.Buffer
 		err := tc.run(unauthenticatedEnv(&buf, s, pushNow, time.UTC))
@@ -3874,7 +3874,7 @@ func TestTotalCommand(t *testing.T) {
 			c, _ := totalReportsServer(t)
 
 			var buf bytes.Buffer
-			err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), tc.first, tc.fragments, totalSince, false)
+			err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), tc.first, tc.fragments, nil, totalSince, false)
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("err = %v, want it to contain %q", err, tc.wantErr)
@@ -3922,7 +3922,7 @@ func TestTotalWindow(t *testing.T) {
 			c, body := totalReportsServer(t)
 
 			var buf bytes.Buffer
-			if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, []string{"login"}, tc.since, false); err != nil {
+			if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, []string{"login"}, nil, tc.since, false); err != nil {
 				t.Fatalf("total: %v", err)
 			}
 			if got := (*body)["start_date"]; got != tc.wantStart {
@@ -3945,7 +3945,7 @@ func TestTotalFiltersByCurrentUser(t *testing.T) {
 	c, body := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, []string{"login"}, totalSince, false); err != nil {
+	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, []string{"login"}, nil, totalSince, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	ids, ok := (*body)["user_ids"].([]any)
@@ -3982,12 +3982,71 @@ func TestTotalDiscoversUserID(t *testing.T) {
 	e := env(io.Discard, s, c, totalNow, time.UTC)
 	e.userID = 0 // config predates the cached id
 
-	if err := cmdTotal(e, false, []string{"login"}, totalSince, false); err != nil {
+	if err := cmdTotal(e, false, []string{"login"}, nil, totalSince, false); err != nil {
 		t.Fatalf("total: %v", err)
 	}
 	ids, ok := body["user_ids"].([]any)
 	if !ok || len(ids) != 1 || ids[0] != float64(77) {
 		t.Errorf("user_ids = %v, want [77] discovered from /me", body["user_ids"])
+	}
+}
+
+// TestTotalScopedToProject pins `tg total --project`: a non-nil projectID is
+// passed to the Reports API as the project_ids filter, so the report is scoped
+// to that single project.
+func TestTotalScopedToProject(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+	c, body := totalReportsServer(t)
+
+	var buf bytes.Buffer
+	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, nil, ptrInt(2), totalSince, false); err != nil {
+		t.Fatalf("total --project: %v", err)
+	}
+	ids, ok := (*body)["project_ids"].([]any)
+	if !ok || len(ids) != 1 || ids[0] != float64(2) {
+		t.Errorf("project_ids = %v, want [2]", (*body)["project_ids"])
+	}
+}
+
+// TestTotalUnscopedByDefault pins that omitting --project (a nil projectID)
+// sends no project_ids filter, so the default report still spans every project.
+func TestTotalUnscopedByDefault(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+	c, body := totalReportsServer(t)
+
+	var buf bytes.Buffer
+	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, nil, nil, totalSince, false); err != nil {
+		t.Fatalf("total: %v", err)
+	}
+	if _, ok := (*body)["project_ids"]; ok {
+		t.Errorf("project_ids = %v, want it omitted when --project is absent", (*body)["project_ids"])
+	}
+}
+
+// TestResolveTotalProject pins `tg total --project`'s fragment resolution: it
+// reuses resolveCachedProject (the same machinery `tg update -p` uses), so a
+// unique name fragment resolves to its id, an ambiguous one needs -1, and a
+// non-matching one is rejected. TOGGL_PROJECT_ID is never consulted.
+func TestResolveTotalProject(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	got, err := resolveTotalProject(ctx, s, "backend", false)
+	if err != nil {
+		t.Fatalf("resolveTotalProject: %v", err)
+	}
+	if got == nil || *got != 1 {
+		t.Errorf("resolved project = %v, want 1 (Backend)", got)
+	}
+
+	if _, err := resolveTotalProject(ctx, s, "nonexistent", false); err == nil ||
+		!strings.Contains(err.Error(), "no project matches") {
+		t.Errorf("err = %v, want a no-project-matches error", err)
 	}
 }
 
@@ -4017,7 +4076,7 @@ func TestTotalJSON(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, []string{"write"}, totalSince, true); err != nil {
+	if err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, []string{"write"}, nil, totalSince, true); err != nil {
 		t.Fatalf("total --json: %v", err)
 	}
 	var got totalJSONOut
@@ -4055,7 +4114,7 @@ func TestTotalMultipleFragmentsJSON(t *testing.T) {
 	c, _ := totalReportsServer(t)
 
 	var buf bytes.Buffer
-	err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, []string{"write", "docs"}, totalSince, true)
+	err := cmdTotal(env(&buf, s, c, totalNow, time.UTC), false, []string{"write", "docs"}, nil, totalSince, true)
 	if err != nil {
 		t.Fatalf("total --json: %v", err)
 	}
@@ -4127,12 +4186,13 @@ func TestResolveTotalSince(t *testing.T) {
 func TestTotalFlagRegistration(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		args      []string
-		wantFrags []string
-		wantSince string
-		wantJSON  bool
-		wantFirst bool
-		wantErr   string
+		args        []string
+		wantFrags   []string
+		wantSince   string
+		wantProject string
+		wantJSON    bool
+		wantFirst   bool
+		wantErr     string
 	}{
 		{args: nil},
 		{args: []string{"login"}, wantFrags: []string{"login"}},
@@ -4142,6 +4202,8 @@ func TestTotalFlagRegistration(t *testing.T) {
 		{args: []string{"--json", "login", "docs"}, wantFrags: []string{"login", "docs"}, wantJSON: true},
 		{args: []string{"login", "-1", "docs"}, wantFrags: []string{"login", "docs"}, wantFirst: true},
 		{args: []string{"--first", "login"}, wantFrags: []string{"login"}, wantFirst: true},
+		{args: []string{"login", "-p", "backend"}, wantFrags: []string{"login"}, wantProject: "backend"},
+		{args: []string{"--project", "backend", "login"}, wantFrags: []string{"login"}, wantProject: "backend"},
 		{
 			args:      []string{"--since", "2025-01-01", "login", "docs", "--json"},
 			wantFrags: []string{"login", "docs"}, wantSince: "2025-01-01", wantJSON: true,
@@ -4170,6 +4232,9 @@ func TestTotalFlagRegistration(t *testing.T) {
 			}
 			if f.since != tc.wantSince {
 				t.Errorf("since = %q, want %q", f.since, tc.wantSince)
+			}
+			if f.project != tc.wantProject {
+				t.Errorf("project = %q, want %q", f.project, tc.wantProject)
 			}
 			if f.jsonOut != tc.wantJSON || f.first != tc.wantFirst {
 				t.Errorf("json/first = %v/%v, want %v/%v",
@@ -5748,7 +5813,7 @@ func TestSyncCommandsSurfaceUnauthorized(t *testing.T) {
 		{name: "pull", run: func(e *cmdEnv) error { return cmdPull(e, false, "", since, false, false) }, wantSentinel: true},
 		{name: "update", run: func(e *cmdEnv) error { return cmdUpdate(e, ptrInt(1), false, "", since, false, false) }, wantSentinel: true},
 		{name: "projects update", run: func(e *cmdEnv) error { return cmdUpdateProjects(e, false, false) }, wantSentinel: true},
-		{name: "total", run: func(e *cmdEnv) error { return cmdTotal(e, false, nil, since, false) }, wantSentinel: true},
+		{name: "total", run: func(e *cmdEnv) error { return cmdTotal(e, false, nil, nil, since, false) }, wantSentinel: true},
 		{name: "push", run: func(e *cmdEnv) error { return cmdPush(e, false) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

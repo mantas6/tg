@@ -402,7 +402,7 @@ func TestSummaryByTask(t *testing.T) {
 		    {"id":10,"title":"Fix login bug","seconds":1800}]}]}`))
 	})
 
-	tasks, err := c.SummaryByTask(ctx, 1, 77, "", "2026-01-02")
+	tasks, err := c.SummaryByTask(ctx, 1, 77, 0, "", "2026-01-02")
 	if err != nil {
 		t.Fatalf("SummaryByTask: %v", err)
 	}
@@ -427,6 +427,11 @@ func TestSummaryByTask(t *testing.T) {
 	// decode as float64 through the any-typed body.
 	if ids, ok := body["user_ids"].([]any); !ok || len(ids) != 1 || ids[0] != float64(77) {
 		t.Errorf("user_ids = %v, want [77]", body["user_ids"])
+	}
+	// No project filter was requested (projectID 0), so project_ids is omitted
+	// and the report covers every project.
+	if _, ok := body["project_ids"]; ok {
+		t.Errorf("project_ids = %v, want it omitted for a zero project id", body["project_ids"])
 	}
 
 	// Task 10 (summed across the two groups), task 12 and the titleless task
@@ -461,11 +466,28 @@ func TestSummaryByTaskNoUserFilter(t *testing.T) {
 		body = decodeBody(t, r)
 		w.Write([]byte(`{"groups":[]}`))
 	})
-	if _, err := c.SummaryByTask(ctx, 1, 0, "", "2026-01-02"); err != nil {
+	if _, err := c.SummaryByTask(ctx, 1, 0, 0, "", "2026-01-02"); err != nil {
 		t.Fatalf("SummaryByTask: %v", err)
 	}
 	if _, ok := body["user_ids"]; ok {
 		t.Errorf("user_ids = %v, want it omitted for a zero user id", body["user_ids"])
+	}
+}
+
+// TestSummaryByTaskProjectFilter verifies a non-zero projectID is sent as the
+// project_ids filter, so `tg total --project` scopes the report to one project.
+func TestSummaryByTaskProjectFilter(t *testing.T) {
+	t.Parallel()
+	var body map[string]any
+	c := newTestClientReports(t, func(w http.ResponseWriter, r *http.Request) {
+		body = decodeBody(t, r)
+		w.Write([]byte(`{"groups":[]}`))
+	})
+	if _, err := c.SummaryByTask(ctx, 1, 77, 5, "", "2026-01-02"); err != nil {
+		t.Fatalf("SummaryByTask: %v", err)
+	}
+	if ids, ok := body["project_ids"].([]any); !ok || len(ids) != 1 || ids[0] != float64(5) {
+		t.Errorf("project_ids = %v, want [5]", body["project_ids"])
 	}
 }
 

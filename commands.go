@@ -614,7 +614,14 @@ type totalGroup struct {
 //
 // The window defaults to the last three months (see runTotal/resolveTotalSince)
 // and can be overridden with `--since`.
-func cmdTotal(env *cmdEnv, first bool, fragments []string, since time.Time, jsonOut bool) error {
+//
+// projectID, when non-nil, limits the report to a single project (the
+// --project/-p flag, resolved by resolveTotalProject from a name fragment or an
+// id exactly as `tg update` resolves its project). It is passed to the Reports
+// API's project_ids filter, so an omitted flag leaves the report unscoped and
+// its behavior unchanged. TOGGL_PROJECT_ID is deliberately NOT consulted: the
+// flag is the only way to scope `tg total`.
+func cmdTotal(env *cmdEnv, first bool, fragments []string, projectID *int64, since time.Time, jsonOut bool) error {
 	c, err := env.client()
 	if err != nil {
 		return err
@@ -637,9 +644,17 @@ func cmdTotal(env *cmdEnv, first bool, fragments []string, since time.Time, json
 		return err
 	}
 
+	// The report is scoped to one project only when --project resolved to one;
+	// a nil projectID sends no project filter, so the report spans every
+	// project exactly as it always did.
+	var pid int64
+	if projectID != nil {
+		pid = *projectID
+	}
+
 	startDate := since.In(env.loc).Format(dateLayout)
 	endDate := env.now.In(env.loc).Format(dateLayout)
-	rows, err := c.SummaryByTask(env.ctx, env.workspaceID, userID, startDate, endDate)
+	rows, err := c.SummaryByTask(env.ctx, env.workspaceID, userID, pid, startDate, endDate)
 	if err != nil {
 		return fmt.Errorf("fetch totals for %s..%s: %w", startDate, endDate, err)
 	}
@@ -1275,6 +1290,17 @@ func resolveUpdateProject(ctx context.Context, st *store.Store, projectID *int64
 	return resolveCachedProject(ctx, st, projectID, fragment, first,
 		errors.New("update requires a project-name argument (or set TOGGL_PROJECT_ID)"),
 		"; set TOGGL_PROJECT_ID to its id to update a project not yet cached")
+}
+
+// resolveTotalProject resolves `tg total`'s optional --project/-p fragment to
+// the single cached project the report is scoped to; see resolveCachedProject.
+// It is called only when a fragment is given, so the empty-fragment error is
+// never hit in practice; total never falls back to TOGGL_PROJECT_ID, so the env
+// id is not passed through and an omitted flag leaves the report unscoped.
+func resolveTotalProject(ctx context.Context, st *store.Store, fragment string, first bool) (*int64, error) {
+	return resolveCachedProject(ctx, st, nil, fragment, first,
+		errors.New("total --project requires a project-name argument"),
+		"; run `tg update` to refresh the catalog")
 }
 
 // resolveAddProject resolves the project-name argument accepted by the 2-fragment

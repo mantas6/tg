@@ -291,6 +291,7 @@ tg total "code review"                # one fragment: "code review"
 tg total                              # every task with tracked time
 tg total --since 2025-01-01 login     # from 2025-01-01 through today
 tg total write -1                     # only the first matching task
+tg total -p backend                   # only the "backend" project
 ```
 
 Each argument is its **own** task-name fragment (unlike `tg add`, which joins
@@ -324,6 +325,13 @@ nothing tracked in the range, fails the whole command instead of quietly
 dropping out of the report. `--json` adds a `fragments` array (each with its own
 `tasks` and `total_seconds`) next to the usual distinct `tasks` and
 `total_seconds`, and is unchanged for a single fragment.
+
+`--project`/`-p` limits the whole report to one project, named the same way as
+`tg update -p` (a case-insensitive name fragment that must uniquely match a
+cached project, with `-1` taking the first of several). It combines with the
+task fragments, which are then matched only within that project. It is optional
+and, unlike `add`/`update`, never falls back to `TOGGL_PROJECT_ID`: omitting it
+leaves the report spanning every project.
 
 `status` (alias `current`) is the terse one-glance line: the last entry with its
 wall-clock range, the idle gap since it stopped, and today's tracked total.
@@ -475,7 +483,8 @@ commands:
   pull [project]            fetch today's changes; all projects, or one
                             [-a|--all this month] [--since DATE] [-f|--force] [--json] [-1]
   total [task...]           total tracked hours per task, one group per named
-                            task; last 3 months [--since DATE] [--json] [-1]
+                            task; last 3 months
+                            [-p FRAGMENT] [--since DATE] [--json] [-1]
   completion zsh            print the zsh completion script
 
 timesign: absolute 9-:30, 10-11, 10:30-11:15 (today); `@` in a range is
