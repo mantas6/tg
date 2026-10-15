@@ -282,7 +282,8 @@ local catalog: report rows are joined to cached tasks by task id, because the
 API's summary rows often carry ids only. It lists one line per task with its
 project plus a grand total. By default it covers the last 3 months (from today
 minus three months through today); pass `--since DATE` (YYYY-MM-DD) to override
-the start of the range:
+the start of the range, or `--this-month`/`-m` to start it on the first day of
+the current month:
 
 ```sh
 tg total login                        # last 3 months for "login"
@@ -290,6 +291,7 @@ tg total login docs                   # two fragments: one group each
 tg total "code review"                # one fragment: "code review"
 tg total                              # every task with tracked time
 tg total --since 2025-01-01 login     # from 2025-01-01 through today
+tg total -m login                     # this calendar month only
 tg total write -1                     # only the first matching task
 tg total -p backend                   # only the "backend" project
 ```
@@ -332,6 +334,11 @@ cached project, with `-1` taking the first of several). It combines with the
 task fragments, which are then matched only within that project. It is optional
 and, unlike `add`/`update`, never falls back to `TOGGL_PROJECT_ID`: omitting it
 leaves the report spanning every project.
+
+`--this-month`/`-m` starts the range at midnight on the 1st of the current
+month in your local time zone, so it reports the calendar month to date. It
+cannot be combined with `--since`: both set the start of the range, so giving
+both is an error rather than one silently winning.
 
 `status` (alias `current`) is the terse one-glance line: the last entry with its
 wall-clock range, the idle gap since it stopped, and today's tracked total.
@@ -492,7 +499,7 @@ commands:
                             [-a|--all this month] [--since DATE] [-f|--force] [--json] [-1]
   total [task...]           total tracked hours per task, one group per named
                             task; last 3 months
-                            [-p FRAGMENT] [--since DATE] [--json] [-1]
+                            [-p FRAGMENT] [-m|--this-month] [--since DATE] [--json] [-1]
   completion zsh            print the zsh completion script
 
 timesign: absolute 9-:30, 10-11, 10:30-11:15 (today); `@` in a range is

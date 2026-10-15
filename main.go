@@ -375,7 +375,7 @@ func runTotal(ctx context.Context, args []string) error {
 	// is what resolves the reported task ids to names and what fragments are
 	// matched against (see cmdTotal).
 	return withEnv(ctx, func(env *cmdEnv) error {
-		since, err := resolveTotalSince(f.since, env.now, env.loc)
+		since, err := resolveTotalSince(f.since, f.thisMonth, env.now, env.loc)
 		if err != nil {
 			return err
 		}
@@ -709,6 +709,11 @@ type totalFlags struct {
 	// since is the explicit window start (--since DATE), empty when absent;
 	// see resolveTotalSince.
 	since string
+	// thisMonth narrows the window to the current calendar month
+	// (--this-month/-m); see resolveTotalSince. It is a separate flag rather
+	// than a --since spelling so the common "how much this month" question
+	// needs no date typed out, and it cannot be combined with --since.
+	thisMonth bool
 	// project limits the report to one project by name fragment (--project/-p),
 	// empty when absent; see resolveTotalProject. Unlike `update` there is no
 	// positional spelling, since the positionals are task fragments.
@@ -720,6 +725,9 @@ func bindTotalFlags(fs *flag.FlagSet) *totalFlags {
 	f := &totalFlags{}
 	fs.BoolVar(&f.jsonOut, "json", false, "emit JSON")
 	fs.StringVar(&f.since, "since", "", "total entries since DATE (YYYY-MM-DD); default 3 months ago")
+	// --this-month and -m are aliases bound to the same variable.
+	fs.BoolVar(&f.thisMonth, "this-month", false, "total only the current calendar month")
+	fs.BoolVar(&f.thisMonth, "m", false, "total only the current calendar month (alias of --this-month)")
 	// --project and -p limit the report to one project, named by the same kind
 	// of fragment `tg update -p` takes.
 	fs.StringVar(&f.project, "project", "", "limit the report to one project (name fragment)")
@@ -924,10 +932,25 @@ func resolveUpdateSince(days int, now time.Time, loc *time.Location) time.Time {
 
 // resolveTotalSince determines the `tg total` window start: an explicit --since
 // date (parsed in loc, mirroring resolveSince's format and error style), else
-// the default three calendar months before now.
-func resolveTotalSince(sinceFlag string, now time.Time, loc *time.Location) (time.Time, error) {
+// with thisMonth (--this-month/-m) midnight on the first day of the current
+// month in loc, else the default three calendar months before now.
+//
+// The month is aligned in loc, like resolvePullSince's --all, so "this month"
+// is the caller's calendar month even when UTC is already in another one.
+//
+// Unlike `pull`, where --since silently wins over --all, giving both --since
+// and --this-month is an error: each names a window START outright, so there is
+// no sensible precedence and quietly dropping one would report a range the
+// caller did not ask for.
+func resolveTotalSince(sinceFlag string, thisMonth bool, now time.Time, loc *time.Location) (time.Time, error) {
+	if sinceFlag != "" && thisMonth {
+		return time.Time{}, errors.New("total: --since and --this-month are mutually exclusive")
+	}
 	if sinceFlag != "" {
 		return parseSinceFlag(sinceFlag, loc)
+	}
+	if thisMonth {
+		return startOfMonth(now, loc), nil
 	}
 	return now.AddDate(0, -3, 0), nil
 }
@@ -997,7 +1020,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  pull [project]            fetch today's changes; all projects, or one")
 	fmt.Fprintln(w, "                            [-a|--all this month] [--since DATE] [-f|--force] [--json] [-1]")
 	fmt.Fprintln(w, "  total [task...]           total tracked hours per task, one group per named")
-	fmt.Fprintln(w, "                            task; last 3 months [--since DATE] [--json] [-1]")
+	fmt.Fprintln(w, "                            task; last 3 months")
+	fmt.Fprintln(w, "                            [-p FRAGMENT] [-m|--this-month] [--since DATE] [--json] [-1]")
 	fmt.Fprintln(w, "  completion zsh            print the zsh completion script")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "timesign: absolute 9-:30, 10-11, 10:30-11:15 (today); `@` in a range is")

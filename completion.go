@@ -198,6 +198,8 @@ _tg() {
         total)
           # Each positional is its own task fragment, so several may be given.
           _arguments '--since[total entries since DATE (default 3 months ago)]:date (YYYY-MM-DD):' \
+            '--this-month[total only the current calendar month]' \
+            '-m[total only the current calendar month (alias of --this-month)]' \
             '--json[emit JSON]' \
             '--project[limit the report to one project]:project fragment:__tg_project_names' \
             '-p[limit the report to one project (alias of --project)]:project fragment:__tg_project_names' \

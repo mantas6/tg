@@ -613,7 +613,8 @@ type totalGroup struct {
 // always did.
 //
 // The window defaults to the last three months (see runTotal/resolveTotalSince)
-// and can be overridden with `--since`.
+// and can be overridden with `--since` or narrowed to the current calendar
+// month with `--this-month`/`-m`.
 //
 // projectID, when non-nil, limits the report to a single project (the
 // --project/-p flag, resolved by resolveTotalProject from a name fragment or an

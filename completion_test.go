@@ -192,6 +192,35 @@ func TestCompletionOffersNoTodayFlag(t *testing.T) {
 	}
 }
 
+// TestCompletionOffersThisMonthFlag pins -m/--this-month to `tg total`, the one
+// command that narrows its window to the current calendar month with it (`pull`
+// spells "this month" as --all/-a), so no other block may offer the long form.
+func TestCompletionOffersThisMonthFlag(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	if err := cmdCompletion(&buf, "zsh"); err != nil {
+		t.Fatalf("completion: %v", err)
+	}
+	blocks := completionBlocks(buf.String())
+	total, ok := blocks["total"]
+	if !ok {
+		t.Fatalf("completion script has no total block")
+	}
+	for _, want := range []string{"'--this-month[", "'-m["} {
+		if !strings.Contains(total, want) {
+			t.Errorf("total block missing %q:\n%s", want, total)
+		}
+	}
+	for cmd, block := range blocks {
+		if cmd == "total" {
+			continue
+		}
+		if strings.Contains(block, "--this-month[") {
+			t.Errorf("%s does not take --this-month, it should not offer one:\n%s", cmd, block)
+		}
+	}
+}
+
 func TestCompletionUnsupportedShell(t *testing.T) {
 	t.Parallel()
 	for _, shell := range []string{"", "bash", "fish"} {

@@ -4144,22 +4144,48 @@ func TestTotalMultipleFragmentsJSON(t *testing.T) {
 // TestResolveTotalSince pins `tg total`'s window start: the default is three
 // calendar months before now, an explicit --since date is parsed as midnight in
 // the given location, and a malformed one is rejected in the shared
-// "invalid --since" style.
+// "invalid --since" style. --this-month starts the window at midnight on the
+// 1st of the current month in the CALLER's location, and combining it with
+// --since is refused rather than letting either silently win.
 func TestResolveTotalSince(t *testing.T) {
 	t.Parallel()
+	// 2026-03-01T01:00+03:00 is still February in UTC, so a UTC-framed month
+	// alignment would start the window a month early.
+	eastern := time.FixedZone("UTC+3", 3*60*60)
+	lateFebruaryUTC := time.Date(2026, 2, 28, 22, 0, 0, 0, time.UTC)
+
 	for _, tc := range []struct {
-		name    string
-		flag    string
-		want    time.Time
-		wantErr string
+		name      string
+		flag      string
+		thisMonth bool
+		now       time.Time
+		loc       *time.Location
+		want      time.Time
+		wantErr   string
 	}{
 		{name: "default is three months back", want: totalNow.AddDate(0, -3, 0)},
 		{name: "explicit date", flag: "2025-01-01", want: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)},
 		{name: "malformed date", flag: "not-a-date", wantErr: "invalid --since"},
+		{name: "--this-month is the 1st of this month", thisMonth: true, want: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{
+			name: "--this-month is aligned in loc", thisMonth: true, now: lateFebruaryUTC, loc: eastern,
+			want: time.Date(2026, 3, 1, 0, 0, 0, 0, eastern),
+		},
+		{
+			name: "--since and --this-month conflict", flag: "2025-01-01", thisMonth: true,
+			wantErr: "--since and --this-month are mutually exclusive",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := resolveTotalSince(tc.flag, totalNow, time.UTC)
+			now, loc := tc.now, tc.loc
+			if now.IsZero() {
+				now = totalNow
+			}
+			if loc == nil {
+				loc = time.UTC
+			}
+			got, err := resolveTotalSince(tc.flag, tc.thisMonth, now, loc)
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("err = %v, want it to contain %q", err, tc.wantErr)
@@ -4190,6 +4216,7 @@ func TestTotalFlagRegistration(t *testing.T) {
 		wantFrags   []string
 		wantSince   string
 		wantProject string
+		wantMonth   bool
 		wantJSON    bool
 		wantFirst   bool
 		wantErr     string
@@ -4204,6 +4231,8 @@ func TestTotalFlagRegistration(t *testing.T) {
 		{args: []string{"--first", "login"}, wantFrags: []string{"login"}, wantFirst: true},
 		{args: []string{"login", "-p", "backend"}, wantFrags: []string{"login"}, wantProject: "backend"},
 		{args: []string{"--project", "backend", "login"}, wantFrags: []string{"login"}, wantProject: "backend"},
+		{args: []string{"login", "-m"}, wantFrags: []string{"login"}, wantMonth: true},
+		{args: []string{"--this-month", "login"}, wantFrags: []string{"login"}, wantMonth: true},
 		{
 			args:      []string{"--since", "2025-01-01", "login", "docs", "--json"},
 			wantFrags: []string{"login", "docs"}, wantSince: "2025-01-01", wantJSON: true,
@@ -4235,6 +4264,9 @@ func TestTotalFlagRegistration(t *testing.T) {
 			}
 			if f.project != tc.wantProject {
 				t.Errorf("project = %q, want %q", f.project, tc.wantProject)
+			}
+			if f.thisMonth != tc.wantMonth {
+				t.Errorf("thisMonth = %v, want %v", f.thisMonth, tc.wantMonth)
 			}
 			if f.jsonOut != tc.wantJSON || f.first != tc.wantFirst {
 				t.Errorf("json/first = %v/%v, want %v/%v",
