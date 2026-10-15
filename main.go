@@ -73,6 +73,8 @@ func run(ctx context.Context, cmd string, args []string) error {
 		return runPull(ctx, args)
 	case "total":
 		return runTotal(ctx, args)
+	case "default":
+		return runDefault(ctx, args)
 	case "completion":
 		return runCompletion(args)
 	case "help", "-h", "--help":
@@ -100,22 +102,23 @@ func runAdd(ctx context.Context, args []string) error {
 	}
 	// First positional arg is the timesign. After it, two fragments mean
 	// `<project> <task>` (the first scopes to a project, overriding
-	// TOGGL_PROJECT_ID); one means `<task>` scoped by env.
+	// TOGGL_PROJECT_ID and the `tg default` project); one means `<task>`
+	// scoped by those (see cmdEnv.scopedProjectID).
 	if len(rest) < 2 {
 		return errors.New(addUsage)
 	}
 	timesign := rest[0]
 	rest = rest[1:]
-	projectID, err := projectIDFromEnv()
-	if err != nil {
-		return err
-	}
 	// The project-name form is resolved against the cached catalog, so it needs
 	// the store and happens inside withEnv. --date is resolved there too: it is
 	// judged against the invocation's pinned clock, like `pull`'s and `total`'s
 	// --since (see resolveDateFlag).
 	return withEnv(ctx, func(env *cmdEnv) error {
 		day, err := resolveDateFlag(f.date, env.now, env.loc)
+		if err != nil {
+			return err
+		}
+		projectID, err := env.scopedProjectID()
 		if err != nil {
 			return err
 		}
@@ -240,11 +243,11 @@ func runTasks(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	projectID, err := projectIDFromEnv()
-	if err != nil {
-		return err
-	}
 	return withEnv(ctx, func(env *cmdEnv) error {
+		projectID, err := env.scopedProjectID()
+		if err != nil {
+			return err
+		}
 		return cmdTasks(env, *all, projectID, *jsonOut)
 	})
 }
@@ -261,14 +264,14 @@ func runGrep(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	projectID, err := projectIDFromEnv()
-	if err != nil {
-		return err
-	}
 	// All positionals form ONE fragment, exactly like `tg add` (unlike
 	// `tg total`, whose positionals are one fragment each).
 	fragment := strings.Join(rest, " ")
 	return withEnv(ctx, func(env *cmdEnv) error {
+		projectID, err := env.scopedProjectID()
+		if err != nil {
+			return err
+		}
 		return cmdGrep(env, *all, projectID, first, fragment, *jsonOut)
 	})
 }
@@ -316,11 +319,13 @@ func runUpdate(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	projectID, err := projectIDFromEnv()
-	if err != nil {
-		return err
-	}
 	return withEnv(ctx, func(env *cmdEnv) error {
+		// The scope is only the fallback: a project named on the command line
+		// still wins over it (see resolveUpdateProject).
+		projectID, err := env.scopedProjectID()
+		if err != nil {
+			return err
+		}
 		since := resolveUpdateSince(f.days, env.now, env.loc)
 		return cmdUpdate(env, projectID, f.first, fragment, since, f.all, f.jsonOut)
 	})
@@ -353,7 +358,9 @@ func runPull(ctx context.Context, args []string) error {
 		// pull deliberately ignores TOGGL_PROJECT_ID (unlike add/tasks/update):
 		// it always reconciles every project. Scoping happens only via an
 		// explicit <project> argument, so the env project id is never passed
-		// through here.
+		// through here — and neither is the `tg default` project, which is
+		// only ever a stand-in for the env var (env.scopedProjectID is
+		// deliberately not called).
 		return cmdPull(env, f.first, fragment, since, f.force, f.jsonOut)
 	})
 }
@@ -381,6 +388,8 @@ func runTotal(ctx context.Context, args []string) error {
 		}
 		// --project/-p is optional: when absent the report stays unscoped, so
 		// the project is resolved only when a fragment was actually given.
+		// Like pull, total ignores TOGGL_PROJECT_ID and therefore the
+		// `tg default` project too: env.scopedProjectID is never consulted.
 		var projectID *int64
 		if strings.TrimSpace(f.project) != "" {
 			projectID, err = resolveTotalProject(env.ctx, env.st, f.project, f.first)
@@ -389,6 +398,27 @@ func runTotal(ctx context.Context, args []string) error {
 			}
 		}
 		return cmdTotal(env, f.first, rest, projectID, since, f.jsonOut)
+	})
+}
+
+func runDefault(ctx context.Context, args []string) error {
+	fs := newFlagSet("default")
+	f := bindDefaultFlags(fs)
+	// Flags may follow the project fragment (`tg default back -1`), so
+	// positionals are peeled off the same way `tg update` does it, and they are
+	// joined into ONE fragment so a multi-word name works unquoted.
+	rest, err := parseArgsAndFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	fragment := strings.TrimSpace(strings.Join(rest, " "))
+	if f.clear && fragment != "" {
+		return fmt.Errorf("default: --clear takes no project, got %q", fragment)
+	}
+	// The store is opened for the catalog the fragment is resolved against;
+	// the config is re-read and written by cmdDefault itself (see there).
+	return withEnv(ctx, func(env *cmdEnv) error {
+		return cmdDefault(env, fragment, f.first, f.clear, f.jsonOut)
 	})
 }
 
@@ -451,9 +481,20 @@ func withEnvOut(ctx context.Context, w io.Writer, fn func(env *cmdEnv) error) er
 	now := time.Now()
 	env := &cmdEnv{ctx: ctx, w: w, st: st, now: now, day: now, loc: time.Local}
 	if cfg != nil {
-		env.c = api.New(cfg.APIToken)
-		env.workspaceID = cfg.WorkspaceID
-		env.userID = cfg.UserID
+		// A config can exist with no token: `tg default` writes one before
+		// (or without) `tg auth`, since pinning a project is a purely local
+		// setting. Such a config carries no credentials, so the invocation
+		// stays offline — a client built from "" would turn every best-effort
+		// push into an auth failure and hide the "run `tg auth`" error.
+		if cfg.APIToken != "" {
+			env.c = api.New(cfg.APIToken)
+			env.workspaceID = cfg.WorkspaceID
+			env.userID = cfg.UserID
+		}
+		if cfg.DefaultProjectID != 0 {
+			id := cfg.DefaultProjectID
+			env.defaultProjectID = &id
+		}
 	}
 	return fn(env)
 }
@@ -736,6 +777,24 @@ func bindTotalFlags(fs *flag.FlagSet) *totalFlags {
 	return f
 }
 
+// defaultFlags holds `tg default`'s flag values; see updateFlags for why
+// registration is a function of its own. The project fragment is positional and
+// stays out of here.
+type defaultFlags struct {
+	// clear unsets the stored default project (--clear).
+	clear   bool
+	jsonOut bool
+	first   bool
+}
+
+func bindDefaultFlags(fs *flag.FlagSet) *defaultFlags {
+	f := &defaultFlags{}
+	fs.BoolVar(&f.clear, "clear", false, "unset the default project")
+	fs.BoolVar(&f.jsonOut, "json", false, "emit JSON")
+	bindFirstFlag(fs, &f.first, "project")
+	return f
+}
+
 // parseArgsAndFlags parses args with fs and returns the positional arguments,
 // tolerating flags that appear AFTER a positional. The flag package stops at the
 // first non-flag argument, which would make `tg mod 2 --desc x` treat --desc as
@@ -859,6 +918,11 @@ func isDigits(s string) bool {
 // variable is what scopes `add`, `tasks`, `grep` and `update` to one project, so
 // treating a typo as "unset" would quietly widen the scope — and file entries
 // added under it against no project at all.
+//
+// Commands do not call this directly: they go through cmdEnv.scopedProjectID,
+// which adds the `tg default` fallback on top. It stays a separate function so
+// the env var's own parsing (and `tg default`'s "overridden by" notice) can use
+// it without the fallback.
 func projectIDFromEnv() (*int64, error) {
 	v := strings.TrimSpace(os.Getenv("TOGGL_PROJECT_ID"))
 	if v == "" {
@@ -869,6 +933,29 @@ func projectIDFromEnv() (*int64, error) {
 		return nil, fmt.Errorf("invalid TOGGL_PROJECT_ID %q: want a numeric project id", v)
 	}
 	return &id, nil
+}
+
+// scopedProjectID is the single place the project-scoped commands (`add`,
+// `tasks`, `grep`, `update`) get their project scope from: TOGGL_PROJECT_ID
+// when it is set, otherwise the global default stored by `tg default`, otherwise
+// nil (unscoped). The env var always wins so a shell, script or direnv file can
+// override the persistent default for one invocation or one directory without
+// touching the config.
+//
+// A malformed TOGGL_PROJECT_ID is still an error and does NOT fall back to the
+// default: the user asked for a specific project and mistyped it, and silently
+// using a different (stored) project would be worse than failing.
+//
+// It lives on cmdEnv rather than being a free function because the stored
+// default comes from the config, which withEnv loads; resolving it there keeps
+// the config read to once per invocation. `pull` and `total`, which deliberately
+// ignore TOGGL_PROJECT_ID, never call it, and so ignore the default as well.
+func (e *cmdEnv) scopedProjectID() (*int64, error) {
+	id, err := projectIDFromEnv()
+	if err != nil || id != nil {
+		return id, err
+	}
+	return e.defaultProjectID, nil
 }
 
 // resolvePullSince determines `tg pull`'s window start. An explicit --since
@@ -1022,6 +1109,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  total [task...]           total tracked hours per task, one group per named")
 	fmt.Fprintln(w, "                            task; last 3 months")
 	fmt.Fprintln(w, "                            [-p FRAGMENT] [-m|--this-month] [--since DATE] [--json] [-1]")
+	fmt.Fprintln(w, "  default [project]         show or set the default project used when")
+	fmt.Fprintln(w, "                            TOGGL_PROJECT_ID is unset [--clear] [--json] [-1]")
 	fmt.Fprintln(w, "  completion zsh            print the zsh completion script")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "timesign: absolute 9-:30, 10-11, 10:30-11:15 (today); `@` in a range is")
@@ -1045,17 +1134,19 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "      the \"last entry\" and an absolute timesign are all that day's;")
 	fmt.Fprintln(w, "      a relative or `@` timesign has no `now` there, so `add` refuses")
 	fmt.Fprintln(w, "      one (`mod` still takes +30/-30, which only move an end).")
-	fmt.Fprintln(w, "-1:   `add`/`grep`/`total`/`update`/`pull` match tasks and projects by")
-	fmt.Fprintln(w, "      name fragment; a fragment matching several of them normally")
-	fmt.Fprintln(w, "      fails with the candidates listed. `-1` (alias `--first`) takes")
-	fmt.Fprintln(w, "      the first candidate instead, which is how two tasks sharing a")
-	fmt.Fprintln(w, "      name in different projects are told apart.")
+	fmt.Fprintln(w, "-1:   `add`/`grep`/`total`/`update`/`pull`/`default` match tasks and")
+	fmt.Fprintln(w, "      projects by name fragment; a fragment matching several of them")
+	fmt.Fprintln(w, "      normally fails with the candidates listed. `-1` (alias")
+	fmt.Fprintln(w, "      `--first`) takes the first candidate instead, which is how two")
+	fmt.Fprintln(w, "      tasks sharing a name in different projects are told apart.")
 	fmt.Fprintln(w, "sync: run `tg pull` then `tg push` for correct last-writer-wins.")
 	fmt.Fprintln(w, "env:  TOGGL_PROJECT_ID scopes `add`/`tasks`/`grep`/`update` to one project")
-	fmt.Fprintln(w, "      (and sets the project on entries created by `add`). `pull`")
-	fmt.Fprintln(w, "      ignores it and always reconciles every project; pass a")
-	fmt.Fprintln(w, "      <project> name to `pull` to scope it explicitly. When unset,")
-	fmt.Fprintln(w, "      `update` needs a <project> fragment (positional or -p) matching")
-	fmt.Fprintln(w, "      exactly one cached project, and `add` accepts")
-	fmt.Fprintln(w, "      `<timesign> <project> <task>` to scope by project name.")
+	fmt.Fprintln(w, "      (and sets the project on entries created by `add`). When it is")
+	fmt.Fprintln(w, "      unset, the project stored by `tg default` scopes them instead;")
+	fmt.Fprintln(w, "      the env var always wins. `pull` and `total` ignore both: `pull`")
+	fmt.Fprintln(w, "      always reconciles every project; pass a <project> name to")
+	fmt.Fprintln(w, "      `pull` to scope it explicitly. With neither set, `update` needs")
+	fmt.Fprintln(w, "      a <project> fragment (positional or -p) matching exactly one")
+	fmt.Fprintln(w, "      cached project, and `add` accepts `<timesign> <project> <task>`")
+	fmt.Fprintln(w, "      to scope by project name.")
 }

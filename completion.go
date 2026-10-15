@@ -20,10 +20,13 @@ func cmdCompletion(w io.Writer, shell string) error {
 // It is written to work both ways: dropped on $fpath as a #compdef file, or
 // eval'd/sourced after compinit (the trailing guard calls compdef itself).
 // `tg add` completion pulls task names from `tg tasks --json`, which reads
-// the local SQLite cache and honours TOGGL_PROJECT_ID scoping.
+// the local SQLite cache and honours TOGGL_PROJECT_ID scoping (or, when that is
+// unset, the `tg default` project), so the offered tasks are the ones `add`
+// would actually resolve.
 //
-// Every fragment-taking command (`add`, `grep`, `total`, `update`, `pull`) also
-// offers -1/--first, the "use the first match" flag (see bindFirstFlag).
+// Every fragment-taking command (`add`, `grep`, `total`, `update`, `pull`,
+// `default`) also offers -1/--first, the "use the first match" flag (see
+// bindFirstFlag).
 const zshCompletion = `#compdef tg
 
 # Complete task names for ` + "`tg add`" + ` from the local catalog cache.
@@ -44,8 +47,8 @@ __tg_tasks() {
   _wanted tasks expl 'task' compadd -a names
 }
 
-# Complete project names for the project fragment taken by ` + "`tg update`" + `
-# and ` + "`tg pull`" + `, from the same local catalog cache.
+# Complete project names for the project fragment taken by ` + "`tg update`" + `,
+# ` + "`tg pull`" + ` and ` + "`tg default`" + `, from the same local catalog cache.
 __tg_project_names() {
   local json name
   local MATCH MBEGIN MEND
@@ -99,6 +102,7 @@ _tg() {
         'push:send local changes to Toggl'
         "pull:fetch today's remote changes (-a for this month)"
         'total:total tracked hours per task, one group per fragment (Reports API)'
+        'default:show or set the default project used when TOGGL_PROJECT_ID is unset'
         'completion:print a shell completion script'
         'help:show usage'
       )
@@ -206,6 +210,15 @@ _tg() {
             '-1[total only the first match of each fragment]' \
             '--first[total only the first match of each fragment (alias of -1)]' \
             '*:task fragment:__tg_tasks'
+          ;;
+        default)
+          # The project is a name fragment like update's; --clear unsets the
+          # stored default and takes no project.
+          _arguments '--clear[unset the default project]' \
+            '--json[emit JSON]' \
+            '-1[use the first match on an ambiguous fragment]' \
+            '--first[use the first match on an ambiguous fragment (alias of -1)]' \
+            '*:project fragment:__tg_project_names'
           ;;
         completion)
           local -a shells

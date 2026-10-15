@@ -20,10 +20,22 @@ var ErrNotConfigured = errors.New("not authenticated: run `tg auth`")
 // cmdAuth) so `tg total` can filter the Reports API to just this user's tracked
 // time rather than the whole workspace's. It is 0 in configs written before the
 // field existed; callers that need it fall back to GET /me (see cmdTotal).
+//
+// DefaultProjectID is the project `tg default` pinned as the global fallback
+// scope: the project-scoped commands use it whenever TOGGL_PROJECT_ID is unset
+// (see cmdEnv.scopedProjectID). 0 means no default, which is also what configs
+// written before the field existed decode to, so they need no migration.
+// DefaultProjectName is the project's name as it was when the default was set;
+// it is only ever displayed (`tg default` with no argument), never matched
+// against, so a later rename in Toggl cannot change which project is pinned.
+// Both are omitted from the file when unset, keeping a config without a default
+// byte-for-byte what it was before the feature existed.
 type Config struct {
-	APIToken    string `json:"api_token"`
-	WorkspaceID int64  `json:"workspace_id"`
-	UserID      int64  `json:"user_id"`
+	APIToken           string `json:"api_token"`
+	WorkspaceID        int64  `json:"workspace_id"`
+	UserID             int64  `json:"user_id"`
+	DefaultProjectID   int64  `json:"default_project_id,omitempty"`
+	DefaultProjectName string `json:"default_project_name,omitempty"`
 }
 
 // Dir returns the tg state directory ($XDG_STATE_HOME/tg or ~/.local/state/tg).

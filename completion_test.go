@@ -22,7 +22,7 @@ func TestCompletionZsh(t *testing.T) {
 		// Every command and alias accepted by run() must be offered.
 		"'auth:", "'add:", "'mod:", "'del:", "\"current:", "\"status:",
 		"\"today:", "\"list:", "\"ls:", "\"daily:", "'tasks:", "'grep:", "'projects:",
-		"\"update:", "'push:", "\"pull:", "'total:",
+		"\"update:", "'push:", "\"pull:", "'total:", "'default:",
 		"'completion:", "'help:",
 		// `projects` has a subcommand of its own.
 		"__tg_projects_cmds", "'update:sync all workspace projects'",
@@ -30,7 +30,7 @@ func TestCompletionZsh(t *testing.T) {
 		"        add)", "        mod)", "        del)",
 		"        current|status|push)", "        today|list|ls)", "        daily)",
 		"        tasks)", "        grep)", "        projects)", "        update)",
-		"        pull)", "        total)",
+		"        pull)", "        total)", "        default)",
 		"        completion)",
 		"--desc[", "--description[", "--json[", "--all[", "--since[", "--days[",
 		// `add`/`mod` take the day the entry belongs to.
@@ -74,7 +74,7 @@ func TestCompletionCoversDispatch(t *testing.T) {
 	for _, cmd := range []string{
 		"auth", "add", "mod", "del", "current", "status", "today", "list",
 		"ls", "daily", "tasks", "grep", "projects", "update", "push",
-		"pull", "total", "completion", "help",
+		"pull", "total", "default", "completion", "help",
 	} {
 		if !strings.Contains(out, "'"+cmd+":") && !strings.Contains(out, `"`+cmd+":") {
 			t.Errorf("completion script does not offer command %q", cmd)
@@ -114,7 +114,7 @@ func TestCompletionOffersFirstFlag(t *testing.T) {
 		t.Fatalf("completion: %v", err)
 	}
 	blocks := completionBlocks(buf.String())
-	for _, cmd := range []string{"add", "grep", "update", "pull", "total"} {
+	for _, cmd := range []string{"add", "grep", "update", "pull", "total", "default"} {
 		block, ok := blocks[cmd]
 		if !ok {
 			t.Fatalf("completion script has no %q block", cmd)
@@ -217,6 +217,32 @@ func TestCompletionOffersThisMonthFlag(t *testing.T) {
 		}
 		if strings.Contains(block, "--this-month[") {
 			t.Errorf("%s does not take --this-month, it should not offer one:\n%s", cmd, block)
+		}
+	}
+}
+
+// TestCompletionOffersDefaultCommand pins `tg default`'s block: it completes the
+// project fragment from the catalog (like `update`), offers --clear and --json,
+// and --clear stays specific to it.
+func TestCompletionOffersDefaultCommand(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	if err := cmdCompletion(&buf, "zsh"); err != nil {
+		t.Fatalf("completion: %v", err)
+	}
+	blocks := completionBlocks(buf.String())
+	block, ok := blocks["default"]
+	if !ok {
+		t.Fatalf("completion script has no default block")
+	}
+	for _, want := range []string{"'--clear[", "'--json[", "__tg_project_names"} {
+		if !strings.Contains(block, want) {
+			t.Errorf("default block missing %q:\n%s", want, block)
+		}
+	}
+	for cmd, b := range blocks {
+		if cmd != "default" && strings.Contains(b, "--clear[") {
+			t.Errorf("%s does not take --clear, it should not offer one:\n%s", cmd, b)
 		}
 	}
 }

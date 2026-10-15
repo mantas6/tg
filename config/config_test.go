@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -105,6 +106,49 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 	if got.APIToken != c.APIToken || got.WorkspaceID != c.WorkspaceID || got.UserID != c.UserID {
 		t.Errorf("round-trip = %+v, want %+v", got, c)
+	}
+}
+
+// TestDefaultProjectRoundTrip covers the `tg default` fields: a pinned project
+// survives Save/Load alongside the credentials, and clearing it (zeroing both
+// fields) drops the keys from the file entirely rather than persisting a 0 id
+// that would read as "project 0".
+func TestDefaultProjectRoundTrip(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	c := &Config{APIToken: "tok", WorkspaceID: 1, DefaultProjectID: 42, DefaultProjectName: "Backend"}
+	if err := c.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	got, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if *got != *c {
+		t.Errorf("round-trip = %+v, want %+v", got, c)
+	}
+
+	got.DefaultProjectID, got.DefaultProjectName = 0, ""
+	if err := got.Save(); err != nil {
+		t.Fatalf("save cleared: %v", err)
+	}
+	path, err := Path()
+	if err != nil {
+		t.Fatalf("path: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if strings.Contains(string(data), "default_project") {
+		t.Errorf("config.json = %s, want no default_project keys once cleared", data)
+	}
+	cleared, err := Load()
+	if err != nil {
+		t.Fatalf("load cleared: %v", err)
+	}
+	if cleared.DefaultProjectID != 0 || cleared.DefaultProjectName != "" || cleared.APIToken != "tok" {
+		t.Errorf("cleared = %+v, want the default gone and the credentials kept", cleared)
 	}
 }
 

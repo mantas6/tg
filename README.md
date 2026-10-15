@@ -84,8 +84,9 @@ from, and a still-running entry has no end to start at; both are refused with an
 error pointing at the other two forms rather than guessing a start.
 
 `add` accepts `<project> <task>` to scope by project name (or set
-`TOGGL_PROJECT_ID`), stores the entry locally marked dirty, and best-effort
-pushes it to Toggl.
+`TOGGL_PROJECT_ID`, or pin a [default project](#default-project) with
+`tg default`), stores the entry locally marked dirty, and best-effort pushes it
+to Toggl.
 
 Time is exclusive: `add` refuses a span that overlaps an entry you already
 tracked and reports the conflict instead of recording it. Back-to-back entries
@@ -272,7 +273,8 @@ The arguments are joined into a single fragment and the output is the `tasks`
 listing restricted to the matches, name plus `[Project]`. Unlike the matching
 used by `add` and `total`, an exact name does **not** win over substrings: a
 task named `Fix` never hides `Fix login bug`, since the point is to see every
-candidate. `TOGGL_PROJECT_ID` scopes the search to one project. A fragment is
+candidate. `TOGGL_PROJECT_ID` (or, when it is unset, the
+[default project](#default-project)) scopes the search to one project. A fragment is
 required, and grep exits non-zero when nothing matches (run `tg update` if the
 catalog is stale).
 
@@ -500,6 +502,8 @@ commands:
   total [task...]           total tracked hours per task, one group per named
                             task; last 3 months
                             [-p FRAGMENT] [-m|--this-month] [--since DATE] [--json] [-1]
+  default [project]         show or set the default project used when
+                            TOGGL_PROJECT_ID is unset [--clear] [--json] [-1]
   completion zsh            print the zsh completion script
 
 timesign: absolute 9-:30, 10-11, 10:30-11:15 (today); `@` in a range is
@@ -522,11 +526,11 @@ date: `add` and `mod` work on today; `--date YYYY-MM-DD` moves them to
       "last entry" and an absolute timesign are all that day's; a
       relative or `@` timesign has no `now` there, so `add` refuses one
       (`mod` still takes +30/-30, which only move an end).
--1:   `add`/`grep`/`total`/`update`/`pull` match tasks and projects by
-      name fragment; a fragment matching several of them normally
-      fails with the candidates listed. `-1` (alias `--first`) takes
-      the first candidate instead, which is how two tasks sharing a
-      name in different projects are told apart.
+-1:   `add`/`grep`/`total`/`update`/`pull`/`default` match tasks and
+      projects by name fragment; a fragment matching several of them
+      normally fails with the candidates listed. `-1` (alias
+      `--first`) takes the first candidate instead, which is how two
+      tasks sharing a name in different projects are told apart.
 ```
 
 ### Syncing
@@ -611,7 +615,8 @@ Refine the fragment (`tg update "backend api"`), pass `-1` to take the first
 candidate listed, or export `TOGGL_PROJECT_ID`, which lets you update a project
 that is not cached yet. A `<project>` named on the command line (positional or
 `--project`/`-p`) takes priority over `TOGGL_PROJECT_ID`, so the env var only
-picks the project when none is named.
+picks the project when none is named; with the env var unset too, the
+[default project](#default-project) is used, so `tg update` alone refreshes it.
 
 The entry window defaults to **one day back** and is set by `--days`/`-n`, a
 count of calendar days: the window starts at midnight that many days before
@@ -622,18 +627,43 @@ the `last_pull` watermark, so a later `tg pull` still reconciles every other
 project. The command stays quiet on success; use `--json` for the project name,
 task count and pull counters.
 
+### Default project
+
+`tg default <project>` pins a project globally: whenever `TOGGL_PROJECT_ID` is
+unset, `add`, `tasks`, `grep` and `update` are scoped to it exactly as if its id
+had been exported. The fragment is resolved against the cached project catalog
+like `tg update`'s (`-1` takes the first of several matches), and the project's
+id and name are stored in `config.json`:
+
+```sh
+tg default backend          # pin "Backend" as the default project
+tg default                  # show it: "Default project: Backend (1)"
+tg default --json           # {"set":true,"id":1,"name":"Backend"}
+tg default --clear          # unset it
+```
+
+`TOGGL_PROJECT_ID` always wins over the stored default, so a shell or a
+per-directory env file can still switch projects without touching the config;
+`tg default` notes when the env var is overriding it. A malformed
+`TOGGL_PROJECT_ID` is still an error rather than a reason to fall back to the
+default. `pull` and `total` ignore the default just as they ignore the env var.
+Re-running `tg auth` keeps the default, and setting one before `tg auth` works
+too (it is a purely local setting).
+
 ### Environment
 
-- `TOGGL_PROJECT_ID` scopes `add`, `tasks`, `grep`, and `update` to one project (and
-  sets the project on entries created by `add`). A value that is not a numeric
-  project id is an error, not a silent "unset", so a typo cannot quietly widen
-  the scope. `pull` ignores it and always
-  reconciles every project; pass a `<project>` name to `pull` to scope it
-  explicitly. `update` takes a `<project>` fragment (positional or
-  `--project`/`-p`) that matches exactly one cached project — or several with
-  `-1`, which takes the first — and that named project takes priority over
-  `TOGGL_PROJECT_ID`; the env var is required only when no project is named. `add`
-  accepts `<timesign> <project> <task>` to scope by project name.
+- `TOGGL_PROJECT_ID` scopes `add`, `tasks`, `grep`, and `update` to one project
+  (and sets the project on entries created by `add`). When it is unset, the
+  [default project](#default-project) set with `tg default` scopes them
+  instead. A value that is not a numeric project id is an error, not a silent
+  "unset", so a typo cannot quietly widen the scope. `pull` and `total` ignore
+  both the env var and the default: `pull` always reconciles every project;
+  pass a `<project>` name to `pull` to scope it explicitly. `update` takes a
+  `<project>` fragment (positional or `--project`/`-p`) that matches exactly one
+  cached project — or several with `-1`, which takes the first — and that named
+  project takes priority over `TOGGL_PROJECT_ID`; the env var (or the default)
+  is needed only when no project is named. `add` accepts
+  `<timesign> <project> <task>` to scope by project name.
 - `XDG_STATE_HOME` controls where state is stored (`$XDG_STATE_HOME/tg`,
   falling back to `~/.local/state/tg`). This holds `config.json` (mode 0600)
   and the SQLite database.

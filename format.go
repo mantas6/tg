@@ -563,6 +563,39 @@ func renderProjectsJSON(w io.Writer, projects []store.Project) error {
 	return writeJSON(w, out)
 }
 
+// defaultJSON is the stable --json shape for `tg default`: whether a default
+// project is set, and if so its id and stored name. set is spelled out rather
+// than inferred from a missing id so a consumer can test one boolean, and id
+// and name are omitted when nothing is set.
+type defaultJSON struct {
+	Set  bool   `json:"set"`
+	ID   int64  `json:"id,omitempty"`
+	Name string `json:"name,omitempty"`
+}
+
+// renderDefault writes the `tg default` report: the stored default project as
+// "Name (id)", the same shape the project candidate lists use, or a line saying
+// there is none. A default whose name was not cached when it was set shows the
+// bare id.
+func renderDefault(w io.Writer, id int64, name string) {
+	switch {
+	case id == 0:
+		fmt.Fprintln(w, "No default project set.")
+	case name == "":
+		fmt.Fprintf(w, "Default project: %d\n", id)
+	default:
+		fmt.Fprintf(w, "Default project: %s (%d)\n", name, id)
+	}
+}
+
+// renderDefaultJSON is renderDefault's --json form; see defaultJSON.
+func renderDefaultJSON(w io.Writer, id int64, name string) error {
+	if id == 0 {
+		return writeJSON(w, defaultJSON{})
+	}
+	return writeJSON(w, defaultJSON{Set: true, ID: id, Name: name})
+}
+
 // totalTaskJSON / totalJSON are the stable --json shapes for `total`.
 type totalTaskJSON struct {
 	Task            string `json:"task"`

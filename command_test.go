@@ -6165,3 +6165,367 @@ func TestAuthForbiddenWritesNothing(t *testing.T) {
 		t.Errorf("config.json should not exist, stat err = %v", statErr)
 	}
 }
+
+// --- default project ---------------------------------------------------------
+//
+// `tg default` persists a project in config.json, and the scoped commands fall
+// back to it when TOGGL_PROJECT_ID is unset. Like the prologue and auth tests
+// above these set XDG_STATE_HOME and/or TOGGL_PROJECT_ID, so none of them can
+// run in parallel.
+
+// saveDefaultConfig writes a config holding credentials and the given default
+// project into the current XDG_STATE_HOME, the state `tg auth` followed by
+// `tg default` leaves behind.
+func saveDefaultConfig(t *testing.T, id int64, name string) {
+	t.Helper()
+	cfg := &config.Config{
+		APIToken: "stored-token", WorkspaceID: testWorkspaceID, UserID: testUserID,
+		DefaultProjectID: id, DefaultProjectName: name,
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+}
+
+// TestScopedProjectIDPrecedence pins the one precedence rule the scoped
+// commands share: TOGGL_PROJECT_ID wins whenever it is set, the stored default
+// stands in only when it is unset, and with neither the scope is nil. A
+// malformed env var is an error even with a default stored — it must not
+// quietly fall back to a different project than the one the user tried to name.
+func TestScopedProjectIDPrecedence(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		envVar  string
+		stored  *int64
+		want    *int64
+		wantErr string
+	}{
+		{name: "env set wins over the default", envVar: "2", stored: ptrInt(1), want: ptrInt(2)},
+		{name: "env set, no default", envVar: "2", want: ptrInt(2)},
+		{name: "env unset uses the default", stored: ptrInt(1), want: ptrInt(1)},
+		{name: "blank env counts as unset", envVar: "  ", stored: ptrInt(1), want: ptrInt(1)},
+		{name: "neither is nil"},
+		{name: "malformed env never falls back", envVar: "abc", stored: ptrInt(1), wantErr: "TOGGL_PROJECT_ID"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TOGGL_PROJECT_ID", tc.envVar)
+			e := localEnv(io.Discard, nil)
+			e.defaultProjectID = tc.stored
+
+			got, err := e.scopedProjectID()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want it to contain %q", err, tc.wantErr)
+				}
+				if got != nil {
+					t.Errorf("scope = %d, want nil alongside the error", *got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("scopedProjectID: %v", err)
+			}
+			switch {
+			case tc.want == nil && got != nil:
+				t.Errorf("scope = %d, want nil", *got)
+			case tc.want != nil && (got == nil || *got != *tc.want):
+				t.Errorf("scope = %v, want %d", got, *tc.want)
+			}
+		})
+	}
+}
+
+// TestWithEnvLoadsDefaultProject verifies the prologue is what carries the
+// stored default into the cmdEnv, so scopedProjectID sees it in every scoped
+// command without each of them reading the config.
+func TestWithEnvLoadsDefaultProject(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("TOGGL_PROJECT_ID", "")
+	saveDefaultConfig(t, 2, "Payments")
+
+	if err := withEnvOut(ctx, io.Discard, func(e *cmdEnv) error {
+		got, err := e.scopedProjectID()
+		if err != nil {
+			return err
+		}
+		if got == nil || *got != 2 {
+			t.Errorf("scope = %v, want the stored default 2", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withEnv: %v", err)
+	}
+}
+
+// TestWithEnvTokenlessConfigIsOffline covers the config `tg default` writes
+// before `tg auth` has ever run: it holds a default but no token, so the
+// invocation must stay offline (the "run `tg auth`" path) rather than build a
+// client from an empty token, while the default still applies.
+func TestWithEnvTokenlessConfigIsOffline(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("TOGGL_PROJECT_ID", "")
+	cfg := &config.Config{DefaultProjectID: 1, DefaultProjectName: "Backend"}
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	if err := withEnvOut(ctx, io.Discard, func(e *cmdEnv) error {
+		if !e.offline() {
+			t.Error("env should be offline when the config carries no token")
+		}
+		if _, err := e.client(); !errors.Is(err, config.ErrNotConfigured) {
+			t.Errorf("client err = %v, want config.ErrNotConfigured", err)
+		}
+		if got, _ := e.scopedProjectID(); got == nil || *got != 1 {
+			t.Errorf("scope = %v, want the stored default 1", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withEnv: %v", err)
+	}
+}
+
+// TestDefaultCommand walks `tg default` through its three forms against one
+// state directory: setting resolves the fragment against the catalog and keeps
+// the stored credentials, showing reports it, clearing removes it, and an
+// ambiguous or unknown fragment is refused without touching the config.
+func TestDefaultCommand(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("TOGGL_PROJECT_ID", "")
+	saveDefaultConfig(t, 0, "")
+	s := newStore(t)
+	seedCatalog(t, s)
+	// A second project sharing "back" makes the ambiguous case below.
+	if err := s.ReplaceProjects(ctx, []store.Project{
+		{ID: 1, WorkspaceID: 1, Name: "Backend", Active: true},
+		{ID: 2, WorkspaceID: 1, Name: "Payments", Active: true},
+		{ID: 3, WorkspaceID: 1, Name: "Backend API", Active: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	loadCfg := func() *config.Config {
+		t.Helper()
+		cfg, err := config.Load()
+		if err != nil {
+			t.Fatalf("load config: %v", err)
+		}
+		return cfg
+	}
+	doDefault := func(fragment string, first, clear, jsonOut bool) (string, error) {
+		t.Helper()
+		var buf bytes.Buffer
+		err := cmdDefault(localEnv(&buf, s), fragment, first, clear, jsonOut)
+		return buf.String(), err
+	}
+
+	// Nothing set yet.
+	if out, err := doDefault("", false, false, false); err != nil || out != "No default project set.\n" {
+		t.Errorf("show (unset) = %q, %v", out, err)
+	}
+	if out, err := doDefault("", false, false, true); err != nil || out != "{\"set\":false}\n" {
+		t.Errorf("show --json (unset) = %q, %v", out, err)
+	}
+
+	// Set by fragment.
+	if out, err := doDefault("pay", false, false, false); err != nil || out != "Default project: Payments (2)\n" {
+		t.Errorf("set = %q, %v", out, err)
+	}
+	if cfg := loadCfg(); cfg.DefaultProjectID != 2 || cfg.DefaultProjectName != "Payments" || cfg.APIToken != "stored-token" {
+		t.Errorf("config after set = %+v, want Payments (2) with the credentials kept", cfg)
+	}
+
+	// Ambiguous and unknown fragments fail and leave the stored default alone.
+	if _, err := doDefault("back", false, false, false); err == nil || !strings.Contains(err.Error(), "multiple projects match") {
+		t.Errorf("ambiguous err = %v, want the candidate list", err)
+	}
+	if _, err := doDefault("nonexistent", false, false, false); err == nil || !strings.Contains(err.Error(), "no project matches") {
+		t.Errorf("unknown err = %v, want a no-match error", err)
+	}
+	if cfg := loadCfg(); cfg.DefaultProjectID != 2 {
+		t.Errorf("default after failed sets = %d, want 2 untouched", cfg.DefaultProjectID)
+	}
+
+	// -1 takes the first candidate of an ambiguous fragment.
+	if out, err := doDefault("back", true, false, false); err != nil || out != "Default project: Backend (1)\n" {
+		t.Errorf("set -1 = %q, %v", out, err)
+	}
+
+	// Showing reports the stored default; JSON carries the id and name.
+	if out, err := doDefault("", false, false, false); err != nil || out != "Default project: Backend (1)\n" {
+		t.Errorf("show = %q, %v", out, err)
+	}
+	if out, err := doDefault("", false, false, true); err != nil || out != "{\"set\":true,\"id\":1,\"name\":\"Backend\"}\n" {
+		t.Errorf("show --json = %q, %v", out, err)
+	}
+
+	// With TOGGL_PROJECT_ID set the default is not in effect, and says so.
+	t.Setenv("TOGGL_PROJECT_ID", "2")
+	if out, err := doDefault("", false, false, false); err != nil ||
+		!strings.Contains(out, "TOGGL_PROJECT_ID=2 is set and takes precedence") {
+		t.Errorf("show with env = %q, %v, want the override noted", out, err)
+	}
+	t.Setenv("TOGGL_PROJECT_ID", "")
+
+	// Clearing removes it but keeps the credentials.
+	if out, err := doDefault("", false, true, false); err != nil || out != "No default project set.\n" {
+		t.Errorf("clear = %q, %v", out, err)
+	}
+	if cfg := loadCfg(); cfg.DefaultProjectID != 0 || cfg.DefaultProjectName != "" || cfg.APIToken != "stored-token" {
+		t.Errorf("config after clear = %+v, want no default and the credentials kept", cfg)
+	}
+}
+
+// TestDefaultCommandWithoutConfig pins that `tg default` works before
+// `tg auth`: setting a default creates a token-less config (see
+// TestWithEnvTokenlessConfigIsOffline), while showing or clearing with nothing
+// stored writes no file at all.
+func TestDefaultCommandWithoutConfig(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("TOGGL_PROJECT_ID", "")
+	s := newStore(t)
+	seedCatalog(t, s)
+	path, err := config.Path()
+	if err != nil {
+		t.Fatalf("config path: %v", err)
+	}
+
+	for _, clear := range []bool{false, true} {
+		if err := cmdDefault(localEnv(io.Discard, s), "", false, clear, false); err != nil {
+			t.Fatalf("default (clear=%v): %v", clear, err)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("clear=%v: config.json exists (stat err %v), want nothing written", clear, err)
+		}
+	}
+
+	if err := cmdDefault(localEnv(io.Discard, s), "back", false, false, false); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.DefaultProjectID != 1 || cfg.APIToken != "" {
+		t.Errorf("config = %+v, want default 1 and no token", cfg)
+	}
+}
+
+// TestDefaultClearRejectsProject pins that --clear takes no fragment: a call
+// naming one is ambiguous (clear it, or set it?) and refused before anything
+// is opened or written.
+func TestDefaultClearRejectsProject(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	err := run(ctx, "default", []string{"--clear", "backend"})
+	if err == nil || !strings.Contains(err.Error(), "--clear takes no project") {
+		t.Fatalf("err = %v, want --clear to refuse a project", err)
+	}
+	path, err := config.Path()
+	if err != nil {
+		t.Fatalf("config path: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("config.json exists (stat err %v), want nothing written", err)
+	}
+}
+
+// TestDefaultFlagRegistration pins `tg default`'s flags through the real
+// registration (see updateFlags for why it is a function of its own): --clear,
+// --json and -1/--first, with flags allowed after the fragment.
+func TestDefaultFlagRegistration(t *testing.T) {
+	t.Parallel()
+	fs := flag.NewFlagSet("default", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	f := bindDefaultFlags(fs)
+	rest, err := parseArgsAndFlags(fs, []string{"backend", "api", "-1", "--json"})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !reflect.DeepEqual(rest, []string{"backend", "api"}) || !f.first || !f.jsonOut || f.clear {
+		t.Errorf("rest = %q, flags = %+v", rest, *f)
+	}
+	fs = flag.NewFlagSet("default", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	f = bindDefaultFlags(fs)
+	if _, err := parseArgsAndFlags(fs, []string{"--clear", "--first"}); err != nil || !f.clear || !f.first {
+		t.Errorf("--clear --first: err = %v, flags = %+v", err, *f)
+	}
+}
+
+// TestPullAndTotalIgnoreStoredDefault pins that the stored default is only a
+// stand-in for TOGGL_PROJECT_ID and so is ignored exactly where the env var is:
+// with a default loaded into the env by the real prologue, an unscoped pull
+// still reconciles every project (and advances the watermark) and an unscoped
+// total still sends no project filter.
+func TestPullAndTotalIgnoreStoredDefault(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("TOGGL_PROJECT_ID", "")
+	saveDefaultConfig(t, 1, "Backend")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(pullEntriesJSON))
+	}))
+	defer srv.Close()
+	pullClient := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+	totalClient, body := totalReportsServer(t)
+
+	if err := withEnvOut(ctx, io.Discard, func(e *cmdEnv) error {
+		if e.defaultProjectID == nil || *e.defaultProjectID != 1 {
+			t.Fatalf("env default = %v, want 1 loaded from the config", e.defaultProjectID)
+		}
+		seedCatalog(t, e.st)
+
+		var buf bytes.Buffer
+		pullEnv := *e
+		pullEnv.w, pullEnv.c = &buf, pullClient
+		since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		pullEnv.now = time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+		if err := cmdPull(&pullEnv, false, "", since, false, false); err != nil {
+			t.Fatalf("pull: %v", err)
+		}
+		if !strings.Contains(buf.String(), "2 inserted") {
+			t.Errorf("pull output = %q, want 2 inserted (every project)", buf.String())
+		}
+		if got := mustEntryByRemoteID(t, e.st, 2); got == nil {
+			t.Error("project 2 entry should be pulled despite the default being project 1")
+		}
+		if _, ok := mustMeta(t, e.st, store.MetaLastPull); !ok {
+			t.Error("pull ignoring the default should be a full pull and advance last_pull")
+		}
+
+		totalEnv := *e
+		totalEnv.w, totalEnv.c, totalEnv.now = io.Discard, totalClient, totalNow
+		if err := cmdTotal(&totalEnv, false, nil, nil, totalSince, false); err != nil {
+			t.Fatalf("total: %v", err)
+		}
+		if _, ok := (*body)["project_ids"]; ok {
+			t.Errorf("project_ids = %v, want no filter from the stored default", (*body)["project_ids"])
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withEnv: %v", err)
+	}
+}
+
+// TestAuthKeepsDefaultProject pins that re-running `tg auth` replaces the
+// credentials but not the `tg default` project stored next to them.
+func TestAuthKeepsDefaultProject(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	saveDefaultConfig(t, 2, "Payments")
+	srv := httptest.NewServer(meHandler(t))
+	defer srv.Close()
+
+	err := cmdAuth(ctx, io.Discard, func() (string, error) { return "tok123", nil }, func(token string) *api.Client {
+		return api.New(token, api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
+	})
+	if err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.APIToken != "tok123" || cfg.DefaultProjectID != 2 || cfg.DefaultProjectName != "Payments" {
+		t.Errorf("config = %+v, want the new token and the default kept", cfg)
+	}
+}

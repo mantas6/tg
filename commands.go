@@ -46,6 +46,12 @@ type cmdEnv struct {
 	// cmdTotal discovers it from GET /me instead.
 	userID int64
 
+	// defaultProjectID is the project `tg default` stored in the config, nil
+	// when none is set (or there is no config). Commands never read it
+	// directly: it is only the fallback behind TOGGL_PROJECT_ID, and
+	// scopedProjectID is the one place that precedence is applied.
+	defaultProjectID *int64
+
 	now time.Time
 	loc *time.Location
 
@@ -178,7 +184,8 @@ const addUsage = "usage: tg add <timesign> [project] <task-fragment>"
 // of its own and picks up where the last entry ended (see addSpan).
 //
 // The task fragment is resolved with resolveTaskFragment scoped by projectID
-// (from TOGGL_PROJECT_ID or, for the 2-argument form
+// (from TOGGL_PROJECT_ID or the `tg default` project, see
+// cmdEnv.scopedProjectID; or, for the 2-argument form
 // `tg add <timesign> <project> <task>`, from the resolved project-name
 // argument; see runAdd / resolveAddProject): 1 match -> create the entry;
 // many -> error listing candidates (unless first, the `-1` flag, picks the top
@@ -958,8 +965,8 @@ func cmdToday(env *cmdEnv, days int, jsonOut, color bool) error {
 }
 
 // cmdTasks lists the locally cached task catalog. `--all` includes inactive
-// tasks; a non-nil projectID (from TOGGL_PROJECT_ID) scopes the listing to one
-// project. Refresh the cache with `tg update`.
+// tasks; a non-nil projectID (from TOGGL_PROJECT_ID or the `tg default`
+// project, see cmdEnv.scopedProjectID) scopes the listing to one project. Refresh the cache with `tg update`.
 func cmdTasks(env *cmdEnv, all bool, projectID *int64, jsonOut bool) error {
 	tasks, err := env.st.ListTasks(env.ctx, all, projectID)
 	if err != nil {
@@ -974,8 +981,8 @@ func cmdTasks(env *cmdEnv, all bool, projectID *int64, jsonOut bool) error {
 
 // cmdGrep lists every cached task whose name contains fragment
 // (case-insensitive), in the same shape as `tg tasks`. `--all` includes
-// inactive tasks and a non-nil projectID (from TOGGL_PROJECT_ID) scopes the
-// search to one project, exactly like cmdTasks.
+// inactive tasks and a non-nil projectID (from TOGGL_PROJECT_ID or the
+// `tg default` project) scopes the search to one project, exactly like cmdTasks.
 //
 // Unlike the fragment matching used by `add`/`total`
 // (store.FindTasksByFragment), grep never lets an exact name win over the
@@ -1050,7 +1057,8 @@ func cmdProjects(env *cmdEnv, all, jsonOut bool) error {
 // are pulled. The project is chosen by fragment (from the --project/-p flag or
 // a positional argument) when given, which must uniquely match a cached project
 // name, or match several with first (`-1`) picking the top candidate; otherwise
-// it falls back to projectID (from TOGGL_PROJECT_ID).
+// it falls back to projectID (from TOGGL_PROJECT_ID, or the `tg default` project
+// when that is unset; see cmdEnv.scopedProjectID).
 // Refreshing every project at once is intentionally disallowed (see
 // resolveUpdateProject).
 //
@@ -1205,8 +1213,8 @@ func cmdPull(env *cmdEnv, first bool, fragment string, since time.Time, force, j
 const firstMatchHint = "pass -1 to use the first match"
 
 // resolveTaskFragment resolves a task-name fragment to the single cached task a
-// command should act on, optionally scoped to projectID (from TOGGL_PROJECT_ID
-// or an explicit project argument). Matching is the store's
+// command should act on, optionally scoped to projectID (from TOGGL_PROJECT_ID,
+// the `tg default` project, or an explicit project argument). Matching is the store's
 // (store.FindTasksByFragment: case-insensitive substring, an exact name winning
 // over mere substrings), and the candidates are ordered as candidateList prints
 // them, so "the first match" means the first line of the ambiguity error.
@@ -1316,7 +1324,7 @@ func resolvePullProject(ctx context.Context, st *store.Store, fragment string, f
 // fallback. This keeps update from ever refreshing every project at once.
 func resolveUpdateProject(ctx context.Context, st *store.Store, projectID *int64, fragment string, first bool) (*int64, error) {
 	return resolveCachedProject(ctx, st, projectID, fragment, first,
-		errors.New("update requires a project-name argument (or set TOGGL_PROJECT_ID)"),
+		errors.New("update requires a project-name argument (or set TOGGL_PROJECT_ID, or a default with `tg default`)"),
 		"; set TOGGL_PROJECT_ID to its id to update a project not yet cached")
 }
 
@@ -1342,8 +1350,98 @@ func resolveAddProject(ctx context.Context, st *store.Store, fragment string, fi
 		"; run `tg update` to refresh the catalog")
 }
 
+// resolveDefaultProject resolves `tg default`'s project fragment to exactly one
+// cached project id; see resolveCachedProject. Like `total -p` it never falls
+// back to TOGGL_PROJECT_ID (no env id is passed through): the stored default is
+// what is being chosen here, so the env var has no say in which project it is.
+// runDefault only calls it with a non-blank fragment, so the empty-fragment
+// error is a safety net rather than a reachable message.
+func resolveDefaultProject(ctx context.Context, st *store.Store, fragment string, first bool) (*int64, error) {
+	return resolveCachedProject(ctx, st, nil, fragment, first,
+		errors.New("default requires a project-name argument"),
+		"; run `tg projects update` to refresh the project catalog")
+}
+
+// cmdDefault shows, sets or clears the global default project: the project the
+// scoped commands (`add`, `tasks`, `grep`, `update`) fall back to whenever
+// TOGGL_PROJECT_ID is unset (see cmdEnv.scopedProjectID).
+//
+//   - a non-blank fragment resolves against the cached catalog exactly like
+//     `tg update`'s project (first, the `-1` flag, picks the top candidate of
+//     an ambiguous one) and stores the project's id, plus its name for display;
+//   - clear (--clear) removes the stored default;
+//   - neither just reports the current default.
+//
+// Every form ends by reporting the resulting default, and when TOGGL_PROJECT_ID
+// is set the human output says so, since the env var then overrides the stored
+// project and the default would otherwise look like it is in effect when it is
+// not.
+//
+// The config is read fresh here rather than taken from env, which carries only
+// the parts of it commands consume: this is a read-modify-write of config.json,
+// so the credentials it holds are written back untouched. With no config yet
+// (before `tg auth`) a token-less one is created: pinning a project is a purely
+// local setting, and withEnv treats a config with no token as offline. Clearing
+// a default that is not set writes nothing.
+func cmdDefault(env *cmdEnv, fragment string, first, clear, jsonOut bool) error {
+	cfg, err := optionalConfig()
+	if err != nil {
+		return err
+	}
+	if cfg == nil {
+		cfg = &config.Config{}
+	}
+	switch {
+	case clear:
+		if cfg.DefaultProjectID == 0 && cfg.DefaultProjectName == "" {
+			break
+		}
+		cfg.DefaultProjectID, cfg.DefaultProjectName = 0, ""
+		if err := cfg.Save(); err != nil {
+			return fmt.Errorf("save config: %w", err)
+		}
+	case strings.TrimSpace(fragment) != "":
+		id, err := resolveDefaultProject(env.ctx, env.st, fragment, first)
+		if err != nil {
+			return err
+		}
+		name, err := projectName(env.ctx, env.st, *id)
+		if err != nil {
+			return err
+		}
+		cfg.DefaultProjectID, cfg.DefaultProjectName = *id, name
+		if err := cfg.Save(); err != nil {
+			return fmt.Errorf("save config: %w", err)
+		}
+	}
+	if jsonOut {
+		return renderDefaultJSON(env.w, cfg.DefaultProjectID, cfg.DefaultProjectName)
+	}
+	renderDefault(env.w, cfg.DefaultProjectID, cfg.DefaultProjectName)
+	// The override notice only makes sense when there is a default to
+	// override. A malformed TOGGL_PROJECT_ID is reported too: the scoped
+	// commands fail on it rather than falling back, so the default is not in
+	// effect then either.
+	if cfg.DefaultProjectID != 0 {
+		envID, envErr := projectIDFromEnv()
+		switch {
+		case envErr != nil:
+			fmt.Fprintf(env.w, "note: %v; the scoped commands fail until it is fixed or unset\n", envErr)
+		case envID != nil:
+			fmt.Fprintf(env.w, "note: TOGGL_PROJECT_ID=%d is set and takes precedence over the default\n", *envID)
+		}
+	}
+	return nil
+}
+
 // cmdAuth acquires a token (via tokenSource), verifies it against GET /me, and
 // on success writes config.json. Nothing is written on an invalid token.
+//
+// Re-authenticating replaces the credentials but keeps a `tg default` project
+// already stored: the default is a preference, not part of the credentials, and
+// running `tg auth` again (a rotated token, say) should not silently unscope
+// every later `tg add`. A config that cannot be loaded is simply replaced, since
+// writing a fresh one is exactly how `tg auth` repairs it.
 func cmdAuth(ctx context.Context, w io.Writer, tokenSource func() (string, error), newClient func(token string) *api.Client) error {
 	token, err := tokenSource()
 	if err != nil {
@@ -1366,6 +1464,9 @@ func cmdAuth(ctx context.Context, w io.Writer, tokenSource func() (string, error
 	}
 
 	cfg := &config.Config{APIToken: token, WorkspaceID: me.DefaultWorkspaceID, UserID: me.ID}
+	if prev, err := config.Load(); err == nil {
+		cfg.DefaultProjectID, cfg.DefaultProjectName = prev.DefaultProjectID, prev.DefaultProjectName
+	}
 	if err := cfg.Save(); err != nil {
 		return fmt.Errorf("save config: %w", err)
 	}
