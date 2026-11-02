@@ -6,7 +6,7 @@ needs a finished time range (`tg add`, `tg mod`). Four forms exist:
 | Form     | Shape         | Example  | Meaning                                    |
 | -------- | ------------- | -------- | ------------------------------------------ |
 | absolute | `START-STOP`  | `9-:30`  | 09:00-09:30 on the day worked on (today by default) |
-| absolute | `@STOP`       | `@:30`   | from now (floored to the last 5-minute mark) until :30 |
+| absolute | `@STOP`       | `@:30`   | from now (floored to the last 5-minute mark) until the next :30 |
 | relative | `+DURATION`   | `+:20`   | the last 20 minutes, ending at the current 5-minute mark |
 | negative | `-DURATION`   | `-:20`   | 20 minutes to take AWAY from an existing span |
 | duration | `DURATION`    | `1:30`   | a bare 1h30m length; the command supplies the start |
@@ -64,7 +64,8 @@ location (`TZ`). Rules:
 - A missing minute component defaults to `00`: `10-11` is 10:00-11:00.
 - A minutes-only `STOP` (`:MM`) inherits `START`'s hour: `9-:30` is 09:00-09:30.
 - A minutes-only `START` is **not** allowed: `:30-10` is an error.
-- `STOP` must be strictly after `START`.
+- `STOP` must be strictly after `START` (the one exception, a minutes-only
+  `STOP` after an `@` `START`, is described below).
 - No day arithmetic: absolute timesigns cannot cross midnight. Use two entries.
 - No rounding: the times are taken exactly as written (`9:07-9:11` is honored).
 
@@ -74,10 +75,18 @@ Either side of the range may be `@`, which resolves to **now floored down to the
 preceding 5-minute wall-clock mark** (`00, 05, ..., 55`), seconds zeroed, in the
 active location — the same mark the relative form ends at, and never rounded up.
 As a `START`, `@` also stands in for the `-` separator, so `@:30` reads as "from
-now until :30" (the `:30` inheriting `@`'s hour) with no dash; the explicit
-`@-:30` and a `@` `STOP` (`9-@`) work too. `STOP` must still be strictly after
-`START`, so an `@` range that would be empty or inside out (`@:05` when now
-floors to 15:05, `@-@`) is an error.
+now until the next :30" with no dash; the explicit `@-:30` and a `@` `STOP`
+(`9-@`) work too.
+
+A minutes-only `STOP` after an `@` `START` inherits `@`'s hour while that hour's
+`:MM` still lies ahead of the `@` mark, and rolls over to the **next hour**
+otherwise: at 15:07 `@:30` is 15:05-15:30, at 15:47 it is 15:45-16:30, and on
+the mark itself (15:30) it is 15:30-16:30. That keeps the shorthand usable
+whatever minute it is typed at. The rollover never crosses midnight (`@:30` at
+23:47 is an error; absolute ranges stay on one day), and it applies only to the
+minutes-only form: a `STOP` that names its hour is taken as written, so an `@`
+range with an explicit stop at or before the mark (`@-9`, `@-15:05` at 15:07,
+`@-@`) is an error.
 
 Because `@` is defined by "now", `tg add` accepts it only on today: on a day
 `--date` moved the command to there is no "now", so it is refused there just like
@@ -101,6 +110,8 @@ Examples:
 | Input     | Start | Stop  | Duration |
 | --------- | ----- | ----- | -------- |
 | `@:30`    | 15:05 | 15:30 | 25m      |
+| `@:05`    | 15:05 | 16:05 | 1h       |
+| `@-:00`   | 15:05 | 16:00 | 55m      |
 | `@16`     | 15:05 | 16:00 | 55m      |
 | `@-16:45` | 15:05 | 16:45 | 1h40m    |
 | `9-@`     | 09:00 | 15:05 | 6h5m     |
@@ -313,7 +324,8 @@ Absolute:
 - minute out of range: `9:60-10`, `9-9:60`, `@-9:60`
 - minutes-only start: `:30-10`, `:30-@`
 - stop not after start: `9-9`, `10-9`, `9-:00`, `@-@`, and any `@` range whose
-  stop is at or before the current 5-minute mark
+  explicit-hour stop is at or before the current 5-minute mark (`@-9`)
+- an `@:MM` rollover that would cross midnight: `@:30` at 23:47
 - non-numeric components: `ab-cd`, `9:aa-10`
 
 Relative:

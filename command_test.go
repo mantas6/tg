@@ -441,6 +441,74 @@ func TestAddAcceptsAtTimesign(t *testing.T) {
 	}
 }
 
+// TestAddAtTimesignRollsToNextHour covers the two ways "@:30" is typed once
+// :30 has already passed this hour: first thing on an empty day, and after a
+// gap following an earlier entry. ":30" is the NEXT :30 after now, so both
+// record from the current 5-minute mark until :30 of the following hour
+// instead of being refused as an inside-out range.
+func TestAddAtTimesignRollsToNextHour(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nothing tracked yet", func(t *testing.T) {
+		t.Parallel()
+		s := newStore(t)
+		seedCatalog(t, s)
+
+		// 09:47 floors to 09:45; :30 has passed, so the stop is 10:30.
+		now := time.Date(2026, 1, 2, 9, 47, 0, 0, time.UTC)
+		var buf bytes.Buffer
+		if err := cmdAdd(env(&buf, s, nil, now, time.UTC), nil, false, "@:30", "login", ""); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+		if out := buf.String(); !strings.Contains(out, "09:45-10:30") {
+			t.Errorf("output = %q, want 09:45-10:30", out)
+		}
+		if entries := addWindow(t, s, now); len(entries) != 1 {
+			t.Fatalf("entries = %d, want 1", len(entries))
+		}
+	})
+
+	t.Run("after a gap", func(t *testing.T) {
+		t.Parallel()
+		s := newStore(t)
+		seedCatalog(t, s)
+
+		// The first "@:30" at 09:05 runs to 09:30; twenty minutes later the
+		// same timesign runs from 09:50 to the next :30.
+		first := time.Date(2026, 1, 2, 9, 5, 0, 0, time.UTC)
+		var buf bytes.Buffer
+		if err := cmdAdd(env(&buf, s, nil, first, time.UTC), nil, false, "@:30", "login", ""); err != nil {
+			t.Fatalf("add first: %v", err)
+		}
+		if out := buf.String(); !strings.Contains(out, "09:05-09:30") {
+			t.Errorf("first output = %q, want 09:05-09:30", out)
+		}
+
+		later := first.Add(45 * time.Minute)
+		buf.Reset()
+		if err := cmdAdd(env(&buf, s, nil, later, time.UTC), nil, false, "@:30", "review", ""); err != nil {
+			t.Fatalf("add after gap: %v", err)
+		}
+		if out := buf.String(); !strings.Contains(out, "09:50-10:30") {
+			t.Errorf("output = %q, want 09:50-10:30", out)
+		}
+
+		entries := addWindow(t, s, later)
+		if len(entries) != 2 {
+			t.Fatalf("entries = %d, want 2", len(entries))
+		}
+		e := entries[1]
+		wantStart := time.Date(2026, 1, 2, 9, 50, 0, 0, time.UTC)
+		wantStop := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+		if !e.Start.Equal(wantStart) {
+			t.Errorf("start = %v, want %v", e.Start, wantStart)
+		}
+		if e.Stop == nil || !e.Stop.Equal(wantStop) {
+			t.Errorf("stop = %v, want %v", e.Stop, wantStop)
+		}
+	})
+}
+
 // TestAddOnAnotherDayRefusesAtTimesign pins that "@", like the relative form,
 // is refused once --date moved the command off today: it resolves to now, which
 // exists only today, so it cannot record time on another day. The refusal names

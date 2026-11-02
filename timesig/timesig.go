@@ -8,7 +8,7 @@
 //
 // Within an ABSOLUTE range either side may be the "@" token, which resolves to
 // now floored to the preceding 5-minute mark; as a START it also stands in for
-// the range separator, so "@:30" reads as "from now until :30" (see
+// the range separator, so "@:30" reads as "from now until the next :30" (see
 // ParseAbsolute).
 //
 // The first two resolve to a Span on their own; the last two do not, so
@@ -182,8 +182,8 @@ func Parse(s string, now time.Time, loc *time.Location) (Span, error) {
 // The "@" token resolves to now floored to the preceding 5-minute wall-clock
 // mark in loc (see Floor5): "9-@" runs from 09:00 until that mark. As a START,
 // "@" also stands in for the range separator, so "@:30" needs no dash and reads
-// as "from now until :30" (the ":30" inheriting @'s hour); the explicit "@-:30"
-// is accepted too.
+// as "from now until :30" (the ":30" inheriting @'s hour, or the next hour's
+// once :30 is at or before the "@" mark); the explicit "@-:30" is accepted too.
 func ParseAbsolute(s string, now time.Time, loc *time.Location) (Span, error) {
 	s = strings.TrimSpace(s)
 
@@ -224,6 +224,14 @@ func ParseAbsolute(s string, now time.Time, loc *time.Location) (Span, error) {
 	y, mo, d := day.Date()
 	start := time.Date(y, mo, d, sh, sm, 0, 0, loc)
 	stop := time.Date(y, mo, d, eh, em, 0, 0, loc)
+	// "@:30" means "until the NEXT :30": a minutes-only STOP after an "@"
+	// START that this hour's :MM no longer lies ahead of rolls over to the
+	// following hour, so the shorthand works whatever minute it is typed at.
+	// It never rolls past midnight (absolute ranges stay on one day), and an
+	// explicit hour ("@-9", "@-15:05") is taken as written.
+	if left == AtSign && strings.HasPrefix(right, ":") && !stop.After(start) && eh < 23 {
+		stop = time.Date(y, mo, d, eh+1, em, 0, 0, loc)
+	}
 	if !stop.After(start) {
 		return Span{}, fmt.Errorf(
 			"invalid timesign %q: STOP %s must be after START %s",

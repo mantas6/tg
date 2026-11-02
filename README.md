@@ -59,7 +59,7 @@ adds a fourth form, `-DURATION`, to take time back off it; see
 tg add 9-:30 <task>         # 09:00-09:30
 tg add 10-11 <task>         # 10:00-11:00
 tg add 10:30-11 <task>      # 10:30-11:00
-tg add @:30 <task>          # from now (floored to the last 5m mark) until :30
+tg add @:30 <task>          # from now (floored to the last 5m mark) until the next :30
 tg add @-16 <task>          # from now until 16:00
 tg add +:20 <task>          # the last 20 minutes
 tg add +1:20 <task>         # the last 1h20m
@@ -71,7 +71,8 @@ For absolute ranges each side is `H` or `H:MM`; the stop side may also be `:MM`,
 inheriting the start hour. Hours are 0-23, minutes 0-59, and the stop must be
 after the start. Either side may be `@`, which is now floored *down* to the
 preceding 5-minute mark (14:23 -> 14:20); as the start it needs no dash, so
-`@:30` reads "from now until :30". A relative timesign ends at that same mark
+`@:30` reads "from now until the next :30" (14:20-14:30 at 14:23, 14:45-15:30
+at 14:47). A relative timesign ends at that same mark
 and starts that duration earlier. The full grammar, rounding rules, and error
 cases are in [docs/timesig.md](docs/timesig.md).
 
@@ -508,7 +509,7 @@ commands:
 
 timesign: absolute 9-:30, 10-11, 10:30-11:15 (today); `@` in a range is
       now floored to the last 5m mark, and `@:30` (no dash) is from now
-      until :30. relative +:20, +1, +1:20 (that long, ending at the last
+      until the next :30. relative +:20, +1, +1:20 (that long, ending at the last
       5m mark), negative -:20, -1:20 (that much LESS; `mod` only), or a
       bare duration 1:30, :45 (that long, starting where the last entry
       ended; `add` only). Full spec: docs/timesig.md

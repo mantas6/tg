@@ -107,6 +107,14 @@ func TestParseAbsoluteAtNow(t *testing.T) {
 		{"one minute before mark", "@17", hm(15, 59), 15, 55, 17, 0},
 		// Whitespace around the token and the dash is tolerated.
 		{"whitespace tolerated", " @ - :30 ", hm(15, 7), 15, 5, 15, 30},
+		// A minutes-only stop is the NEXT :MM after @, so once that minute
+		// has passed this hour it rolls over to the next one.
+		{"minutes stop already passed", "@:30", hm(15, 47), 15, 45, 16, 30},
+		{"minutes stop already passed, dash", "@-:30", hm(15, 47), 15, 45, 16, 30},
+		{"minutes stop equals now mark", "@:05", hm(15, 7), 15, 5, 16, 5},
+		{"on the stop mark itself", "@:30", hm(15, 30), 15, 30, 16, 30},
+		{"top of the next hour", "@:00", hm(15, 7), 15, 5, 16, 0},
+		{"rolls into the last hour", "@:15", hm(22, 50), 22, 50, 23, 15},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -174,11 +182,12 @@ func TestParseAbsoluteAtNowErrors(t *testing.T) {
 	}{
 		{"at alone, no stop", "@", hm(15, 7)},
 		{"at with empty stop", "@-", hm(15, 7)},
-		{"stop equals now mark", "@:05", hm(15, 7)}, // 15:05 == floored start
-		{"stop before now", "@-9", hm(15, 7)},       // 09:00 < 15:05
-		{"both sides at", "@-@", hm(15, 7)},         // zero length
-		{"bad stop hour", "@-24", hm(15, 7)},        // hour out of range
-		{"bad stop minutes", "@-9:60", hm(15, 7)},   // minute out of range
+		{"stop before now", "@-9", hm(15, 7)},          // 09:00 < 15:05
+		{"hour stop equals now", "@-15:05", hm(15, 7)}, // an explicit hour never rolls
+		{"rollover past midnight", "@:30", hm(23, 47)}, // 00:30 is tomorrow
+		{"both sides at", "@-@", hm(15, 7)},            // zero length
+		{"bad stop hour", "@-24", hm(15, 7)},           // hour out of range
+		{"bad stop minutes", "@-9:60", hm(15, 7)},      // minute out of range
 		{"minutes-only start still bad", ":30-@", hm(15, 7)},
 	}
 	for _, tc := range cases {
