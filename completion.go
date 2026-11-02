@@ -89,6 +89,7 @@ _tg() {
         'add:add a finished entry from a timesign (9-:30, +:20, 1:30)'
         'mod:retime (+30, -30, 9-10:30) or rename an entry (default: the last one)'
         'del:delete an entry by its number from tg ls'
+        'cut:stop the running entry at the nearest 5-minute mark (at least 5m long)'
         "current:show the last entry, idle gap and today's total"
         "status:show the last entry, idle gap and today's total"
         "today:show today's entries"

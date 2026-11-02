@@ -88,6 +88,11 @@ minutes-only form: a `STOP` that names its hour is taken as written, so an `@`
 range with an explicit stop at or before the mark (`@-9`, `@-15:05` at 15:07,
 `@-@`) is an error.
 
+`tg cut`, which takes no timesign, is the one place a 5-minute mark is
+**rounded** rather than floored: it ends the running entry at the mark nearest
+to now (the 2m30s midpoint rounding up), so at 15:07 it stops at 15:05 and at
+15:08 at 15:10.
+
 Because `@` is defined by "now", `tg add` accepts it only on today: on a day
 `--date` moved the command to there is no "now", so it is refused there just like
 the relative form (see [The day a timesign lands

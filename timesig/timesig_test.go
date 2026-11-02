@@ -632,6 +632,50 @@ func TestFloor5KeepsLocation(t *testing.T) {
 	}
 }
 
+func TestRound5(t *testing.T) {
+	t.Parallel()
+	at := func(h, m, s int) time.Time { return time.Date(2026, 1, 2, h, m, s, 0, time.UTC) }
+	cases := []struct {
+		in, want time.Time
+	}{
+		// On a mark: unchanged (sub-minute parts dropped).
+		{hm(14, 0), hm(14, 0)},
+		{hm(14, 5), hm(14, 5)},
+		{at(14, 5, 0), hm(14, 5)},
+		// Less than halfway past a mark rounds down.
+		{hm(14, 1), hm(14, 0)},
+		{hm(14, 2), hm(14, 0)},
+		{at(14, 2, 29), hm(14, 0)},
+		{hm(10, 12), hm(10, 10)},
+		// Exactly halfway (2m30s) rounds up, as does anything past it.
+		{at(14, 2, 30), hm(14, 5)},
+		{hm(14, 3), hm(14, 5)},
+		{hm(14, 4), hm(14, 5)},
+		{hm(10, 13), hm(10, 15)},
+		{time.Date(2026, 1, 2, 14, 4, 59, 999999999, time.UTC), hm(14, 5)},
+		// Rounding up can cross into the next hour and the next day.
+		{hm(14, 58), hm(15, 0)},
+		{at(23, 58, 0), time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)},
+	}
+	for _, tc := range cases {
+		if got := Round5(tc.in); !got.Equal(tc.want) {
+			t.Errorf("Round5(%v) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestRound5KeepsLocation(t *testing.T) {
+	t.Parallel()
+	// Like Floor5, rounding is a wall-clock operation: a location with a
+	// non-hour UTC offset must still land on a local :00/:05/... mark.
+	loc := time.FixedZone("half", 30*60)
+	in := time.Date(2026, 1, 2, 14, 23, 0, 0, loc)
+	got := Round5(in)
+	if got.Minute() != 25 || got.Hour() != 14 || got.Location() != loc {
+		t.Errorf("Round5(%v) = %v, want 14:25 in %v", in, got, loc)
+	}
+}
+
 func TestParseRelativeUsesLocationWallClock(t *testing.T) {
 	t.Parallel()
 	// now is given in UTC but loc is offset, so the 5-minute mark is computed

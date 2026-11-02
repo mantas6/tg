@@ -356,6 +356,21 @@ func Floor5(t time.Time) time.Time {
 	return hour.Add((t.Sub(hour) / step) * step)
 }
 
+// Round5 rounds t to the NEAREST wall-clock 5-minute mark, seconds and
+// sub-second components zeroed: 10:12 becomes 10:10 and 10:13 becomes 10:15.
+// The exact midpoint (2m30s past a mark) rounds up. Like Floor5 it works in t's
+// own location, and rounding up may carry into the next hour or day. It backs
+// `tg cut`, which ends the running entry at the mark closest to now rather than
+// at the preceding one.
+func Round5(t time.Time) time.Time {
+	const step = 5 * time.Minute
+	floor := Floor5(t)
+	if t.Sub(floor) >= step/2 {
+		return floor.Add(step)
+	}
+	return floor
+}
+
 // parseClockOrAt parses one side of an absolute range, resolving the "@" token
 // to at's wall-clock hour and minute (already floored by ParseAbsolute) and
 // deferring every other form to parseClockPart. Passing at's minute through as

@@ -20,7 +20,7 @@ func TestCompletionZsh(t *testing.T) {
 		"compdef _tg tg",
 		"tg tasks --json",
 		// Every command and alias accepted by run() must be offered.
-		"'auth:", "'add:", "'mod:", "'del:", "\"current:", "\"status:",
+		"'auth:", "'add:", "'mod:", "'del:", "'cut:", "\"current:", "\"status:",
 		"\"today:", "\"list:", "\"ls:", "\"daily:", "'tasks:", "'grep:", "'projects:",
 		"\"update:", "'push:", "\"pull:", "'total:", "'default:",
 		"'completion:", "'help:",
@@ -72,7 +72,7 @@ func TestCompletionCoversDispatch(t *testing.T) {
 	}
 	out := buf.String()
 	for _, cmd := range []string{
-		"auth", "add", "mod", "del", "current", "status", "today", "list",
+		"auth", "add", "mod", "del", "cut", "current", "status", "today", "list",
 		"ls", "daily", "tasks", "grep", "projects", "update", "push",
 		"pull", "total", "default", "completion", "help",
 	} {

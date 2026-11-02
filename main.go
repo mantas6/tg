@@ -53,6 +53,8 @@ func run(ctx context.Context, cmd string, args []string) error {
 		return runMod(ctx, args)
 	case "del":
 		return runDel(ctx, args)
+	case "cut":
+		return runCut(ctx, args)
 	case "current", "status":
 		return runCurrent(ctx, args)
 	case "today", "list", "ls":
@@ -179,6 +181,17 @@ func runDel(ctx context.Context, args []string) error {
 		return err
 	}
 	return withEnv(ctx, func(env *cmdEnv) error { return cmdDel(env, ref) })
+}
+
+func runCut(ctx context.Context, args []string) error {
+	fs := newFlagSet("cut")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("usage: tg cut")
+	}
+	return withEnv(ctx, cmdCut)
 }
 
 func runCurrent(ctx context.Context, args []string) error {
@@ -1093,6 +1106,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  mod [num] [timesign]      retime/rename an entry (default: last), e.g.")
 	fmt.Fprintln(w, "                            +30 / -30 minutes  [--desc TEXT] [--date DATE]")
 	fmt.Fprintln(w, "  del <num>                 delete the entry numbered by `tg ls`")
+	fmt.Fprintln(w, "  cut                       stop the running entry at the nearest 5m mark")
+	fmt.Fprintln(w, "                            (at least 5m long)")
 	fmt.Fprintln(w, "  current | status          last entry, gap, day total        [--json]")
 	fmt.Fprintln(w, "  today   | list | ls       show today's entries     [--days N] [--json]")
 	fmt.Fprintln(w, "  daily                     this month's time per day and overtime")

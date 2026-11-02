@@ -574,6 +574,61 @@ func cmdDel(env *cmdEnv, ref int) error {
 	return nil
 }
 
+// cutMinDuration is the shortest entry `tg cut` leaves behind.
+const cutMinDuration = 5 * time.Minute
+
+// cmdCut stops the running entry: its stop becomes now rounded to the NEAREST
+// 5-minute wall-clock mark in loc (timesig.Round5; the 2m30s midpoint rounds
+// up), so 10:12 ends it at 10:10 and 10:13 at 10:15. The running entry is the
+// one `tg status` reports as running (store.Running). tg never starts a timer
+// itself, so such an entry only exists after a `tg pull` of one started
+// elsewhere; with none there is nothing to cut and that is an error.
+//
+// The entry always keeps at least cutMinDuration: when the rounded stop would
+// leave it shorter (or at or before its start, e.g. a timer started a minute
+// ago), the stop is start+5m instead, which is off a mark when the start is.
+//
+// Everything else is `tg mod`'s retiming: a running entry that started on a day
+// that is over is refused (store.CheckEditableDay), a stop that would overlap
+// another entry is refused, and the entry is stored dirty with now as its LWW
+// clock and pushed best-effort.
+func cmdCut(env *cmdEnv) error {
+	running, err := env.st.Running(env.ctx)
+	if err != nil {
+		return err
+	}
+	if running == nil {
+		return errors.New("no running entry to cut")
+	}
+	e := *running
+	if err := store.CheckEditableDay(e.Start, env.now, env.loc); err != nil {
+		return err
+	}
+
+	stop := timesig.Round5(env.now.In(env.loc))
+	if minStop := e.Start.Add(cutMinDuration); stop.Before(minStop) {
+		stop = minStop
+	}
+	clashes, err := env.st.FindOverlappingExcluding(env.ctx, e.Start, stop, e.ID)
+	if err != nil {
+		return err
+	}
+	if len(clashes) > 0 {
+		return fmt.Errorf("%s-%s overlaps existing entry %s",
+			formatClock(e.Start, env.loc), formatClock(stop, env.loc), overlapLabel(clashes[0], env.loc))
+	}
+
+	e.Stop = &stop
+	e.Duration = int64(stop.Sub(e.Start) / time.Second)
+	e.UpdatedAt = env.now
+	if err := env.st.UpdateEntry(env.ctx, e, env.now, env.loc); err != nil {
+		return err
+	}
+	renderEntryChange(env.w, "Cut", e, env.now, env.loc)
+	env.bestEffortPush()
+	return nil
+}
+
 // totalRow is one line of `tg total`: the seconds come from the Reports API,
 // the display name and project from the local catalog.
 type totalRow struct {
