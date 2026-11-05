@@ -414,15 +414,22 @@ The marker takes the place of a padding space, so no other row shifts.
 listing groups the entries under a date header; `mod`/`del` address today's
 numbers. `--json` emits the same data with `num` on each entry.
 
-### Stopping a running entry: `cut`
+### Ending an entry now: `cut`
 
-tg never starts a timer itself, but a timer started elsewhere (the Toggl web
-app, say) arrives with `tg pull` as a *running* entry. `tg cut` stops it:
+`tg cut` ends an entry now. tg never starts a timer itself, but a timer started
+elsewhere (the Toggl web app, say) arrives with `tg pull` as a *running* entry,
+and `tg cut` is how you stop it:
 
 ```sh
 $ tg cut
 Cut: Code review [Backend]  09:00-10:10 (1h10m)
 ```
+
+The entry is picked exactly like `tg mod` picks it: the number from `tg ls`
+(`tg cut 2`), or with none the last entry, the one `tg status` reports. A
+finished entry is cut the same way, its stop moved to now whether that shortens
+or extends it; an entry numbered explicitly that has not started yet is
+refused. There is no `--date`, since "now" only exists today.
 
 The entry ends at **now rounded to the nearest 5-minute mark** (`:00`, `:05`,
 `:10`, ...; seconds dropped) in your local time zone: at 10:12 it ends at 10:10,
@@ -431,10 +438,8 @@ always **at least 5 minutes** long: if the rounded stop would leave it shorter
 (a timer started at 10:08 and cut at 10:09), it ends 5 minutes after its start
 instead (10:13).
 
-The running entry is the one `tg status` reports as running; with none, `cut`
-is an error. Otherwise it follows `tg mod`'s rules: a timer still running from a
-day that is over is refused, a stop that would overlap another entry is refused,
-and the change is marked dirty and best-effort pushed to Toggl.
+Otherwise it follows `tg mod`'s rules: a stop that would overlap another entry
+is refused, and the change is marked dirty and best-effort pushed to Toggl.
 
 ### Daily totals and overtime
 
@@ -509,8 +514,8 @@ commands:
   mod [num] [timesign]      retime/rename an entry (default: last), e.g.
                             +30 / -30 minutes  [--desc TEXT] [--date DATE]
   del <num>                 delete the entry numbered by `tg ls`
-  cut                       stop the running entry at the nearest 5m mark
-                            (at least 5m long)
+  cut [num]                 end an entry (default: last) at the nearest
+                            5m mark (at least 5m long)
   current | status          last entry, gap, day total        [--json]
   today   | list | ls       show today's entries     [--days N] [--json]
   daily                     this month's time per day and overtime

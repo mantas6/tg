@@ -396,7 +396,7 @@ func cmdMod(env *cmdEnv, ref int, timesign, desc string, setDesc bool) error {
 		return errors.New("usage: tg mod [entry-number] [timesign] [--desc TEXT] [--date DATE]")
 	}
 
-	e, err := modTarget(env, ref)
+	e, err := modTarget(env, ref, "modify")
 	if err != nil {
 		return err
 	}
@@ -453,7 +453,10 @@ func cmdMod(env *cmdEnv, ref int, timesign, desc string, setDesc bool) error {
 // all "already started" as far as the anchor is concerned (see cmdEnv.day). It
 // is also a day mod may write to, since the failsafe only closes days that are
 // over (store.CheckEditableDay).
-func modTarget(env *cmdEnv, ref int) (store.Entry, error) {
+//
+// `tg cut` resolves its entry the same way; verb names the action in the
+// missing-entry error ("modify", "cut").
+func modTarget(env *cmdEnv, ref int, verb string) (store.Entry, error) {
 	if ref > 0 {
 		return env.st.EntryByNum(env.ctx, ref, env.day)
 	}
@@ -462,7 +465,7 @@ func modTarget(env *cmdEnv, ref int) (store.Entry, error) {
 		return store.Entry{}, err
 	}
 	if last == nil {
-		return store.Entry{}, fmt.Errorf("no entry tracked %s to modify", env.dayPhrase())
+		return store.Entry{}, fmt.Errorf("no entry tracked %s to %s", env.dayPhrase(), verb)
 	}
 	return *last, nil
 }
@@ -577,32 +580,36 @@ func cmdDel(env *cmdEnv, ref int) error {
 // cutMinDuration is the shortest entry `tg cut` leaves behind.
 const cutMinDuration = 5 * time.Minute
 
-// cmdCut stops the running entry: its stop becomes now rounded to the NEAREST
+// cmdCut ends an entry now: its stop becomes now rounded to the NEAREST
 // 5-minute wall-clock mark in loc (timesig.Round5; the 2m30s midpoint rounds
-// up), so 10:12 ends it at 10:10 and 10:13 at 10:15. The running entry is the
-// one `tg status` reports as running (store.Running). tg never starts a timer
-// itself, so such an entry only exists after a `tg pull` of one started
-// elsewhere; with none there is nothing to cut and that is an error.
+// up), so 10:12 ends it at 10:10 and 10:13 at 10:15. Typically that stops a
+// timer started elsewhere and pulled since, but a finished entry is cut the
+// same way, its stop moved to the mark whether that shortens or extends it.
+//
+// ref selects the entry exactly as `tg mod` does (modTarget): its number on
+// today's listing, or 0 meaning the last entry (store.LastEntry, what `tg
+// status` reports). There is no --date: "now" only exists today. An entry
+// numbered explicitly that has not started yet is refused, as there is nothing
+// of it to cut.
 //
 // The entry always keeps at least cutMinDuration: when the rounded stop would
 // leave it shorter (or at or before its start, e.g. a timer started a minute
 // ago), the stop is start+5m instead, which is off a mark when the start is.
 //
-// Everything else is `tg mod`'s retiming: a running entry that started on a day
-// that is over is refused (store.CheckEditableDay), a stop that would overlap
+// Everything else is `tg mod`'s retiming: an entry that started on a day that
+// is over is refused (store.CheckEditableDay), a stop that would overlap
 // another entry is refused, and the entry is stored dirty with now as its LWW
 // clock and pushed best-effort.
-func cmdCut(env *cmdEnv) error {
-	running, err := env.st.Running(env.ctx)
+func cmdCut(env *cmdEnv, ref int) error {
+	e, err := modTarget(env, ref, "cut")
 	if err != nil {
 		return err
 	}
-	if running == nil {
-		return errors.New("no running entry to cut")
-	}
-	e := *running
 	if err := store.CheckEditableDay(e.Start, env.now, env.loc); err != nil {
 		return err
+	}
+	if e.Start.After(env.now) {
+		return fmt.Errorf("entry %s has not started yet: nothing to cut", overlapLabel(e, env.loc))
 	}
 
 	stop := timesig.Round5(env.now.In(env.loc))

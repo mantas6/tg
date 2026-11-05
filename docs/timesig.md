@@ -89,7 +89,7 @@ range with an explicit stop at or before the mark (`@-9`, `@-15:05` at 15:07,
 `@-@`) is an error.
 
 `tg cut`, which takes no timesign, is the one place a 5-minute mark is
-**rounded** rather than floored: it ends the running entry at the mark nearest
+**rounded** rather than floored: it ends an entry at the mark nearest
 to now (the 2m30s midpoint rounding up), so at 15:07 it stops at 15:05 and at
 15:08 at 15:10.
 

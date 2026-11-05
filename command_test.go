@@ -2445,7 +2445,7 @@ var cutStart = testStart
 // store and the display location the cut tests use.
 func cutAt(h, m, s int) time.Time { return time.Date(2026, 1, 2, h, m, s, 0, time.UTC) }
 
-// TestCutRoundsToNearestMark covers the stop `tg cut` gives the running entry:
+// TestCutRoundsToNearestMark covers the stop `tg cut` gives the last entry:
 // now rounded to the NEAREST 5-minute mark, so a little past a mark rounds down
 // and the second half of the interval (from 2m30s on) rounds up.
 func TestCutRoundsToNearestMark(t *testing.T) {
@@ -2469,7 +2469,7 @@ func TestCutRoundsToNearestMark(t *testing.T) {
 			seedRunning(t, s, 12, cutStart)
 
 			var buf bytes.Buffer
-			if err := cmdCut(env(&buf, s, nil, tc.now, time.UTC)); err != nil {
+			if err := cmdCut(env(&buf, s, nil, tc.now, time.UTC), 0); err != nil {
 				t.Fatalf("cut: %v", err)
 			}
 			if want := "Cut: Code review [Backend]  " + tc.wantOut + "\n"; buf.String() != want {
@@ -2504,7 +2504,7 @@ func TestCutStopsAndDirtiesEntry(t *testing.T) {
 	now := cutAt(11, 3, 0)
 
 	var buf bytes.Buffer
-	if err := cmdCut(env(&buf, s, nil, now, time.UTC)); err != nil {
+	if err := cmdCut(env(&buf, s, nil, now, time.UTC), 0); err != nil {
 		t.Fatalf("cut: %v", err)
 	}
 	if r := mustRunning(t, s); r != nil {
@@ -2551,7 +2551,7 @@ func TestCutEnforcesMinimumDuration(t *testing.T) {
 			seedRunning(t, s, 12, tc.start)
 
 			var buf bytes.Buffer
-			if err := cmdCut(env(&buf, s, nil, tc.now, time.UTC)); err != nil {
+			if err := cmdCut(env(&buf, s, nil, tc.now, time.UTC), 0); err != nil {
 				t.Fatalf("cut: %v", err)
 			}
 			if !strings.Contains(buf.String(), tc.wantOut) {
@@ -2572,24 +2572,74 @@ func TestCutEnforcesMinimumDuration(t *testing.T) {
 	}
 }
 
-// TestCutWithoutRunningEntry: with nothing running there is nothing to cut, so
-// the command fails clearly and leaves the finished entries alone.
-func TestCutWithoutRunningEntry(t *testing.T) {
+// TestCutWithoutEntryToday: with nothing tracked today there is no last entry
+// to cut, so the command fails the way `tg mod` does and writes nothing.
+func TestCutWithoutEntryToday(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+
+	var buf bytes.Buffer
+	err := cmdCut(env(&buf, s, nil, modNow, time.UTC), 0)
+	if err == nil || !strings.Contains(err.Error(), "no entry tracked today to cut") {
+		t.Fatalf("err = %v, want a no-entry-today error", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("output = %q, want nothing written", buf.String())
+	}
+}
+
+// TestCutFinishedLastEntry: cut resolves its entry like `tg mod`, so with
+// nothing running a bare `tg cut` ends the last entry at now's nearest mark,
+// extending it here from 11:00 to 15:05.
+func TestCutFinishedLastEntry(t *testing.T) {
 	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	seedModDay(t, s)
 
 	var buf bytes.Buffer
-	err := cmdCut(env(&buf, s, nil, modNow, time.UTC))
-	if err == nil || !strings.Contains(err.Error(), "no running entry") {
-		t.Fatalf("err = %v, want a no-running-entry error", err)
+	if err := cmdCut(env(&buf, s, nil, modNow, time.UTC), 0); err != nil {
+		t.Fatalf("cut: %v", err)
+	}
+	if want := "Cut: Code review [Backend]  10:00-15:05 (5h05m)\n"; buf.String() != want {
+		t.Errorf("output = %q, want %q", buf.String(), want)
+	}
+	dirty := mustDirtyEntries(t, s)
+	if len(dirty) != 1 || dirty[0].Seq != 2 {
+		t.Fatalf("dirty entries = %+v, want only entry 2", dirty)
+	}
+}
+
+// TestCutByNumber: an explicit entry number picks the entry from today's
+// listing, exactly as `tg mod N` does, while one that has not started yet is
+// refused rather than given a stop before it begins.
+func TestCutByNumber(t *testing.T) {
+	t.Parallel()
+	s := newStore(t)
+	seedCatalog(t, s)
+	seedModDay(t, s) // 1: 09:00-10:00, 2: 10:00-11:00
+	now := cutAt(9, 42, 0)
+
+	var buf bytes.Buffer
+	if err := cmdCut(env(&buf, s, nil, now, time.UTC), 1); err != nil {
+		t.Fatalf("cut 1: %v", err)
+	}
+	if !strings.Contains(buf.String(), "09:00-09:40 (0h40m)") {
+		t.Errorf("output = %q, want 09:00-09:40", buf.String())
+	}
+
+	buf.Reset()
+	err := cmdCut(env(&buf, s, nil, now, time.UTC), 2)
+	if err == nil || !strings.Contains(err.Error(), "has not started yet") {
+		t.Fatalf("cut 2 err = %v, want a not-started error", err)
 	}
 	if buf.Len() != 0 {
 		t.Errorf("output = %q, want nothing written", buf.String())
 	}
-	if dirty := mustDirtyEntries(t, s); len(dirty) != 0 {
-		t.Errorf("dirty entries = %+v, want none", dirty)
+
+	if err := cmdCut(env(&buf, s, nil, now, time.UTC), 3); !errors.Is(err, store.ErrNoEntryNum) {
+		t.Errorf("cut 3 err = %v, want ErrNoEntryNum", err)
 	}
 }
 
@@ -2607,7 +2657,8 @@ func TestCutRejectsOverlap(t *testing.T) {
 	)
 
 	var buf bytes.Buffer
-	err := cmdCut(env(&buf, s, nil, cutAt(10, 13, 0), time.UTC)) // stop would be 10:15
+	// The 10:12 entry is the last one, so the running entry is cut by number.
+	err := cmdCut(env(&buf, s, nil, cutAt(10, 13, 0), time.UTC), 1) // stop would be 10:15
 	if err == nil {
 		t.Fatal("overlapping cut = nil error, want an error")
 	}
@@ -2625,7 +2676,7 @@ func TestCutRejectsOverlap(t *testing.T) {
 
 	// Rounding down to 10:10 stays clear of the 10:12 start.
 	buf.Reset()
-	if err := cmdCut(env(&buf, s, nil, cutAt(10, 12, 0), time.UTC)); err != nil {
+	if err := cmdCut(env(&buf, s, nil, cutAt(10, 12, 0), time.UTC), 1); err != nil {
 		t.Fatalf("non-overlapping cut: %v", err)
 	}
 	if !strings.Contains(buf.String(), "09:00-10:10") {
@@ -2633,19 +2684,19 @@ func TestCutRejectsOverlap(t *testing.T) {
 	}
 }
 
-// TestCutRefusesEntryOlderThanToday: a timer left running since yesterday sits
-// on a day that is over, which no edit may touch (see store.CheckEditableDay),
-// so cut refuses it like `tg mod` would.
-func TestCutRefusesEntryOlderThanToday(t *testing.T) {
+// TestCutIgnoresEntryOlderThanToday: a timer left running since yesterday is
+// not today's last entry (store.LastEntry is today-only, as for `tg mod`), so
+// there is nothing to cut and it is left running.
+func TestCutIgnoresEntryOlderThanToday(t *testing.T) {
 	t.Parallel()
 	s := newStore(t)
 	seedCatalog(t, s)
 	seedRunning(t, s, 12, cutStart.Add(-24*time.Hour))
 
 	var buf bytes.Buffer
-	err := cmdCut(env(&buf, s, nil, cutAt(10, 0, 0), time.UTC))
-	if !errors.Is(err, store.ErrEntryTooOld) {
-		t.Fatalf("err = %v, want ErrEntryTooOld", err)
+	err := cmdCut(env(&buf, s, nil, cutAt(10, 0, 0), time.UTC), 0)
+	if err == nil || !strings.Contains(err.Error(), "no entry tracked today to cut") {
+		t.Fatalf("err = %v, want a no-entry-today error", err)
 	}
 	if r := mustRunning(t, s); r == nil {
 		t.Error("running entry was stopped by a refused cut")
@@ -2669,7 +2720,7 @@ func TestCutPushesBestEffort(t *testing.T) {
 	c := api.New("tok", api.WithBaseURL(srv.URL), api.WithHTTPClient(srv.Client()))
 
 	var buf bytes.Buffer
-	if err := cmdCut(env(&buf, s, c, cutAt(10, 12, 0), time.UTC)); err != nil {
+	if err := cmdCut(env(&buf, s, c, cutAt(10, 12, 0), time.UTC), 0); err != nil {
 		t.Fatalf("cut: %v", err)
 	}
 	if got, _ := body["stop"].(string); got != "2026-01-02T10:10:00Z" {
@@ -2706,7 +2757,8 @@ func TestRunDispatchValidatesArgs(t *testing.T) {
 		{name: "del with two numbers", cmd: "del", args: []string{"1", "2"}, wantErr: "usage: tg del"},
 		{name: "del with a non-number", cmd: "del", args: []string{"x"}, wantErr: "invalid entry number"},
 		{name: "del with zero", cmd: "del", args: []string{"0"}, wantErr: "invalid entry number"},
-		{name: "cut with an argument", cmd: "cut", args: []string{"1"}, wantErr: "usage: tg cut"},
+		{name: "cut with two numbers", cmd: "cut", args: []string{"1", "2"}, wantErr: "usage: tg cut"},
+		{name: "cut with a non-number", cmd: "cut", args: []string{"x"}, wantErr: "invalid entry number"},
 		{name: "mod with two numbers", cmd: "mod", args: []string{"1", "2"}, wantErr: "unexpected second entry number"},
 		{name: "mod with two timesigns", cmd: "mod", args: []string{"+:30", "9-10"}, wantErr: "unexpected second timesign"},
 		// A negative timesign reaches the argument classifier instead of being
